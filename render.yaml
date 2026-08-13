@@ -6,7 +6,7 @@ services:
     region: singapore
     autoDeployTrigger: checksPass
     healthCheckPath: /health
-    dockerCommand: 'uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT:-10000}'
+    dockerCommand: 'uvicorn app.api.main:app --host 0.0.0.0 --port $PORT'
     envVars:
       - key: APP_ENV
         value: production
@@ -48,7 +48,7 @@ services:
     region: singapore
     autoDeployTrigger: checksPass
     healthCheckPath: /_stcore/health
-    dockerCommand: 'streamlit run ui/app.py --server.address=0.0.0.0 --server.port ${PORT:-10000} --server.headless=true'
+    dockerCommand: 'streamlit run ui/app.py --server.address=0.0.0.0 --server.port $PORT --server.headless=true'
     envVars:
       - key: API_HOST
         fromService:
@@ -65,7 +65,6 @@ services:
           type: web
           name: ai-automation-api
           envVarKey: API_KEY
-        # Runtime API calls use the API key shared with the API service.
 
 databases:
   - name: ai-automation-db
