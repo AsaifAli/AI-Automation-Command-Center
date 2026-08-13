@@ -1,4 +1,4 @@
-# ⚡ AI Automation Command Center
+# ⚡ FlowPilot — Agentic Automation Platform
 
 > **Portfolio-grade AI automation platform with LangGraph orchestration, async workers, human approval, evidence, PostgreSQL persistence, Redis queues, scheduled workflows, Prometheus/Grafana metrics, OpenTelemetry traces and Docker Compose deployment.**
 
