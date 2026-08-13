@@ -1,0 +1,241 @@
+services:
+  litellm:
+    image: litellm/litellm:1.94.0
+    container_name: ai_automation_litellm
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENROUTER_LITELLM_MODEL: ${OPENROUTER_LITELLM_MODEL:-openrouter/free}
+      GEMINI_LITELLM_MODEL: ${GEMINI_LITELLM_MODEL:-gemini/gemini-flash-lite-latest}
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: ai_automation_postgres
+    environment:
+      POSTGRES_DB: automation
+      POSTGRES_USER: automation
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-automation}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U automation -d automation"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai_automation_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_automation_api
+    environment:
+      APP_NAME: ${APP_NAME:-AI Automation Command Center}
+      APP_VERSION: ${APP_VERSION:-3.3.2}
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:-automation}@postgres:5432/automation
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_NAME: automation
+      DEMO_MODE: ${DEMO_MODE:-false}
+      LLM_PROVIDER: ${LLM_PROVIDER:-litellm}
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://litellm:4000/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-portfolio-free}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-30}
+      MAX_RETRIES: ${MAX_RETRIES:-2}
+      API_AUTH_ENABLED: ${API_AUTH_ENABLED:-false}
+      API_KEY: ${API_KEY:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8501}
+      DEMO_CONFIG_PATH: /app/config.json
+      INTELLIGENCE_TIMEOUT_SECONDS: ${INTELLIGENCE_TIMEOUT_SECONDS:-10}
+      MAX_INTELLIGENCE_ITEMS: ${MAX_INTELLIGENCE_ITEMS:-25}
+      MAX_PAYLOAD_BYTES: ${MAX_PAYLOAD_BYTES:-1000000}
+      INPUT_COST_PER_MILLION: ${INPUT_COST_PER_MILLION:-0.15}
+      OUTPUT_COST_PER_MILLION: ${OUTPUT_COST_PER_MILLION:-0.60}
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_SERVICE_NAME: ai-automation-api
+      OTEL_EXPORTER_ENDPOINT: http://otel-collector:4318/v1/traces
+    command: ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      litellm:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_automation_worker
+    environment:
+      APP_NAME: ${APP_NAME:-AI Automation Command Center}
+      APP_VERSION: ${APP_VERSION:-3.3.2}
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:-automation}@postgres:5432/automation
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_NAME: automation
+      DEMO_MODE: ${DEMO_MODE:-false}
+      LLM_PROVIDER: ${LLM_PROVIDER:-litellm}
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://litellm:4000/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-portfolio-free}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-30}
+      MAX_RETRIES: ${MAX_RETRIES:-2}
+      DEMO_CONFIG_PATH: /app/config.json
+      INTELLIGENCE_TIMEOUT_SECONDS: ${INTELLIGENCE_TIMEOUT_SECONDS:-10}
+      MAX_INTELLIGENCE_ITEMS: ${MAX_INTELLIGENCE_ITEMS:-25}
+      INPUT_COST_PER_MILLION: ${INPUT_COST_PER_MILLION:-0.15}
+      OUTPUT_COST_PER_MILLION: ${OUTPUT_COST_PER_MILLION:-0.60}
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_SERVICE_NAME: ai-automation-worker
+      OTEL_EXPORTER_ENDPOINT: http://otel-collector:4318/v1/traces
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      litellm:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_automation_scheduler
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:-automation}@postgres:5432/automation
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_NAME: automation
+      DEMO_CONFIG_PATH: /app/config.json
+      SCHEDULE_ENABLED: ${SCHEDULE_ENABLED:-true}
+      SCHEDULE_INTERVAL_MINUTES: ${SCHEDULE_INTERVAL_MINUTES:-60}
+      SCHEDULE_WORKFLOW: ${SCHEDULE_WORKFLOW:-competitor}
+      SCHEDULE_COMPETITORS: ${SCHEDULE_COMPETITORS:-Example Protocol,Example AI Startup}
+    command: ["python", "-m", "app.scheduler"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_automation_ui
+    environment:
+      API_BASE_URL: http://api:8000
+      API_KEY: ${API_KEY:-}
+    command: ["streamlit", "run", "ui/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
+    ports:
+      - "${UI_PORT:-8501}:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: ai_automation_prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: ai_automation_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    container_name: ai_automation_jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_PORT:-16686}:16686"
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.133.0
+    container_name: ai_automation_otel
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:

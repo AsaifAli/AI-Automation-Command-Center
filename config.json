@@ -1,0 +1,37 @@
+{
+  "content": {
+    "topics": ["AI agents", "DeFi infrastructure", "workflow automation"],
+    "channels": ["linkedin", "x", "telegram"],
+    "tone": "insightful"
+  },
+  "competitor": {
+    "competitors": ["Example Protocol", "Example AI Startup"],
+    "sources": []
+  },
+  "outreach": {
+    "candidates": [
+      {
+        "name": "Demo Partner",
+        "type": "protocol",
+        "context": "AI infrastructure collaboration",
+        "channel": "email"
+      }
+    ]
+  },
+  "kpi": {
+    "updates": [
+      {
+        "entity": "Demo Portfolio",
+        "metric": "weekly progress",
+        "value": "on track",
+        "blocker": "None reported"
+      },
+      {
+        "entity": "Demo Team",
+        "metric": "automation adoption",
+        "value": "improving",
+        "blocker": "Need workflow ownership"
+      }
+    ]
+  }
+}

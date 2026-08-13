@@ -1,0 +1,18 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {"title":"Total Workflow Runs","type":"stat","gridPos":{"h":5,"w":6,"x":0,"y":0},"targets":[{"expr":"workflow_runs_total","refId":"A"}]},
+    {"title":"Completed Runs","type":"stat","gridPos":{"h":5,"w":6,"x":6,"y":0},"targets":[{"expr":"workflow_runs_completed","refId":"A"}]},
+    {"title":"Failed Runs","type":"stat","gridPos":{"h":5,"w":6,"x":12,"y":0},"targets":[{"expr":"workflow_runs_failed","refId":"A"}]},
+    {"title":"Approved Outreach","type":"stat","gridPos":{"h":5,"w":6,"x":18,"y":0},"targets":[{"expr":"workflow_approvals_approved","refId":"A"}]},
+    {"title":"Run State","type":"timeseries","gridPos":{"h":8,"w":12,"x":0,"y":5},"targets":[{"expr":"workflow_runs_queued","legendFormat":"queued","refId":"A"},{"expr":"workflow_runs_running","legendFormat":"running","refId":"B"}]},
+    {"title":"Approvals","type":"timeseries","gridPos":{"h":8,"w":12,"x":12,"y":5},"targets":[{"expr":"workflow_approvals_total","legendFormat":"total","refId":"A"},{"expr":"workflow_approvals_approved","legendFormat":"approved","refId":"B"}]}
+  ],
+  "schemaVersion": 41,
+  "tags": ["ai","automation","portfolio"],
+  "templating": {"list": []},
+  "time": {"from":"now-6h","to":"now"},
+  "title": "AI Automation Command Center",
+  "version": 1
+}
