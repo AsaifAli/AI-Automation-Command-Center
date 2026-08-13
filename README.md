@@ -6,6 +6,16 @@ This project is a from-scratch implementation of a production-minded AI automati
 
 The domain model covers four automation patterns: content generation, competitor intelligence, partner outreach, and KPI/leadership reporting.
 
+## 🚀 Deployment
+
+**Status:** Deployed
+
+The application is deployed as a public portfolio demonstration.
+
+**Architecture:** GitHub Actions → Docker → Cloud deployment
+
+> Live demo access is provided selectively for evaluation/interviews.
+
 ## Why this project stands out
 
 Most agent portfolios stop at `prompt -> LLM -> answer`. This project demonstrates the engineering layer around the model:
