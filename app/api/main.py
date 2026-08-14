@@ -144,17 +144,21 @@ def workflows(_: None = Depends(require_api_key)):
 
 
 @app.post("/api/v1/runs", response_model=WorkflowResult, status_code=202, tags=["workflows"])
-def run_workflow(request: RunRequest, _: None = Depends(require_api_key)):
+def run_workflow(
+    request: RunRequest,
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    _: None = Depends(require_api_key),
+):
     run_id = repo.create_pending_run(request.workflow.value)
     if settings.inline_execution:
         payload = dict(request.payload)
-        token = request.headers.get("X-LLM-Gateway-Token", "")
+        token = llm_gateway_token
         if token:
             payload["_llm_gateway_token"] = token
         execute_run(run_id, request.workflow.value, payload)
     else:
         payload = dict(request.payload)
-        token = request.headers.get("X-LLM-Gateway-Token", "")
+        token = llm_gateway_token
         if token:
             payload["_llm_gateway_token"] = token
         queue().enqueue(execute_run, run_id, request.workflow.value, payload, job_id=run_id)
