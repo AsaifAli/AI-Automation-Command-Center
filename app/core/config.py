@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # Demo / LLM
     demo_mode: bool = False
     llm_provider: str = "litellm"
+    # Common LLM gateway contract. OPENAI_* remains supported for compatibility.
+    llm_api_key: str = ""
+    llm_base_url: str = ""
+    llm_model: str = ""
     openai_api_key: str = ""
     openai_base_url: str = "http://litellm:4000/v1"
     openai_model: str = "portfolio-free"

@@ -17,7 +17,10 @@ class LLMProvider:
         self.settings = settings
 
     def generate(self, system: str, user: str) -> dict[str, Any]:
-        if self.settings.demo_mode or not self.settings.openai_api_key:
+        api_key = self.settings.llm_api_key or self.settings.openai_api_key
+        base_url = self.settings.llm_base_url or self.settings.openai_base_url
+        model = self.settings.llm_model or self.settings.openai_model
+        if self.settings.demo_mode or not api_key:
             return {
                 "text": self._demo(system, user),
                 "provider": "demo",
@@ -32,16 +35,16 @@ class LLMProvider:
                 },
             }
 
-        url = self.settings.openai_base_url.rstrip("/") + "/chat/completions"
+        url = base_url.rstrip("/") + "/chat/completions"
         payload = {
-            "model": self.settings.openai_model,
+            "model": model,
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         }
-        headers = {"Authorization": f"Bearer {self.settings.openai_api_key}"}
+        headers = {"Authorization": f"Bearer {api_key}"}
         last_error: Exception | None = None
 
         for attempt in range(self.settings.max_retries + 1):
@@ -67,10 +70,10 @@ class LLMProvider:
                 return {
                     "text": data["choices"][0]["message"]["content"],
                     "provider": self.settings.llm_provider,
-                    "model": data.get("model", self.settings.openai_model),
+                    "model": data.get("model", model),
                     "usage": {
                         "provider": self.settings.llm_provider,
-                        "model": data.get("model", self.settings.openai_model),
+                        "model": data.get("model", model),
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,

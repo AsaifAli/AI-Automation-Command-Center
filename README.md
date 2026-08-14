@@ -1,20 +1,10 @@
-# ⚡ FlowPilot — Agentic Automation Platform
+# ⚡ AI Automation Command Center
 
 > **Portfolio-grade AI automation platform with LangGraph orchestration, async workers, human approval, evidence, PostgreSQL persistence, Redis queues, scheduled workflows, Prometheus/Grafana metrics, OpenTelemetry traces and Docker Compose deployment.**
 
 This project is a from-scratch implementation of a production-minded AI automation control plane. It demonstrates how AI agents can be turned into **reliable business workflows** rather than isolated LLM demos.
 
 The domain model covers four automation patterns: content generation, competitor intelligence, partner outreach, and KPI/leadership reporting.
-
-## 🚀 Deployment
-
-**Status:** Deployed
-
-The application is deployed as a public portfolio demonstration.
-
-**Architecture:** GitHub Actions → Docker → Cloud deployment
-
-> Live demo access is provided selectively for evaluation/interviews.
 
 ## Why this project stands out
 
