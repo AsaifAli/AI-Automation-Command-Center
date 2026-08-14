@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.core.llm_gateway_context import get_llm_gateway_token
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +18,7 @@ class LLMProvider:
         self.settings = settings
 
     def generate(self, system: str, user: str) -> dict[str, Any]:
-        api_key = self.settings.llm_api_key or self.settings.openai_api_key
-        base_url = self.settings.llm_base_url or self.settings.openai_base_url
-        model = self.settings.llm_model or self.settings.openai_model
-        if self.settings.demo_mode or not api_key:
+        if self.settings.demo_mode or not self.settings.openai_api_key:
             return {
                 "text": self._demo(system, user),
                 "provider": "demo",
@@ -35,15 +33,21 @@ class LLMProvider:
                 },
             }
 
-        url = base_url.rstrip("/") + "/chat/completions"
+        gateway_token = get_llm_gateway_token()
+        gateway_url = (self.settings.llm_gateway_url or self.settings.llm_base_url).strip()
+        if gateway_token and gateway_url:
+            url = gateway_url.rstrip("/") + "/chat/completions"
+        else:
+            url = self.settings.openai_base_url.rstrip("/") + "/chat/completions"
         payload = {
-            "model": model,
+            "model": self.settings.llm_model or self.settings.openai_model,
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         }
+        api_key = gateway_token or self.settings.openai_api_key
         headers = {"Authorization": f"Bearer {api_key}"}
         last_error: Exception | None = None
 
@@ -70,10 +74,10 @@ class LLMProvider:
                 return {
                     "text": data["choices"][0]["message"]["content"],
                     "provider": self.settings.llm_provider,
-                    "model": data.get("model", model),
+                    "model": data.get("model", self.settings.openai_model),
                     "usage": {
                         "provider": self.settings.llm_provider,
-                        "model": data.get("model", model),
+                        "model": data.get("model", self.settings.openai_model),
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,

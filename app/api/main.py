@@ -48,7 +48,7 @@ app.add_middleware(
     allow_origins=[origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Request-ID", "X-LLM-Gateway-Token"],
 )
 
 
@@ -72,6 +72,10 @@ def startup() -> None:
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    from app.core.llm_gateway_context import set_llm_gateway_token
+    set_llm_gateway_token(request.headers.get("X-LLM-Gateway-Token", ""))
+    from app.core.llm_gateway_context import set_llm_gateway_token
+    set_llm_gateway_token(request.headers.get("X-LLM-Gateway-Token", ""))
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -143,9 +147,17 @@ def workflows(_: None = Depends(require_api_key)):
 def run_workflow(request: RunRequest, _: None = Depends(require_api_key)):
     run_id = repo.create_pending_run(request.workflow.value)
     if settings.inline_execution:
-        execute_run(run_id, request.workflow.value, request.payload)
+        payload = dict(request.payload)
+        token = request.headers.get("X-LLM-Gateway-Token", "")
+        if token:
+            payload["_llm_gateway_token"] = token
+        execute_run(run_id, request.workflow.value, payload)
     else:
-        queue().enqueue(execute_run, run_id, request.workflow.value, request.payload, job_id=run_id)
+        payload = dict(request.payload)
+        token = request.headers.get("X-LLM-Gateway-Token", "")
+        if token:
+            payload["_llm_gateway_token"] = token
+        queue().enqueue(execute_run, run_id, request.workflow.value, payload, job_id=run_id)
     result = repo.get_run(run_id)
     if not result:
         raise HTTPException(status_code=500, detail="Failed to create workflow run")

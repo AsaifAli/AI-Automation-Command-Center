@@ -14,6 +14,9 @@ def execute_run(run_id: str, workflow: str, payload: dict) -> dict:
     repo = Repository(settings)
     repo.mark_running(run_id)
     try:
+        from app.core.llm_gateway_context import set_llm_gateway_token
+        set_llm_gateway_token(str(payload.get("_llm_gateway_token", "")))
+        payload = {k: v for k, v in payload.items() if k != "_llm_gateway_token"}
         result = WorkflowEngine(LLMProvider(settings)).run(workflow, payload, run_id=run_id)
         result["run_id"] = run_id
         repo.save_result(result)
