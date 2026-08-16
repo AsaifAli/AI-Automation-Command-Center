@@ -74,8 +74,6 @@ async def request_context(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     from app.core.llm_gateway_context import set_llm_gateway_token
     set_llm_gateway_token(request.headers.get("X-LLM-Gateway-Token", ""))
-    from app.core.llm_gateway_context import set_llm_gateway_token
-    set_llm_gateway_token(request.headers.get("X-LLM-Gateway-Token", ""))
     content_length = request.headers.get("content-length")
     if content_length:
         try:

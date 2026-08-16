@@ -18,7 +18,12 @@ class LLMProvider:
         self.settings = settings
 
     def generate(self, system: str, user: str) -> dict[str, Any]:
-        if self.settings.demo_mode or not self.settings.openai_api_key:
+        gateway_token = get_llm_gateway_token()
+        gateway_url = (self.settings.llm_gateway_url or self.settings.llm_base_url).strip()
+
+        # A request-scoped gateway session is a valid production credential
+        # even when the service has no static provider key configured.
+        if not gateway_token and (self.settings.demo_mode or not self.settings.openai_api_key):
             return {
                 "text": self._demo(system, user),
                 "provider": "demo",
@@ -33,8 +38,6 @@ class LLMProvider:
                 },
             }
 
-        gateway_token = get_llm_gateway_token()
-        gateway_url = (self.settings.llm_gateway_url or self.settings.llm_base_url).strip()
         if gateway_token and gateway_url:
             url = gateway_url.rstrip("/") + "/chat/completions"
         else:

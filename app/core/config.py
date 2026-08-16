@@ -25,9 +25,6 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_model: str = ""
     llm_gateway_url: str = ""
-    llm_base_url: str = ""
-    llm_model: str = ""
-    llm_gateway_url: str = ""
     request_timeout_seconds: int = 30
     max_retries: int = 2
     inline_execution: bool = False
