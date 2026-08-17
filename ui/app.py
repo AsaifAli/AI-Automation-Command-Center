@@ -30,11 +30,11 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 
 def api_get(path: str):
-    return requests.get(f"{API}{path}", headers=HEADERS, timeout=8)
+    return requests.get(f"{API}{path}", headers=request_headers(), timeout=8)
 
 
 def api_post(path: str, body: dict):
-    return requests.post(f"{API}{path}", headers={**HEADERS, "Content-Type": "application/json"}, json=body, timeout=15)
+    return requests.post(f"{API}{path}", headers={**request_headers(), "Content-Type": "application/json"}, json=body, timeout=15)
 
 
 def response_json(response: requests.Response, context: str):
