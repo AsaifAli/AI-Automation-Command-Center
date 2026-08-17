@@ -13,6 +13,19 @@ if not API:
 API_KEY = os.getenv("API_KEY", "")
 HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
 
+
+def request_headers() -> dict[str, str]:
+    """Build request headers, including a portfolio-issued gateway session when present."""
+    headers = dict(HEADERS)
+    try:
+        gateway_token = st.query_params.get("portfolio_llm_session", "")
+    except Exception:
+        gateway_token = ""
+    gateway_token = str(gateway_token or "").strip()
+    if gateway_token:
+        headers["X-LLM-Gateway-Token"] = gateway_token
+    return headers
+
 st.set_page_config(page_title="AI Automation Command Center", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
 <style>
