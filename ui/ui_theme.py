@@ -230,6 +230,23 @@ def apply_theme() -> None:
     .live-title {{ margin-top:.18rem; color:var(--ui-text); font-weight:800; }}
     .run-id {{ color:var(--ui-faint); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.62rem; }}
     .live-status {{ margin-top:.8rem; }}
+    .demo-note {{ margin:.45rem 0 .65rem; padding:.55rem .7rem; border:1px solid color-mix(in srgb,var(--ui-accent) 18%,var(--ui-border)); border-radius:12px; background:var(--ui-tint); color:var(--ui-text-2); font-size:.67rem; font-weight:700; }}
+    .live-flow {{ margin-top:.65rem; padding:.9rem 1rem; border:1px solid var(--ui-border); border-radius:16px; background:linear-gradient(180deg,var(--ui-surface),var(--ui-surface-2)); box-shadow:var(--ui-shadow); }}
+    .live-flow-steps {{ display:grid; gap:.08rem; margin-top:.7rem; }}
+    .live-flow-step {{ position:relative; display:flex; align-items:center; gap:.62rem; min-height:34px; color:var(--ui-muted); font-size:.7rem; }}
+    .live-flow-step:not(:last-child)::after {{ content:""; position:absolute; left:11px; top:28px; width:1px; height:14px; background:var(--ui-border); }}
+    .live-flow-marker {{ display:grid; place-items:center; width:23px; height:23px; flex:0 0 23px; border-radius:8px; border:1px solid var(--ui-border); background:var(--ui-surface-2); color:var(--ui-faint); font-size:.56rem; font-weight:850; }}
+    .live-flow-step.active {{ color:var(--ui-text-2); font-weight:750; }}
+    .live-flow-step.active .live-flow-marker {{ color:var(--ui-accent); border-color:color-mix(in srgb,var(--ui-accent) 32%,var(--ui-border)); background:var(--ui-tint); box-shadow:0 0 0 4px color-mix(in srgb,var(--ui-accent) 8%,transparent); animation:uiPulse 1.7s ease-in-out infinite; }}
+    .live-flow-step.complete {{ color:var(--ui-text-2); }}
+    .live-flow-step.complete .live-flow-marker {{ color:#10b981; border-color:rgba(16,185,129,.2); background:rgba(16,185,129,.07); }}
+    .live-flow-step.failed {{ color:var(--ui-text-2); }}
+    .live-flow-step.failed .live-flow-marker {{ color:#ef4444; border-color:rgba(239,68,68,.2); background:rgba(239,68,68,.07); }}
+    .live-flow small {{ display:block; margin-top:.55rem; color:var(--ui-faint); font-size:.59rem; line-height:1.45; }}
+    .detail-stat {{ padding:.58rem .68rem; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface-2); }}
+    .detail-stat span {{ display:block; color:var(--ui-muted); font-size:.57rem; font-weight:800; letter-spacing:.1em; }}
+    .detail-stat strong {{ display:block; margin-top:.16rem; color:var(--ui-text-2); font-size:.7rem; word-break:break-word; }}
+    .detail-label {{ margin:.7rem 0 .35rem; color:var(--ui-muted); font-size:.6rem; font-weight:800; letter-spacing:.12em; }}
     .ops-label {{ font-size:.62rem; text-transform:uppercase; letter-spacing:.12em; color:var(--ui-muted); font-weight:800; }}
     .ops-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:.55rem; }}
     .ops-panel {{ padding:.7rem .8rem; border:1px solid var(--ui-border); border-radius:14px; background:var(--ui-surface-2); }}
@@ -258,6 +275,7 @@ def apply_theme() -> None:
     .footer-note {{ text-align:center; font-size:.66rem; padding:.8rem 0 0; }}
 
     @keyframes uiFadeUp {{ from {{ opacity:0; transform:translateY(6px); }} to {{ opacity:1; transform:none; }} }}
+    @keyframes uiPulse {{ 0%,100% {{ box-shadow:0 0 0 4px color-mix(in srgb,var(--ui-accent) 8%,transparent); }} 50% {{ box-shadow:0 0 0 7px color-mix(in srgb,var(--ui-accent) 2%,transparent); }} }}
     @media (prefers-reduced-motion:reduce) {{ *,*::before,*::after {{ animation:none!important; transition:none!important; }} }}
     @media (max-width:900px) {{
       .block-container {{ padding-left:1rem; padding-right:1rem; }}

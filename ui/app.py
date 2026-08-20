@@ -89,6 +89,12 @@ def api_delete(path: str):
     return requests.delete(f"{API}{path}", headers=request_headers(), timeout=15)
 
 
+def queue_workflow(workflow_name: str, payload: dict) -> str:
+    response = api_post("/api/v1/runs", {"workflow": workflow_name, "payload": payload})
+    queued = response_json(response, "Queue automation")
+    return queued["run_id"]
+
+
 def response_json(response: requests.Response, context: str):
     """Safely decode an API response and expose useful diagnostics in the UI."""
     if not response.ok:
@@ -255,19 +261,30 @@ with left:
         payload["updates"] = [{"entity": entity, "metric": metric, "value": value, "blocker": blocker}]
 
     st.markdown('<div class="config-note">Publishing and external actions remain human-controlled.</div>', unsafe_allow_html=True)
-    queue_clicked = st.button("▶  Queue automation", type="primary", use_container_width=True)
+    action_col1, action_col2 = st.columns([1.45, 1], gap="small")
+    with action_col1:
+        queue_clicked = st.button("▶  Queue automation", type="primary", use_container_width=True)
+    with action_col2:
+        demo_clicked = st.button("⚡ Run demo", use_container_width=True, help="Queue the current workflow with its portfolio-safe sample inputs.")
 
 with right:
     workflow_preview(meta, mode_label)
 
-if queue_clicked:
+if queue_clicked or demo_clicked:
     try:
-        response = api_post("/api/v1/runs", {"workflow": workflow, "payload": payload})
-        queued = response_json(response, "Queue automation")
-        run_id = queued["run_id"]
+        run_payload = payload
+        if demo_clicked:
+            run_payload = {
+                "content": {"topics": ["AI agents, DeFi infrastructure"], "channels": ["linkedin", "x", "telegram"], "tone": "insightful"},
+                "competitor": {"competitors": ["Example Protocol", "Example AI Startup"]},
+                "outreach": {"candidates": [{"name": "Demo Partner", "type": "partner", "context": "AI infrastructure collaboration", "channel": "linkedin"}]},
+                "kpi": {"updates": [{"entity": "Demo Portfolio", "metric": "weekly progress", "value": "on track", "blocker": "None reported"}]},
+            }[workflow]
+        run_id = queue_workflow(workflow, run_payload)
         st.session_state["active_run_id"] = run_id
         st.session_state["result"] = None
         st.session_state["poll_count"] = 0
+        st.session_state["demo_run"] = demo_clicked
         st.rerun()
     except Exception as exc:
         st.error(str(exc))
@@ -276,6 +293,8 @@ active_run_id = st.session_state.get("active_run_id")
 if active_run_id:
     st.divider()
     st.markdown('<div class="section-kicker">LIVE EXECUTION</div>', unsafe_allow_html=True)
+    if st.session_state.get("demo_run"):
+        st.markdown('<div class="demo-note">⚡ Portfolio demo run · using safe sample inputs</div>', unsafe_allow_html=True)
     try:
         result = fetch_run(active_run_id)
     except Exception as exc:
@@ -309,6 +328,23 @@ if active_run_id:
             """,
             unsafe_allow_html=True,
         )
+
+    stage_state = "active" if status in {"queued", "running"} else ("complete" if status in {"completed", "completed_with_warnings", "approved"} else "failed")
+    steps = []
+    for index, stage in enumerate(meta["stages"]):
+        if stage_state == "complete":
+            marker, cls = "✓", "complete"
+        elif stage_state == "failed":
+            marker, cls = "!", "failed"
+        elif index == 0:
+            marker, cls = "●", "active"
+        else:
+            marker, cls = f"{index + 1:02d}", "pending"
+        steps.append(f'<div class="live-flow-step {cls}"><span class="live-flow-marker">{marker}</span><span>{stage}</span></div>')
+    st.markdown(
+        f'<div class="live-flow"><div class="ops-label">EXECUTION PATH</div><div class="live-flow-steps">{"".join(steps)}</div><small>Stage-level telemetry is represented by the workflow lifecycle; detailed audit events remain available below.</small></div>',
+        unsafe_allow_html=True,
+    )
 
     if status in {"queued", "running"}:
         poll_count = st.session_state.get("poll_count", 0) + 1
@@ -442,7 +478,11 @@ try:
             unsafe_allow_html=True,
         )
         with st.expander("View execution details", expanded=False):
-            st.code(run["run_id"])
+            detail_a, detail_b, detail_c = st.columns(3)
+            detail_a.markdown(f'<div class="detail-stat"><span>STATUS</span><strong>{status_label}</strong></div>', unsafe_allow_html=True)
+            detail_b.markdown(f'<div class="detail-stat"><span>DURATION</span><strong>{run["duration_ms"]} ms</strong></div>', unsafe_allow_html=True)
+            detail_c.markdown(f'<div class="detail-stat"><span>RUN ID</span><strong>{run["run_id"][:12]}</strong></div>', unsafe_allow_html=True)
+            st.markdown('<div class="detail-label">OUTPUT</div>', unsafe_allow_html=True)
             st.json(run["output"])
 except Exception as exc:
     st.caption(f"Run history unavailable: {exc}")
