@@ -103,7 +103,7 @@ workflow = st.sidebar.radio("Automation", ["content", "competitor", "outreach", 
 }[x])
 st.sidebar.divider()
 st.sidebar.markdown('<div class="premium-kicker">RUNTIME</div>', unsafe_allow_html=True)
-st.sidebar.markdown(f'<div class="status-pill"><span class="status-dot"></span>API online</div>', unsafe_allow_html=True)
+st.sidebar.markdown('<div class="status-pill"><span class="status-dot"></span>API online</div>', unsafe_allow_html=True)
 st.sidebar.caption(f"Endpoint · {API}")
 st.sidebar.caption(f"Version · {health['version']}")
 st.sidebar.caption("Queue · Redis + worker")
