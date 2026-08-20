@@ -29,7 +29,7 @@ def apply_theme() -> None:
       --ui-page:{tokens['page']}; --ui-surface:{tokens['surface']}; --ui-surface-2:{tokens['surface2']};
       --ui-border:{tokens['border']}; --ui-text:{tokens['text']}; --ui-muted:{tokens['muted']};
       --ui-faint:{tokens['faint']}; --ui-field:{tokens['field']}; --ui-shadow:{tokens['shadow']};
-      --ui-accent:#2563eb; --ui-accent-2:#7c3aed; --ui-tint:{tokens['tint'].format(accent1=accent1)};
+      --ui-accent:#2563eb; --ui-accent-2:#7c3aed; --ui-tint:{tokens['tint']};
     }}
     html, body, [data-testid="stAppViewContainer"], [data-testid="stMainBlockContainer"] {{
       color: var(--ui-text); background: var(--ui-page);
