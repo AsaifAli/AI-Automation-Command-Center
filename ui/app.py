@@ -5,6 +5,8 @@ from datetime import datetime
 import requests
 import streamlit as st
 
+from ui_theme import apply_theme
+
 API = os.getenv("API_BASE_URL", "").strip()
 if not API:
     api_host = os.getenv("API_HOST", "localhost").strip()
@@ -29,7 +31,6 @@ def request_headers() -> dict[str, str]:
 st.set_page_config(page_title="AI Automation Command Center", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
 
 # Shared premium visual layer (presentation-only).
-from ui_theme import apply_theme
 apply_theme()
 
 st.markdown("""

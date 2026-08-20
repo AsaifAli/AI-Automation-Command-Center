@@ -23,7 +23,6 @@ def apply_theme() -> None:
             text="#172033", muted="#5f6b7d", faint="#7b8797", field="#ffffff",
             shadow="0 14px 36px rgba(15,23,42,.08)", tint="#2563eb0b",
         )
-    accent1 = "#2563eb"; accent2 = "#7c3aed"
     css = f"""
     <style>
     :root {{
