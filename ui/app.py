@@ -27,6 +27,11 @@ def request_headers() -> dict[str, str]:
     return headers
 
 st.set_page_config(page_title="AI Automation Command Center", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
+
+# Shared premium visual layer (presentation-only).
+from ui_theme import apply_theme
+apply_theme()
+
 st.markdown("""
 <style>
 .hero {padding: .8rem 0 .3rem;}
