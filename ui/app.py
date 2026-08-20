@@ -33,19 +33,24 @@ st.set_page_config(page_title="AI Automation Command Center", page_icon="⚡", l
 # Shared premium visual layer (presentation-only).
 apply_theme()
 
-st.markdown("""
-<style>
-.hero {padding: .8rem 0 .3rem;}
-.muted {opacity: .7;}
-[data-testid="stMetricValue"] {font-size: 1.55rem;}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <section class="premium-hero">
+      <div class="premium-kicker">FLOWPILOT · AI OPERATIONS</div>
+      <div class="premium-title">⚡ AI Automation Command Center</div>
+      <div class="premium-subtitle">A portfolio-grade control plane for async AI workflows — with evidence, human approval, auditability, and operational visibility built into the experience.</div>
+      <div class="premium-strip">
+        <span class="premium-chip"><span class="premium-dot"></span>Async workflows</span>
+        <span class="premium-chip"><span class="premium-dot"></span>Evidence-aware</span>
+        <span class="premium-chip"><span class="premium-dot"></span>Human approval</span>
+        <span class="premium-chip"><span class="premium-dot"></span>Audit trail</span>
+        <span class="premium-chip"><span class="premium-dot"></span>Observability</span>
+      </div>
+    </section>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.markdown('<div class="hero">', unsafe_allow_html=True)
-st.title("⚡ AI Automation Command Center")
-st.markdown("**AI operations control plane** · async workflows · evidence · human approval · audit trail · observability")
-st.markdown('<span class="muted">Portfolio-grade demonstration of production-minded AI automation architecture.</span>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
 
 
 def api_get(path: str):
@@ -81,6 +86,7 @@ except Exception as exc:
     st.error(f"API unavailable: {exc}")
     st.stop()
 
+st.markdown('<div class="section-kicker">SYSTEM PULSE</div>', unsafe_allow_html=True)
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("API", "Online")
 m2.metric("Mode", "Demo" if health["demo_mode"] else "LLM")
@@ -88,17 +94,21 @@ m3.metric("Runs", metrics["workflow_runs_total"])
 m4.metric("Running", metrics["workflow_runs_running"])
 m5.metric("Approved", metrics["workflow_approvals_approved"])
 
+st.sidebar.markdown('<div class="premium-kicker">WORKFLOWS</div>', unsafe_allow_html=True)
 workflow = st.sidebar.radio("Automation", ["content", "competitor", "outreach", "kpi"], format_func=lambda x: {
-    "content": "✍️ Content",
+    "content": "✍️ Content Agent",
     "competitor": "🔎 Competitor Intel",
-    "outreach": "🤝 Reachout",
+    "outreach": "🤝 Reachout Agent",
     "kpi": "📊 KPI Briefing",
 }[x])
 st.sidebar.divider()
-st.sidebar.caption(f"API: {API}")
-st.sidebar.caption(f"Version: {health['version']}")
-st.sidebar.caption("Execution: Redis queue + worker")
+st.sidebar.markdown('<div class="premium-kicker">RUNTIME</div>', unsafe_allow_html=True)
+st.sidebar.markdown(f'<div class="status-pill"><span class="status-dot"></span>API online</div>', unsafe_allow_html=True)
+st.sidebar.caption(f"Endpoint · {API}")
+st.sidebar.caption(f"Version · {health['version']}")
+st.sidebar.caption("Queue · Redis + worker")
 
+st.markdown('<div class="section-kicker">AUTOMATION CONFIGURATION</div>', unsafe_allow_html=True)
 payload = {}
 if workflow == "content":
     st.subheader("Content Agent")
@@ -146,7 +156,8 @@ if st.button("▶ Queue automation", type="primary", use_container_width=True):
 active_run_id = st.session_state.get("active_run_id")
 if active_run_id:
     st.divider()
-    st.subheader("Live execution")
+    st.markdown('<div class="section-kicker">LIVE EXECUTION</div>', unsafe_allow_html=True)
+    st.subheader("Workflow run")
     try:
         result = fetch_run(active_run_id)
     except Exception as exc:
@@ -162,7 +173,8 @@ if active_run_id:
             st.rerun()
         st.stop()
     status = result.get("status")
-    st.write(f"Run **{active_run_id}** · status **{status}**")
+    dot_class = "status-dot" if status in {"queued", "running", "completed", "approved"} else ("status-dot warn" if status in {"pending", "rejected"} else "status-dot fail")
+    st.markdown(f'<span class="status-pill"><span class="{dot_class}"></span>{status.upper()}</span> <span class="premium-muted">Run {active_run_id}</span>', unsafe_allow_html=True)
     if status in {"queued", "running"}:
         poll_count = st.session_state.get("poll_count", 0) + 1
         st.session_state["poll_count"] = poll_count
@@ -206,6 +218,7 @@ if result:
                 st.warning("Rejection recorded in the audit trail.") if r.ok else st.error(r.text)
 
 st.divider()
+st.markdown('<div class="section-kicker">AUDIT TRAIL</div>', unsafe_allow_html=True)
 st.subheader("Recent executions")
 try:
     runs = response_json(api_get("/api/v1/runs?limit=10"), "Run history")["runs"]
@@ -223,4 +236,4 @@ except Exception as exc:
     st.caption(f"Run history unavailable: {exc}")
 
 st.divider()
-st.caption("Observability: Prometheus → Grafana · traces: OpenTelemetry → Jaeger")
+st.markdown('<div class="premium-muted" style="text-align:center;font-size:.72rem;padding:.25rem 0 1rem;">Observability · Prometheus → Grafana &nbsp;•&nbsp; Traces · OpenTelemetry → Jaeger</div>', unsafe_allow_html=True)
