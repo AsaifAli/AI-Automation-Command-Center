@@ -52,11 +52,16 @@ def apply_theme() -> None:
     }}
     [data-testid="stHeader"] {{ background:transparent; }}
 
-    /* Never hide Streamlit's native sidebar controls. This covers current and legacy selectors. */
+    /* Keep Streamlit's native React control available to the reliable custom toggle. */
     [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapseButton"] button,
-    [data-testid="collapsedControl"], [data-testid="collapsedControl"] button {{
-      display:flex !important; visibility:visible !important; opacity:1 !important;
-      pointer-events:auto !important; z-index:100000 !important;
+    [data-testid="collapsedControl"], [data-testid="collapsedControl"] button,
+    [data-testid="stSidebarCollapsedControl"], [data-testid="stSidebarCollapsedControl"] button {{
+      z-index:100000 !important;
+    }}
+    [data-testid="stIFrame"] {{
+      position:fixed !important; top:.55rem !important; left:.55rem !important;
+      width:44px !important; height:44px !important; z-index:100001 !important;
+      margin:0 !important; padding:0 !important; pointer-events:auto !important;
     }}
     [data-testid="stToolbar"] {{ visibility:hidden; height:0; }}
     #MainMenu, footer {{ visibility:hidden; }}

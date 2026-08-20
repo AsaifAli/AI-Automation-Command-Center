@@ -5,6 +5,7 @@ from datetime import datetime
 import requests
 import streamlit as st
 
+from sidebar_toggle import render_sidebar_toggle
 from ui_theme import apply_theme
 
 API = os.getenv("API_BASE_URL", "").strip()
@@ -32,6 +33,7 @@ st.set_page_config(page_title="AI Automation Command Center", page_icon="⚡", l
 
 # Shared premium visual layer (presentation-only).
 apply_theme()
+render_sidebar_toggle()
 
 st.markdown(
     """
@@ -59,6 +61,10 @@ def api_get(path: str):
 
 def api_post(path: str, body: dict):
     return requests.post(f"{API}{path}", headers={**request_headers(), "Content-Type": "application/json"}, json=body, timeout=15)
+
+
+def api_delete(path: str):
+    return requests.delete(f"{API}{path}", headers=request_headers(), timeout=15)
 
 
 def response_json(response: requests.Response, context: str):
@@ -219,7 +225,34 @@ if result:
 
 st.divider()
 st.markdown('<div class="section-kicker">AUDIT TRAIL</div>', unsafe_allow_html=True)
-st.subheader("Recent executions")
+header_col, action_col = st.columns([7, 1.6], vertical_alignment="center")
+with header_col:
+    st.subheader("Recent executions")
+with action_col:
+    if st.button("Clear history", use_container_width=True, help="Permanently remove completed and failed run history."):
+        st.session_state["confirm_clear_history"] = True
+
+if st.session_state.get("confirm_clear_history"):
+    st.warning("This permanently removes completed and failed runs, including their audit events and approvals. Queued/running runs are protected.")
+    confirm_col, cancel_col = st.columns([1, 1])
+    with confirm_col:
+        if st.button("Confirm clear", type="primary", use_container_width=True):
+            try:
+                response = api_delete("/api/v1/runs/history")
+                cleared = response_json(response, "Clear run history")
+                st.session_state["confirm_clear_history"] = False
+                st.session_state["active_run_id"] = None
+                st.session_state["result"] = None
+                st.session_state["poll_count"] = 0
+                st.success(f"Cleared {cleared.get('deleted_runs', 0)} run(s) from history.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state["confirm_clear_history"] = False
+            st.rerun()
+
 try:
     runs = response_json(api_get("/api/v1/runs?limit=10"), "Run history")["runs"]
     if not runs:

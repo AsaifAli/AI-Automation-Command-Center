@@ -163,6 +163,19 @@ class Repository:
             rows = conn.execute("SELECT * FROM workflow_runs ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
         return [self._row_to_run(row) for row in rows]
 
+    def clear_history(self) -> int:
+        """Delete completed/failed history while protecting active worker jobs."""
+        with self._connect() as conn:
+            active = conn.execute(
+                "SELECT COUNT(*) AS count FROM workflow_runs WHERE status IN ('queued', 'running')"
+            ).fetchone()
+            if int(active["count"] or 0) > 0:
+                raise ValueError("Cannot clear history while queued or running workflows exist")
+            result = conn.execute(
+                "DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running') RETURNING run_id"
+            )
+            return sum(1 for _ in result)
+
     def create_approval(self, run_id: str, decision: str, reviewer: str, note: str) -> dict[str, Any]:
         approval_id = str(uuid.uuid4())
         decided_at = datetime.now(timezone.utc)

@@ -32,6 +32,10 @@ class FakeRepo:
     def list_runs(self, limit):
         return [self.run] if self.run else []
 
+    def clear_history(self):
+        self.run = None
+        return 1
+
     def metrics(self):
         return {"workflow_runs_total": 0, "workflow_runs_completed": 0, "workflow_runs_failed": 0, "workflow_runs_queued": 1 if self.run else 0, "workflow_runs_running": 0, "workflow_approvals_total": 0, "workflow_approvals_approved": 0}
 
@@ -60,6 +64,13 @@ def test_queue_workflow():
     response = client.post("/api/v1/runs", json={"workflow": "content", "payload": {"topics": ["AI"]}})
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
+
+
+def test_clear_run_history():
+    client.post("/api/v1/runs", json={"workflow": "content", "payload": {"topics": ["AI"]}})
+    response = client.delete("/api/v1/runs/history")
+    assert response.status_code == 200
+    assert response.json()["deleted_runs"] == 1
 
 
 def test_outreach_approval():

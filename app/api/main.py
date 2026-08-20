@@ -47,7 +47,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "X-API-Key", "X-Request-ID", "X-LLM-Gateway-Token"],
 )
 
@@ -175,6 +175,18 @@ def list_runs(limit: int = 20, _: None = Depends(require_api_key)):
     except Exception as exc:
         logger.exception("run_history_failed")
         raise HTTPException(status_code=503, detail=f"Run history unavailable: {exc}") from exc
+
+
+@app.delete("/api/v1/runs/history", tags=["workflows"])
+def clear_run_history(_: None = Depends(require_api_key)):
+    try:
+        deleted = repo.clear_history()
+        return {"deleted_runs": deleted}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("run_history_clear_failed")
+        raise HTTPException(status_code=503, detail=f"Unable to clear run history: {exc}") from exc
 
 
 @app.get("/api/v1/runs/{run_id}", response_model=WorkflowResult, tags=["workflows"])
