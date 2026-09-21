@@ -12,7 +12,8 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     # Infrastructure
-    database_url: str = "postgresql://automation:automation@postgres:5432/automation"
+    # Optional. Render demo uses ephemeral in-memory state when unset.
+    database_url: str = ""
     redis_url: str = "redis://redis:6379/0"
     queue_name: str = "automation"
 

@@ -1,5 +1,7 @@
 import json
 import logging
+import copy
+import threading
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -96,19 +98,45 @@ ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
 
 
 class Repository:
+    """Workflow state repository with optional PostgreSQL or ephemeral memory."""
+
+    _memory_runs: dict[str, dict[str, Any]] = {}
+    _memory_approvals: dict[str, dict[str, Any]] = {}
+    _memory_lock = threading.RLock()
+
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._use_memory = not bool(settings.database_url.strip())
 
     def _connect(self):
+        if self._use_memory:
+            raise RuntimeError("In-memory repository does not use a database connection")
         return psycopg.connect(self.settings.database_url, row_factory=dict_row)
 
     def init_db(self) -> None:
+        if self._use_memory:
+            return
         with self._connect() as conn:
             conn.execute(SCHEMA)
 
     def create_pending_run(self, workflow: str) -> str:
         run_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
+        record = {
+            "run_id": run_id,
+            "workflow": workflow,
+            "status": "queued",
+            "output": {},
+            "evidence": [],
+            "duration_ms": 0,
+            "created_at": now,
+            "usage": None,
+            "warnings": [],
+        }
+        if self._use_memory:
+            with self._memory_lock:
+                self._memory_runs[run_id] = record
+            return run_id
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO workflow_runs(run_id,workflow,status,created_at) VALUES (%s,%s,%s,%s)",
@@ -122,6 +150,12 @@ class Repository:
 
     def mark_running(self, run_id: str) -> None:
         now = datetime.now(timezone.utc)
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if run:
+                    run["status"] = "running"
+            return
         with self._connect() as conn:
             conn.execute("UPDATE workflow_runs SET status='running' WHERE run_id=%s", (run_id,))
             conn.execute(
@@ -130,6 +164,24 @@ class Repository:
             )
 
     def save_result(self, result: dict[str, Any]) -> None:
+        if self._use_memory:
+            with self._memory_lock:
+                record = self._memory_runs.get(result["run_id"])
+                if not record:
+                    raise KeyError(f"Run not found: {result['run_id']}")
+                record.update(
+                    {
+                        "workflow": result.get("workflow", record["workflow"]),
+                        "status": result["status"],
+                        "output": copy.deepcopy(result.get("output", {})),
+                        "evidence": copy.deepcopy(result.get("evidence", [])),
+                        "duration_ms": result.get("duration_ms", 0),
+                        "created_at": result.get("created_at", record["created_at"]),
+                        "usage": _normalize_usage(result.get("usage")),
+                        "warnings": copy.deepcopy(result.get("warnings", [])),
+                    }
+                )
+            return
         with self._connect() as conn:
             conn.execute(
                 """UPDATE workflow_runs
@@ -154,43 +206,80 @@ class Repository:
             )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                return copy.deepcopy(run) if run else None
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM workflow_runs WHERE run_id=%s", (run_id,)).fetchone()
         return self._row_to_run(row) if row else None
 
     def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        if self._use_memory:
+            with self._memory_lock:
+                runs = sorted(self._memory_runs.values(), key=lambda item: item["created_at"], reverse=True)[:limit]
+                return copy.deepcopy(runs)
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM workflow_runs ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
         return [self._row_to_run(row) for row in rows]
 
     def clear_history(self) -> int:
-        """Delete completed/failed history while protecting active worker jobs."""
+        if self._use_memory:
+            with self._memory_lock:
+                active = [run for run in self._memory_runs.values() if run["status"] in ("queued", "running")]
+                if active:
+                    raise ValueError("Cannot clear history while queued or running workflows exist")
+                doomed = [run_id for run_id, run in self._memory_runs.items() if run["status"] not in ("queued", "running")]
+                for run_id in doomed:
+                    self._memory_runs.pop(run_id, None)
+                    for approval_id, approval in list(self._memory_approvals.items()):
+                        if approval["run_id"] == run_id:
+                            self._memory_approvals.pop(approval_id, None)
+                return len(doomed)
         with self._connect() as conn:
-            active = conn.execute(
-                "SELECT COUNT(*) AS count FROM workflow_runs WHERE status IN ('queued', 'running')"
-            ).fetchone()
+            active = conn.execute("SELECT COUNT(*) AS count FROM workflow_runs WHERE status IN ('queued', 'running')").fetchone()
             if int(active["count"] or 0) > 0:
                 raise ValueError("Cannot clear history while queued or running workflows exist")
-            result = conn.execute(
-                "DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running') RETURNING run_id"
-            )
+            result = conn.execute("DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running') RETURNING run_id")
             return sum(1 for _ in result)
 
     def create_approval(self, run_id: str, decision: str, reviewer: str, note: str) -> dict[str, Any]:
         approval_id = str(uuid.uuid4())
         decided_at = datetime.now(timezone.utc)
+        approval = {
+            "approval_id": approval_id,
+            "run_id": run_id,
+            "decision": decision,
+            "reviewer": reviewer,
+            "note": note,
+            "decided_at": decided_at,
+        }
+        if self._use_memory:
+            with self._memory_lock:
+                self._memory_approvals[approval_id] = approval
+            return copy.deepcopy(approval)
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO approvals VALUES (%s,%s,%s,%s,%s,%s)",
-                (approval_id, run_id, decision, reviewer, note, decided_at),
-            )
+            conn.execute("INSERT INTO approvals VALUES (%s,%s,%s,%s,%s,%s)", (approval_id, run_id, decision, reviewer, note, decided_at))
             conn.execute(
                 "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
                 (run_id, "human_approval", json.dumps({"approval_id": approval_id, "decision": decision, "reviewer": reviewer}), decided_at),
             )
-        return {"approval_id": approval_id, "run_id": run_id, "decision": decision, "reviewer": reviewer, "note": note, "decided_at": decided_at}
+        return approval
 
     def metrics(self) -> dict[str, int]:
+        if self._use_memory:
+            with self._memory_lock:
+                runs = list(self._memory_runs.values())
+                approvals = list(self._memory_approvals.values())
+            return {
+                "workflow_runs_total": len(runs),
+                "workflow_runs_completed": sum(1 for run in runs if run["status"] in ("completed", "completed_with_warnings")),
+                "workflow_runs_failed": sum(1 for run in runs if run["status"] == "failed"),
+                "workflow_runs_queued": sum(1 for run in runs if run["status"] == "queued"),
+                "workflow_runs_running": sum(1 for run in runs if run["status"] == "running"),
+                "workflow_approvals_total": len(approvals),
+                "workflow_approvals_approved": sum(1 for item in approvals if item["decision"] == "approved"),
+            }
         with self._connect() as conn:
             runs = conn.execute(
                 """SELECT COUNT(*) AS total,
@@ -200,9 +289,7 @@ class Repository:
                           COUNT(*) FILTER (WHERE status='running') AS running
                    FROM workflow_runs"""
             ).fetchone()
-            approvals = conn.execute(
-                "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE decision='approved') AS approved FROM approvals"
-            ).fetchone()
+            approvals = conn.execute("SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE decision='approved') AS approved FROM approvals").fetchone()
         return {
             "workflow_runs_total": int(runs["total"] or 0),
             "workflow_runs_completed": int(runs["completed"] or 0),

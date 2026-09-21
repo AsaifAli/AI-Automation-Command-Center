@@ -36,12 +36,6 @@ services:
         value: "false"
       - key: OTEL_ENABLED
         value: "false"
-      # This MUST be supplied by the Render PostgreSQL resource.
-      # The application otherwise falls back to postgres:5432.
-      - key: DATABASE_URL
-        fromDatabase:
-          name: ai-automation-db
-          property: connectionString
 
   - type: web
     name: ai-automation-ui
@@ -67,9 +61,3 @@ services:
           type: web
           name: ai-automation-api
           envVarKey: API_KEY
-
-databases:
-  - name: ai-automation-db
-    plan: free
-    databaseName: automation
-    user: automation

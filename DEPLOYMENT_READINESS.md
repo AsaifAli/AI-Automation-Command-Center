@@ -4,14 +4,24 @@ Status: Render demo-ready.
 
 ## Public demo topology
 
-Two Render Free web services plus one Render Free Postgres database:
+Two Render Free web services:
 
 - `ai-automation-api` — FastAPI API
 - `ai-automation-ui` — Streamlit UI
-- `ai-automation-db` — managed Postgres
 
-The full local Compose stack remains available for development and includes Redis, worker, scheduler, LiteLLM and observability.
+The public demo intentionally does **not** provision a Render Postgres database. The API runs with `INLINE_EXECUTION=true` and uses an ephemeral in-memory state store when `DATABASE_URL` is unset. Run history, approvals, and audit state are therefore disposable and tied to the running process.
 
-For the public demo, Redis/worker infrastructure is intentionally omitted. `INLINE_EXECUTION=true` makes the API execute a workflow in-process so the demo does not require a background worker or Redis. The LLM still uses an external OpenAI-compatible endpoint (OpenRouter).
+The full local Compose stack can still provide PostgreSQL when durable local testing is useful.
 
-Render Free Postgres is temporary: Render currently expires free Postgres databases after 30 days. This is acceptable for the portfolio demo, not for production. citeturn333765search0
+## Demo persistence boundary
+
+This deployment is intentionally a portfolio/demo environment rather than a durable production system. A service restart, redeploy, or instance replacement can clear workflow history and approvals.
+
+## First deployment test
+
+1. API `/health`
+2. API `/ready`
+3. UI loads
+4. Run a small demo workflow
+5. Confirm run details and metrics are visible
+6. Restart/redeploy and confirm that state is treated as disposable

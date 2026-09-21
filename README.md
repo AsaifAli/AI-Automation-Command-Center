@@ -23,7 +23,7 @@ Most agent portfolios stop at `prompt -> LLM -> answer`. This project demonstrat
 - **LangGraph** workflow orchestration
 - **FastAPI** control plane with typed contracts
 - **Redis + RQ** asynchronous job execution
-- **PostgreSQL** durable run and audit storage
+- **PostgreSQL (optional local mode)** for durable run and audit storage
 - **Human-in-the-loop** approval for external-impact workflows
 - **Evidence and validation** instead of unsupported claims
 - **Scheduled automation** through a dedicated scheduler service
@@ -40,7 +40,7 @@ Streamlit Operations Console
         ↓
 FastAPI Control Plane
         ↓
-Redis Queue ─────────── PostgreSQL
+Redis Queue (local async mode)
         ↓                  │
 RQ Workers               Audit / History
         ↓
