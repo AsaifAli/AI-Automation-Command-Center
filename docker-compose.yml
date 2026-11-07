@@ -19,7 +19,7 @@ services:
     environment:
       POSTGRES_DB: automation
       POSTGRES_USER: automation
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-automation}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -52,7 +52,7 @@ services:
       APP_VERSION: ${APP_VERSION:-3.3.2}
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:-automation}@postgres:5432/automation
+      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@postgres:5432/automation
       REDIS_URL: redis://redis:6379/0
       QUEUE_NAME: automation
       DEMO_MODE: ${DEMO_MODE:-false}
@@ -62,7 +62,7 @@ services:
       OPENAI_MODEL: ${OPENAI_MODEL:-portfolio-free}
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-30}
       MAX_RETRIES: ${MAX_RETRIES:-2}
-      API_AUTH_ENABLED: ${API_AUTH_ENABLED:-false}
+      API_AUTH_ENABLED: ${API_AUTH_ENABLED:-true}
       API_KEY: ${API_KEY:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8501}
       DEMO_CONFIG_PATH: /app/config.json
@@ -104,7 +104,7 @@ services:
       APP_VERSION: ${APP_VERSION:-3.3.2}
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:-automation}@postgres:5432/automation
+      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@postgres:5432/automation
       REDIS_URL: redis://redis:6379/0
       QUEUE_NAME: automation
       DEMO_MODE: ${DEMO_MODE:-false}
@@ -142,7 +142,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:-automation}@postgres:5432/automation
+      DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@postgres:5432/automation
       REDIS_URL: redis://redis:6379/0
       QUEUE_NAME: automation
       DEMO_CONFIG_PATH: /app/config.json
@@ -188,9 +188,10 @@ services:
       - --storage.tsdb.path=/prometheus
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./secrets/prometheus-token:/etc/prometheus/secrets/api-token:ro
       - prometheus_data:/prometheus
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     depends_on:
       api:
         condition: service_healthy
@@ -201,14 +202,14 @@ services:
     container_name: ai_automation_grafana
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD_must_be_set_in_.env}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     depends_on:
       prometheus:
         condition: service_started
@@ -220,7 +221,7 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "${JAEGER_PORT:-16686}:16686"
+      - "127.0.0.1:${JAEGER_PORT:-16686}:16686"
     restart: unless-stopped
 
   otel-collector:

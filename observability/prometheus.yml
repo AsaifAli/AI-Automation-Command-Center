@@ -5,5 +5,8 @@ global:
 scrape_configs:
   - job_name: ai-automation-api
     metrics_path: /prometheus
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/api-token
     static_configs:
       - targets: ["api:8000"]

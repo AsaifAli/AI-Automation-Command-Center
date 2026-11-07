@@ -1,3 +1,4 @@
+
 import json
 import logging
 import time
@@ -21,8 +22,6 @@ class LLMProvider:
         gateway_token = get_llm_gateway_token()
         gateway_url = (self.settings.llm_gateway_url or self.settings.llm_base_url).strip()
 
-        # A request-scoped gateway session is a valid production credential
-        # even when the service has no static provider key configured.
         if not gateway_token and (self.settings.demo_mode or not self.settings.openai_api_key):
             return {
                 "text": self._demo(system, user),
@@ -42,6 +41,7 @@ class LLMProvider:
             url = gateway_url.rstrip("/") + "/chat/completions"
         else:
             url = self.settings.openai_base_url.rstrip("/") + "/chat/completions"
+
         payload = {
             "model": self.settings.llm_model or self.settings.openai_model,
             "temperature": 0.2,
@@ -50,12 +50,13 @@ class LLMProvider:
                 {"role": "user", "content": user},
             ],
         }
+
         api_key = gateway_token or self.settings.openai_api_key
         headers = {"Authorization": f"Bearer {api_key}"}
-        last_error: Exception | None = None
 
         for attempt in range(self.settings.max_retries + 1):
             started = time.perf_counter()
+
             try:
                 response = httpx.post(
                     url,
@@ -64,44 +65,84 @@ class LLMProvider:
                     timeout=self.settings.request_timeout_seconds,
                 )
                 response.raise_for_status()
+
                 data = response.json()
                 usage = data.get("usage", {})
                 prompt_tokens = int(usage.get("prompt_tokens", 0))
                 completion_tokens = int(usage.get("completion_tokens", 0))
-                total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens))
+                total_tokens = int(
+                    usage.get(
+                        "total_tokens",
+                        prompt_tokens + completion_tokens,
+                    )
+                )
+
                 cost = (
                     prompt_tokens * self.settings.input_cost_per_million
                     + completion_tokens * self.settings.output_cost_per_million
                 ) / 1_000_000
-                logger.info("llm_request_complete attempt=%s latency_ms=%s", attempt + 1, int((time.perf_counter() - started) * 1000))
+
+                logger.info(
+                    "llm_request_complete attempt=%s latency_ms=%s",
+                    attempt + 1,
+                    int((time.perf_counter() - started) * 1000),
+                )
+
                 return {
                     "text": data["choices"][0]["message"]["content"],
                     "provider": self.settings.llm_provider,
-                    "model": data.get("model", self.settings.openai_model),
+                    "model": data.get(
+                        "model",
+                        self.settings.openai_model,
+                    ),
                     "usage": {
                         "provider": self.settings.llm_provider,
-                        "model": data.get("model", self.settings.openai_model),
+                        "model": data.get(
+                            "model",
+                            self.settings.openai_model,
+                        ),
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,
                         "estimated_cost_usd": round(cost, 8),
                     },
                 }
-            except Exception as exc:  # provider boundary: translate third-party errors into one retryable path
-                last_error = exc
-                logger.warning("llm_request_failed attempt=%s error=%s", attempt + 1, exc)
+
+            except Exception as exc:
+                status_code = (
+                    exc.response.status_code
+                    if isinstance(exc, httpx.HTTPStatusError)
+                    else None
+                )
+
+                logger.warning(
+                    "llm_request_failed provider=%s attempt=%s error_type=%s status_code=%s",
+                    self.settings.llm_provider,
+                    attempt + 1,
+                    type(exc).__name__,
+                    status_code,
+                )
+
                 if attempt < self.settings.max_retries:
                     time.sleep(min(2**attempt, 4))
 
-        raise RuntimeError(f"LLM provider failed after retries: {last_error}")
+        raise RuntimeError(
+            "LLM provider request failed after configured retries."
+        ) from None
 
     @staticmethod
     def _demo(system: str, user: str) -> str:
         return json.dumps(
             {
                 "summary": "Deterministic demo output generated without external credentials.",
-                "recommendation": "Review evidence, approve the proposed action, then execute through an approved integration.",
+                "recommendation": (
+                    "Review evidence, approve the proposed action, "
+                    "then execute through an approved integration."
+                ),
                 "input_preview": user[:240],
-                "guardrail": "External actions require human approval in this portfolio demo.",
+                "guardrail": (
+                    "External actions require human approval "
+                    "in this portfolio demo."
+                ),
             }
         )

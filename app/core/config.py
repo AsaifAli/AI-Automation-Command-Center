@@ -1,5 +1,7 @@
+
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,7 +14,6 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     # Infrastructure
-    # Optional. Render demo uses ephemeral in-memory state when unset.
     database_url: str = ""
     redis_url: str = "redis://redis:6379/0"
     queue_name: str = "automation"
@@ -33,7 +34,20 @@ class Settings(BaseSettings):
     # API / security
     api_base_url: str = "http://localhost:8000"
     api_auth_enabled: bool = False
+
+    # Existing dashboard key: retained as admin.
     api_key: str = ""
+
+    # Role-specific API credentials.
+    api_viewer_keys: str = ""
+    api_operator_keys: str = ""
+    api_reviewer_keys: str = ""
+    api_admin_keys: str = ""
+
+    # Server-assigned audit identities.
+    api_reviewer_name: str = "Configured Reviewer"
+    api_admin_name: str = "API administrator"
+
     cors_origins: str = "http://localhost:8501"
     max_payload_bytes: int = 1_000_000
 
@@ -57,7 +71,57 @@ class Settings(BaseSettings):
     otel_service_name: str = "ai-automation-api"
     otel_exporter_endpoint: str = "http://otel-collector:4318/v1/traces"
 
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
+    @model_validator(mode="after")
+    def validate_api_credentials(self):
+        if self.app_env.strip().lower() in {"prod", "production"} and not self.api_auth_enabled:
+            raise ValueError("API_AUTH_ENABLED must be true in production")
+
+        role_values = {
+            "viewer": self.api_viewer_keys,
+            "operator": self.api_operator_keys,
+            "reviewer": self.api_reviewer_keys,
+            # Legacy API_KEY is the dashboard/admin credential.
+            "admin": ",".join(
+                value
+                for value in (
+                    self.api_admin_keys,
+                    self.api_key,
+                )
+                if value
+            ),
+        }
+
+        configured: dict[str, str] = {}
+
+        for role, raw_values in role_values.items():
+            for candidate in (
+                item.strip()
+                for item in raw_values.split(",")
+            ):
+                if not candidate:
+                    continue
+
+                previous_role = configured.get(candidate)
+
+                if previous_role and previous_role != role:
+                    raise ValueError(
+                        "API role credentials must be unique across roles"
+                    )
+
+                configured[candidate] = role
+
+        if self.api_auth_enabled and not configured:
+            raise ValueError(
+                "API_AUTH_ENABLED requires at least one configured API role key"
+            )
+
+        return self
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
 
 @lru_cache

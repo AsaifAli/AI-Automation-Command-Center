@@ -1,3 +1,4 @@
+
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -56,8 +57,11 @@ class HealthResponse(BaseModel):
 
 class ApprovalRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected)$")
-    reviewer: str = Field(min_length=2, max_length=100)
     note: str = Field(default="", max_length=1000)
+
+    # Deprecated compatibility field.
+    # Never use this as the authenticated reviewer identity.
+    reviewer: str | None = Field(default=None, max_length=100)
 
 
 class ApprovalResponse(BaseModel):

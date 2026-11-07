@@ -8,3 +8,5 @@ env/
 *.db
 .DS_Store
 .streamlit/secrets.toml
+
+/secrets/

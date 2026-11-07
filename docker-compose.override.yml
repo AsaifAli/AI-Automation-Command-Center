@@ -1,0 +1,10 @@
+
+services:
+  api:
+    environment:
+      API_VIEWER_KEYS: ${API_VIEWER_KEYS:-}
+      API_OPERATOR_KEYS: ${API_OPERATOR_KEYS:-}
+      API_REVIEWER_KEYS: ${API_REVIEWER_KEYS:-}
+      API_ADMIN_KEYS: ${API_ADMIN_KEYS:-}
+      API_REVIEWER_NAME: ${API_REVIEWER_NAME:-Configured Reviewer}
+      API_ADMIN_NAME: ${API_ADMIN_NAME:-API administrator}

@@ -15,6 +15,8 @@ if not API:
     API = f"http://{api_host}:{api_port}"
 API_KEY = os.getenv("API_KEY", "")
 HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
+API_REVIEWER_KEY = os.getenv("API_REVIEWER_KEY", "")
+API_ADMIN_KEY = os.getenv("API_ADMIN_KEY", "")
 
 WORKFLOW_META = {
     "content": {

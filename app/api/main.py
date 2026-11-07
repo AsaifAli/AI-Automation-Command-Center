@@ -1,3 +1,4 @@
+
 import logging
 import time
 import uuid
@@ -5,12 +6,17 @@ import uuid
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 from redis import Redis
 from rq import Queue
+from starlette.responses import Response
 
+from app.core.auth import Principal, authenticate_api_key, require_permission
 from app.core.config import get_settings
+from app.core.llm_gateway_context import (
+    reset_llm_gateway_token,
+    set_llm_gateway_token,
+)
 from app.core.logging import configure_logging
 from app.core.telemetry import configure_telemetry
 from app.integrations.llm import LLMProvider
@@ -19,8 +25,8 @@ from app.models.schemas import (
     ApprovalResponse,
     HealthResponse,
     MetricResponse,
-    RunRequest,
     RunListResponse,
+    RunRequest,
     WorkflowResult,
 )
 from app.storage.repository import Repository
@@ -28,6 +34,7 @@ from app.workers.jobs import execute_run
 
 settings = get_settings()
 configure_logging(settings.log_level)
+
 logger = logging.getLogger(__name__)
 repo = Repository(settings)
 
@@ -48,8 +55,8 @@ app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     description=(
-        "Production-minded AI automation control plane with async execution, "
-        "human approval, evidence, auditability and observability."
+        "AI automation control plane with asynchronous execution, "
+        "role-based authorization, human approval and observability."
     ),
     docs_url="/docs",
     redoc_url="/redoc",
@@ -74,14 +81,10 @@ app.add_middleware(
 
 
 def queue() -> Queue:
-    return Queue(settings.queue_name, connection=Redis.from_url(settings.redis_url))
-
-
-def require_api_key(x_api_key: str | None = Header(default=None)):
-    if settings.api_auth_enabled and (
-        not settings.api_key or x_api_key != settings.api_key
-    ):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return Queue(
+        settings.queue_name,
+        connection=Redis.from_url(settings.redis_url),
+    )
 
 
 @app.on_event("startup")
@@ -89,7 +92,9 @@ def startup() -> None:
     if settings.database_url.strip():
         repo.init_db()
     else:
-        logger.info("database persistence disabled; using ephemeral in-memory state")
+        logger.info(
+            "database persistence disabled; using ephemeral in-memory state"
+        )
 
     LLMProvider(settings)
     configure_telemetry(settings)
@@ -98,13 +103,13 @@ def startup() -> None:
 
 @app.middleware("http")
 async def request_context(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-
-    from app.core.llm_gateway_context import set_llm_gateway_token
-
-    set_llm_gateway_token(request.headers.get("X-LLM-Gateway-Token", ""))
+    request_id = request.headers.get(
+        "X-Request-ID",
+        str(uuid.uuid4()),
+    )
 
     content_length = request.headers.get("content-length")
+
     if content_length:
         try:
             if int(content_length) > settings.max_payload_bytes:
@@ -118,8 +123,17 @@ async def request_context(request: Request, call_next):
                 content={"detail": "Invalid Content-Length header"},
             )
 
+    context_token = set_llm_gateway_token(
+        request.headers.get("X-LLM-Gateway-Token", "")
+    )
+
     started = time.perf_counter()
-    response = await call_next(request)
+
+    try:
+        response = await call_next(request)
+    finally:
+        reset_llm_gateway_token(context_token)
+
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -133,12 +147,18 @@ async def request_context(request: Request, call_next):
         int((time.perf_counter() - started) * 1000),
         request_id,
     )
+
     return response
 
 
 @app.get("/", tags=["system"])
 def root():
-    state_store = "ephemeral-memory" if not settings.database_url.strip() else "postgresql"
+    state_store = (
+        "ephemeral-memory"
+        if not settings.database_url.strip()
+        else "postgresql"
+    )
+
     architecture = (
         "api -> inline execution -> ephemeral in-memory state"
         if settings.inline_execution and not settings.database_url.strip()
@@ -146,6 +166,7 @@ def root():
         if settings.database_url.strip()
         else "api -> execution -> ephemeral in-memory state"
     )
+
     return {
         "service": settings.app_name,
         "version": settings.app_version,
@@ -155,7 +176,11 @@ def root():
     }
 
 
-@app.get("/health", response_model=HealthResponse, tags=["system"])
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    tags=["system"],
+)
 def health():
     return HealthResponse(
         status="ok",
@@ -167,9 +192,14 @@ def health():
 
 @app.get("/ready", tags=["system"])
 def ready():
+    # Kept public for Docker and deployment health probes.
     try:
         repo.metrics()
-        redis_status = "inline" if settings.inline_execution else "available"
+
+        redis_status = (
+            "inline" if settings.inline_execution else "available"
+        )
+
         if not settings.inline_execution:
             Redis.from_url(settings.redis_url).ping()
 
@@ -183,28 +213,56 @@ def ready():
             "redis": redis_status,
             "llm": "demo" if settings.demo_mode else "configured",
         }
-    except Exception as exc:
+
+    except Exception:
+        logger.exception("readiness_check_failed")
+
         raise HTTPException(
             status_code=503,
-            detail=f"Readiness check failed: {exc}",
-        ) from exc
+            detail="Readiness check failed",
+        ) from None
 
 
-@app.get("/metrics", response_model=MetricResponse, tags=["observability"])
-def metrics():
+@app.get(
+    "/metrics",
+    response_model=MetricResponse,
+    tags=["observability"],
+)
+def metrics(
+    _: Principal = Depends(
+        require_permission("metrics:read")
+    ),
+):
     return repo.metrics()
 
 
-@app.get("/prometheus", include_in_schema=False)
-def prometheus_metrics():
+@app.get(
+    "/prometheus",
+    include_in_schema=False,
+)
+def prometheus_metrics(authorization: str | None = Header(default=None, alias="Authorization")):
+    settings = get_settings()
+    if settings.api_auth_enabled:
+        scheme, separator, token = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not separator or not token:
+            raise HTTPException(status_code=401, detail="Missing or invalid bearer token")
+        principal = authenticate_api_key(token, settings)
+        if not principal.can("metrics:read"):
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
     values = repo.metrics()
     for name, gauge in PROM_METRICS.items():
         gauge.set(values.get(name, 0))
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-
-@app.get("/api/v1/workflows", tags=["workflows"])
-def workflows(_: None = Depends(require_api_key)):
+@app.get(
+    "/api/v1/workflows",
+    tags=["workflows"],
+)
+def workflows(
+    _: Principal = Depends(
+        require_permission("workflows:read")
+    ),
+):
     return {
         "workflows": [
             {
@@ -235,18 +293,38 @@ def workflows(_: None = Depends(require_api_key)):
 )
 def run_workflow(
     request: RunRequest,
-    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
-    _: None = Depends(require_api_key),
+    llm_gateway_token: str = Header(
+        default="",
+        alias="X-LLM-Gateway-Token",
+    ),
+    _: Principal = Depends(
+        require_permission("runs:execute")
+    ),
 ):
-    run_id = repo.create_pending_run(request.workflow.value)
+    # Never serialize a request-scoped token into Redis/RQ job data.
+    if llm_gateway_token and not settings.inline_execution:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Request-scoped gateway tokens are supported only "
+                "with inline execution. Use configured service-level "
+                "LLM credentials for queued runs."
+            ),
+        )
+
+    run_id = repo.create_pending_run(
+        request.workflow.value
+    )
 
     payload = dict(request.payload)
-    token = llm_gateway_token
-    if token:
-        payload["_llm_gateway_token"] = token
 
     if settings.inline_execution:
-        execute_run(run_id, request.workflow.value, payload)
+        execute_run(
+            run_id,
+            request.workflow.value,
+            payload,
+            use_request_context=True,
+        )
     else:
         queue().enqueue(
             execute_run,
@@ -257,8 +335,13 @@ def run_workflow(
         )
 
     result = repo.get_run(run_id)
+
     if not result:
-        raise HTTPException(status_code=500, detail="Failed to create workflow run")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create workflow run",
+        )
+
     return result
 
 
@@ -267,32 +350,60 @@ def run_workflow(
     response_model=RunListResponse,
     tags=["workflows"],
 )
-def list_runs(limit: int = 20, _: None = Depends(require_api_key)):
+def list_runs(
+    limit: int = 20,
+    _: Principal = Depends(
+        require_permission("runs:read")
+    ),
+):
     safe_limit = min(max(limit, 1), 100)
+
     try:
         runs = repo.list_runs(safe_limit)
-        return {"runs": runs, "total": len(runs)}
-    except Exception as exc:
+
+        return {
+            "runs": runs,
+            "total": len(runs),
+        }
+
+    except Exception:
         logger.exception("run_history_failed")
+
         raise HTTPException(
             status_code=503,
-            detail=f"Run history unavailable: {exc}",
-        ) from exc
+            detail="Run history unavailable",
+        ) from None
 
 
-@app.delete("/api/v1/runs/history", tags=["workflows"])
-def clear_run_history(_: None = Depends(require_api_key)):
+@app.delete(
+    "/api/v1/runs/history",
+    tags=["workflows"],
+)
+def clear_run_history(
+    _: Principal = Depends(
+        require_permission("runs:delete")
+    ),
+):
     try:
         deleted = repo.clear_history()
-        return {"deleted_runs": deleted}
+
+        return {
+            "deleted_runs": deleted,
+        }
+
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    except Exception:
         logger.exception("run_history_clear_failed")
+
         raise HTTPException(
             status_code=503,
-            detail=f"Unable to clear run history: {exc}",
-        ) from exc
+            detail="Unable to clear run history",
+        ) from None
 
 
 @app.get(
@@ -300,18 +411,32 @@ def clear_run_history(_: None = Depends(require_api_key)):
     response_model=WorkflowResult,
     tags=["workflows"],
 )
-def get_run(run_id: str, _: None = Depends(require_api_key)):
+def get_run(
+    run_id: str,
+    _: Principal = Depends(
+        require_permission("runs:read")
+    ),
+):
     try:
         result = repo.get_run(run_id)
-    except Exception as exc:
-        logger.exception("run_lookup_failed run_id=%s", run_id)
+
+    except Exception:
+        logger.exception(
+            "run_lookup_failed run_id=%s",
+            run_id,
+        )
+
         raise HTTPException(
             status_code=503,
-            detail=f"Run lookup unavailable: {exc}",
-        ) from exc
+            detail="Run lookup unavailable",
+        ) from None
 
     if not result:
-        raise HTTPException(status_code=404, detail="Run not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Run not found",
+        )
+
     return result
 
 
@@ -323,11 +448,17 @@ def get_run(run_id: str, _: None = Depends(require_api_key)):
 def decide_approval(
     run_id: str,
     request: ApprovalRequest,
-    _: None = Depends(require_api_key),
+    principal: Principal = Depends(
+        require_permission("approvals:decide")
+    ),
 ):
     result = repo.get_run(run_id)
+
     if not result:
-        raise HTTPException(status_code=404, detail="Run not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Run not found",
+        )
 
     if result["workflow"] != "outreach":
         raise HTTPException(
@@ -335,9 +466,11 @@ def decide_approval(
             detail="Only outreach runs support human approval",
         )
 
+    # The authenticated principal determines reviewer identity.
+    # The legacy request.reviewer field is deliberately ignored.
     return repo.create_approval(
         run_id,
         request.decision,
-        request.reviewer,
+        principal.subject,
         request.note,
     )
