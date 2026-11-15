@@ -1,11 +1,11 @@
+import copy
 import json
 import logging
-import copy
 import threading
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, ClassVar
 
 import psycopg
 from psycopg.rows import dict_row
@@ -48,6 +48,7 @@ def _normalize_usage(usage: Any) -> dict[str, Any] | None:
         int(normalized.get("prompt_tokens", 0)) + int(normalized.get("completion_tokens", 0)),
     )
     normalized.setdefault("estimated_cost_usd", 0.0)
+    normalized.setdefault("cost_estimate_available", True)
     return normalized
 
 
@@ -94,15 +95,24 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS detail_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS gateway_job_credentials (
+    credential_id UUID PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    encrypted_token BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_job_credentials_expires_at
+    ON gateway_job_credentials(expires_at);
 """
 
 
 class Repository:
     """Workflow state repository with optional PostgreSQL or ephemeral memory."""
 
-    _memory_runs: dict[str, dict[str, Any]] = {}
-    _memory_approvals: dict[str, dict[str, Any]] = {}
-    _memory_lock = threading.RLock()
+    _memory_runs: ClassVar[dict[str, dict[str, Any]]] = {}
+    _memory_approvals: ClassVar[dict[str, dict[str, Any]]] = {}
+    _memory_lock: ClassVar[Any] = threading.RLock()
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -118,10 +128,14 @@ class Repository:
             return
         with self._connect() as conn:
             conn.execute(SCHEMA)
+            conn.execute(
+                "DELETE FROM gateway_job_credentials WHERE expires_at <= %s",
+                (datetime.now(UTC),),
+            )
 
     def create_pending_run(self, workflow: str) -> str:
         run_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         record = {
             "run_id": run_id,
             "workflow": workflow,
@@ -148,8 +162,98 @@ class Repository:
             )
         return run_id
 
+
+    def store_gateway_job_credential(
+        self,
+        run_id: str,
+        encrypted_token: bytes,
+        ttl_seconds: int,
+    ) -> str:
+        """Persist an encrypted short-lived bearer and return an opaque UUID.
+
+        The raw bearer is never accepted by this repository method. Only the
+        already-encrypted bytes are stored, and callers put only the returned
+        UUID in the RQ job arguments.
+        """
+        if self._use_memory:
+            raise RuntimeError(
+                "Queued Gateway sessions require persistent PostgreSQL storage."
+            )
+        if not encrypted_token:
+            raise ValueError("Encrypted Gateway credential cannot be empty")
+        if not 60 <= int(ttl_seconds) <= 1800:
+            raise ValueError("Gateway credential TTL is outside the allowed range")
+
+        credential_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=int(ttl_seconds))
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM gateway_job_credentials WHERE expires_at <= %s",
+                (now,),
+            )
+            conn.execute(
+                """INSERT INTO gateway_job_credentials
+                   (credential_id, run_id, encrypted_token, created_at, expires_at)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (credential_id, run_id, bytes(encrypted_token), now, expires_at),
+            )
+            conn.execute(
+                """INSERT INTO audit_events(run_id,event,detail_json,created_at)
+                   VALUES (%s,%s,%s,%s)""",
+                (run_id, "gateway_credential_queued", "{}", now),
+            )
+        return credential_id
+
+    def consume_gateway_job_credential(
+        self,
+        run_id: str,
+        credential_id: str,
+    ) -> bytes | None:
+        """Atomically consume the encrypted credential for exactly one run."""
+        if self._use_memory:
+            raise RuntimeError(
+                "Queued Gateway sessions require persistent PostgreSQL storage."
+            )
+        now = datetime.now(UTC)
+        with self._connect() as conn:
+            row = conn.execute(
+                """DELETE FROM gateway_job_credentials
+                   WHERE credential_id=%s AND run_id=%s AND expires_at > %s
+                   RETURNING encrypted_token""",
+                (credential_id, run_id, now),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    """INSERT INTO audit_events(run_id,event,detail_json,created_at)
+                       VALUES (%s,%s,%s,%s)""",
+                    (run_id, "gateway_credential_consumed", "{}", now),
+                )
+                value = row["encrypted_token"]
+                return bytes(value) if value is not None else None
+            conn.execute(
+                """DELETE FROM gateway_job_credentials
+                   WHERE credential_id=%s AND run_id=%s AND expires_at <= %s""",
+                (credential_id, run_id, now),
+            )
+        return None
+
+    def delete_gateway_job_credential(
+        self,
+        run_id: str,
+        credential_id: str,
+    ) -> None:
+        """Best-effort cleanup when RQ dispatch fails."""
+        if self._use_memory:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM gateway_job_credentials WHERE credential_id=%s AND run_id=%s",
+                (credential_id, run_id),
+            )
+
     def mark_running(self, run_id: str) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -199,7 +303,7 @@ class Repository:
                     result["run_id"],
                 ),
             )
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             conn.execute(
                 "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
                 (result["run_id"], result["status"], json.dumps({"duration_ms": result.get("duration_ms", 0)}), now),
@@ -245,7 +349,7 @@ class Repository:
 
     def create_approval(self, run_id: str, decision: str, reviewer: str, note: str) -> dict[str, Any]:
         approval_id = str(uuid.uuid4())
-        decided_at = datetime.now(timezone.utc)
+        decided_at = datetime.now(UTC)
         approval = {
             "approval_id": approval_id,
             "run_id": run_id,

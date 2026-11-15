@@ -1,7 +1,8 @@
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 import app.api.main as api_module
@@ -24,7 +25,7 @@ class FakeRepo:
             "output": {},
             "evidence": [],
             "duration_ms": 0,
-            "created_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(UTC),
             "usage": None,
             "warnings": [],
         }
@@ -70,7 +71,7 @@ class FakeRepo:
             "decision": decision,
             "reviewer": reviewer,
             "note": note,
-            "decided_at": datetime.now(timezone.utc),
+            "decided_at": datetime.now(UTC),
         }
 
         self.approvals.append(result)
@@ -212,54 +213,223 @@ def test_api_enforces_roles_and_reviewer_identity(monkeypatch):
     assert admin_delete.status_code == 200
 
 
-def test_queued_run_rejects_request_scoped_gateway_token(monkeypatch):
+def test_queued_gateway_token_is_encrypted_and_only_reference_enters_rq(monkeypatch):
     settings = Settings(
         api_auth_enabled=True,
         api_operator_keys="operator-key",
         api_admin_keys="admin-key",
     )
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module, "verify_flowpilot_gateway_session", lambda token: 600)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "database_url", "postgresql://test/db")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_url", "https://gateway.example/v1")
+    monkeypatch.setattr(api_module.settings, "gateway_job_credential_encryption_key", "test-fernet-key")
+    monkeypatch.setattr(api_module.settings, "gateway_job_credential_ttl_seconds", 900)
 
-    monkeypatch.setattr(
-        auth_module,
-        "get_settings",
-        lambda: settings,
-    )
+    encrypted_values = []
 
-    monkeypatch.setattr(
-        api_module.settings,
-        "inline_execution",
-        False,
-    )
+    class FakeVault:
+        def __init__(self, encryption_key, ttl_seconds):
+            assert encryption_key == "test-fernet-key"
+            assert ttl_seconds == 900
+
+        def encrypt(self, token):
+            encrypted_values.append(token)
+            return b"encrypted-token-bytes"
+
+    monkeypatch.setattr(api_module, "GatewayCredentialVault", FakeVault)
 
     fake_repo = FakeRepo()
+    fake_repo.stored_credentials = []
+
+    def store_credential(run_id, encrypted_token, ttl_seconds):
+        fake_repo.stored_credentials.append((run_id, encrypted_token, ttl_seconds))
+        return "credential-reference-only"
+
+    fake_repo.store_gateway_job_credential = store_credential
+    fake_repo.delete_gateway_job_credential = lambda run_id, credential_id: None
     fake_queue = FakeQueue()
-
-    monkeypatch.setattr(
-        api_module,
-        "repo",
-        fake_repo,
-    )
-
-    monkeypatch.setattr(
-        api_module,
-        "queue",
-        lambda: fake_queue,
-    )
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "queue", lambda: fake_queue)
 
     client = TestClient(api_module.app)
-
+    secret = "must-not-enter-redis"
     response = client.post(
         "/api/v1/runs",
         headers={
             "X-API-Key": "operator-key",
-            "X-LLM-Gateway-Token": "must-not-enter-redis",
+            "X-LLM-Gateway-Token": secret,
         },
-        json={
-            "workflow": "content",
-            "payload": {},
-        },
+        json={"workflow": "content", "payload": {"topics": ["comma, preserved"]}},
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 202
+    assert encrypted_values == [secret]
+    assert fake_repo.stored_credentials[0][1:] == (b"encrypted-token-bytes", 600)
+    assert len(fake_queue.calls) == 1
+    args, kwargs = fake_queue.calls[0]
+    assert args[0].__name__ == "execute_run"
+    assert kwargs["gateway_credential_id"] == "credential-reference-only"
+    assert kwargs["job_id"] == response.json()["run_id"]
+    assert secret not in repr(fake_queue.calls)
+    assert secret not in repr(fake_repo.stored_credentials)
+
+
+def test_queued_gateway_token_fails_closed_without_postgres(monkeypatch):
+    settings = Settings(
+        api_auth_enabled=True,
+        api_operator_keys="operator-key",
+        api_admin_keys="admin-key",
+    )
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module, "verify_flowpilot_gateway_session", lambda token: 600)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "database_url", "")
+    fake_repo = FakeRepo()
+    fake_queue = FakeQueue()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "queue", lambda: fake_queue)
+
+    response = TestClient(api_module.app).post(
+        "/api/v1/runs",
+        headers={"X-API-Key": "operator-key", "X-LLM-Gateway-Token": "short-lived-session"},
+        json={"workflow": "content", "payload": {}},
+    )
+
+    assert response.status_code == 503
     assert not fake_queue.calls
     assert not fake_repo.runs
+
+
+def test_queued_gateway_token_fails_closed_without_encryption_key(monkeypatch):
+    settings = Settings(
+        api_auth_enabled=True,
+        api_operator_keys="operator-key",
+        api_admin_keys="admin-key",
+    )
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module, "verify_flowpilot_gateway_session", lambda token: 600)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "database_url", "postgresql://test/db")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_url", "https://gateway.example/v1")
+    monkeypatch.setattr(api_module.settings, "gateway_job_credential_encryption_key", "")
+    fake_repo = FakeRepo()
+    fake_queue = FakeQueue()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "queue", lambda: fake_queue)
+
+    response = TestClient(api_module.app).post(
+        "/api/v1/runs",
+        headers={"X-API-Key": "operator-key", "X-LLM-Gateway-Token": "short-lived-session"},
+        json={"workflow": "content", "payload": {}},
+    )
+
+    assert response.status_code == 503
+    assert not fake_queue.calls
+    assert not fake_repo.runs
+
+
+def test_gateway_session_verifier_requires_active_flowpilot_audience(monkeypatch):
+    import time
+
+    from fastapi import HTTPException
+
+    class FakeResponse:
+        status_code = 200
+        content = b"{}"
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        response = None
+
+        def __init__(self, **kwargs):
+            self.options = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def get(self, url, headers):
+            assert url == "https://gateway.example/v1/demo/session/status"
+            assert headers == {"Authorization": "Bearer test-session-token"}
+            assert self.options["follow_redirects"] is False
+            assert self.options["trust_env"] is False
+            return self.response
+
+    monkeypatch.setattr(api_module.settings, "llm_gateway_url", "https://gateway.example/v1")
+    valid = FakeResponse({
+        "active": True,
+        "project": "flowpilot",
+        "session_project": "portfolio",
+        "expires_at": int(time.time()) + 300,
+    })
+    FakeClient.response = valid
+    monkeypatch.setattr(api_module.httpx, "Client", FakeClient)
+
+    remaining = api_module.verify_flowpilot_gateway_session("test-session-token")
+    assert 0 < remaining <= 300
+
+    FakeClient.response = FakeResponse({
+        "active": True,
+        "project": "quotesense",
+        "session_project": "portfolio",
+        "expires_at": int(time.time()) + 300,
+    })
+    with pytest.raises(HTTPException) as exc_info:
+        api_module.verify_flowpilot_gateway_session("test-session-token")
+    assert exc_info.value.status_code == 403
+
+    FakeClient.response = FakeResponse({
+        "active": False,
+        "project": "flowpilot",
+        "session_project": "portfolio",
+        "expires_at": int(time.time()) + 300,
+    })
+    with pytest.raises(HTTPException) as exc_info:
+        api_module.verify_flowpilot_gateway_session("test-session-token")
+    assert exc_info.value.status_code == 403
+
+
+def test_inline_gateway_token_is_request_scoped_and_not_persisted(monkeypatch):
+    from app.core.llm_gateway_context import get_llm_gateway_token
+
+    settings = Settings(
+        api_auth_enabled=True,
+        api_operator_keys="operator-key",
+        api_admin_keys="admin-key",
+    )
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module, "verify_flowpilot_gateway_session", lambda token: 600)
+    monkeypatch.setattr(api_module.settings, "inline_execution", True)
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    observed = {}
+
+    def fake_execute_run(run_id, workflow, payload, *, use_request_context=False):
+        observed["token_during_execution"] = get_llm_gateway_token()
+        observed["use_request_context"] = use_request_context
+        return {"run_id": run_id, "workflow": workflow, "status": "completed"}
+
+    monkeypatch.setattr(api_module, "execute_run", fake_execute_run)
+    token = "valid-flowpilot-gateway-bearer"
+    response = TestClient(api_module.app).post(
+        "/api/v1/runs",
+        headers={
+            "X-API-Key": "operator-key",
+            "X-LLM-Gateway-Token": token,
+        },
+        json={"workflow": "content", "payload": {"topics": ["Finance operations"]}},
+    )
+
+    assert response.status_code == 202
+    assert observed["token_during_execution"] == token
+    assert observed["use_request_context"] is True
+    assert token not in repr(fake_repo.runs)

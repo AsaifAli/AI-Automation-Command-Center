@@ -19,6 +19,6 @@ def configure_telemetry(settings: Settings) -> None:
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.otel_exporter_endpoint)))
         trace.set_tracer_provider(provider)
         logger.info("otel_configured endpoint=%s", settings.otel_exporter_endpoint)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # Observability must never prevent the application from starting.
         logger.warning("otel_setup_failed error=%s", exc)

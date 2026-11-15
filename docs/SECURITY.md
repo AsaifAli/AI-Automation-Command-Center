@@ -3,15 +3,17 @@
 ## Implemented in this portfolio version
 
 - Secrets are supplied through environment variables rather than source code.
+- The first-run bootstrap creates `.env` and Prometheus credentials with owner-only permissions and refuses to overwrite existing files.
+- Queued BYOK session bearers are Fernet-encrypted in PostgreSQL, expire, and are consumed once; RQ receives only an opaque UUID reference.
 - `.env` is ignored by Git and excluded from the Docker build context.
 - API endpoints use Pydantic validation.
 - Payload size is bounded by middleware.
-- Optional API-key authentication protects workflow endpoints.
+- Role-based API-key authentication protects workflow endpoints (viewer, operator, reviewer and admin).
 - CORS is configurable rather than open by default.
 - Security response headers are added by API middleware.
 - Application containers run as a non-root user.
 - Outreach side effects are blocked behind human approval.
-- Workflow state and approvals are auditable in PostgreSQL.
+- Workflow state, approvals, audit events and encrypted one-time Gateway job credentials are stored in PostgreSQL in the durable topology.
 - Redis and PostgreSQL are not exposed to the host by default.
 
 ## Production recommendations

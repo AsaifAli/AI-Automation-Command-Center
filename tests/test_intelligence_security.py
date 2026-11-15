@@ -2,6 +2,7 @@
 import logging
 import socket
 from contextlib import contextmanager
+from typing import ClassVar
 
 import pytest
 
@@ -136,7 +137,7 @@ def test_redirects_are_not_followed_and_urls_are_not_logged(
 
     class FakeResponse:
         status_code = 302
-        headers = {
+        headers: ClassVar[dict[str, str]] = {
             "location": "http://127.0.0.1/private"
         }
 
@@ -207,7 +208,7 @@ def test_rejects_oversized_response(monkeypatch, caplog):
 
     class FakeResponse:
         status_code = 200
-        headers = {"content-length": "1000001"}
+        headers: ClassVar[dict[str, str]] = {"content-length": "1000001"}
 
         def raise_for_status(self):
             return None

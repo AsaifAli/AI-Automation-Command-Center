@@ -1,7 +1,11 @@
 [tool.ruff]
 line-length = 120
-exclude = [".git", ".venv", "__pycache__", ".pytest_cache"]
+exclude = [".git", ".venv", ".venv312", "__pycache__", ".pytest_cache", ".ruff_cache"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI Depends declarations are intentional parameter metadata.
+"app/api/main.py" = ["B008"]

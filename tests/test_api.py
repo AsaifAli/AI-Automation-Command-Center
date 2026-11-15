@@ -1,8 +1,9 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
-import app.api.main as api_module
 from fastapi.testclient import TestClient
+
+import app.api.main as api_module
 
 
 class FakeRepo:
@@ -20,7 +21,7 @@ class FakeRepo:
             "output": {},
             "evidence": [],
             "duration_ms": 0,
-            "created_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(UTC),
             "usage": None,
             "warnings": [],
         }
@@ -40,7 +41,7 @@ class FakeRepo:
         return {"workflow_runs_total": 0, "workflow_runs_completed": 0, "workflow_runs_failed": 0, "workflow_runs_queued": 1 if self.run else 0, "workflow_runs_running": 0, "workflow_approvals_total": 0, "workflow_approvals_approved": 0}
 
     def create_approval(self, run_id, decision, reviewer, note):
-        return {"approval_id": "22222222-2222-2222-2222-222222222222", "run_id": run_id, "decision": decision, "reviewer": reviewer, "note": note, "decided_at": datetime.now(timezone.utc)}
+        return {"approval_id": "22222222-2222-2222-2222-222222222222", "run_id": run_id, "decision": decision, "reviewer": reviewer, "note": note, "decided_at": datetime.now(UTC)}
 
 
 class FakeQueue:
@@ -82,10 +83,11 @@ def test_outreach_approval():
 
 
 def test_json_serialization_of_datetime_evidence():
-    from datetime import datetime, timezone
+    from datetime import datetime
+
     from app.storage.repository import _json_dumps
 
-    payload = {"observed_at": datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)}
+    payload = {"observed_at": datetime(2026, 8, 10, 12, 0, tzinfo=UTC)}
     encoded = _json_dumps(payload)
     assert "2026-08-10T12:00:00+00:00" in encoded
 

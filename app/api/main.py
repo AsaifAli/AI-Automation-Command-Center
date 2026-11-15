@@ -2,7 +2,9 @@
 import logging
 import time
 import uuid
+from datetime import UTC, datetime
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,6 +15,7 @@ from starlette.responses import Response
 
 from app.core.auth import Principal, authenticate_api_key, require_permission
 from app.core.config import get_settings
+from app.core.gateway_credentials import GatewayCredentialError, GatewayCredentialVault
 from app.core.llm_gateway_context import (
     reset_llm_gateway_token,
     set_llm_gateway_token,
@@ -85,6 +88,80 @@ def queue() -> Queue:
         settings.queue_name,
         connection=Redis.from_url(settings.redis_url),
     )
+
+
+def verify_flowpilot_gateway_session(gateway_token: str) -> int:
+    """Validate a Gateway bearer and require the FlowPilot project audience.
+
+    Returns remaining Gateway-session lifetime in seconds. The token is sent
+    only to the Gateway status endpoint and is never logged or persisted here.
+    """
+    gateway_base = (settings.llm_gateway_url or settings.llm_base_url).strip()
+    if not gateway_base:
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway BYOK is not configured on the workflow service.",
+        )
+
+    endpoint = gateway_base.rstrip("/") + "/demo/session/status"
+    try:
+        with httpx.Client(
+            timeout=8.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            response = client.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {gateway_token}"},
+            )
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway session verification is temporarily unavailable.",
+        ) from None
+
+    if 300 <= response.status_code < 400:
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway session verification redirects are not allowed.",
+        )
+    if response.status_code in {401, 403}:
+        raise HTTPException(
+            status_code=401,
+            detail="The Gateway session is invalid, expired, or revoked.",
+        )
+    if response.status_code != 200 or len(response.content) > 16 * 1024:
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway session verification returned an invalid response.",
+        )
+
+    try:
+        session = response.json()
+        active = session.get("active") is True
+        correct_project = (
+            session.get("project") == "flowpilot"
+            and session.get("session_project") == "portfolio"
+        )
+        expires_at = int(session.get("expires_at"))
+    except (AttributeError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=502,
+            detail="Gateway session verification returned an invalid session.",
+        ) from None
+
+    remaining_seconds = expires_at - int(time.time()) - 2
+    if not active or not correct_project:
+        raise HTTPException(
+            status_code=403,
+            detail="The Gateway session is not authorized for FlowPilot.",
+        )
+    if remaining_seconds < 60:
+        raise HTTPException(
+            status_code=401,
+            detail="The Gateway session is expiring. Reopen the portfolio demo and retry.",
+        )
+    return remaining_seconds
 
 
 @app.on_event("startup")
@@ -301,47 +378,112 @@ def run_workflow(
         require_permission("runs:execute")
     ),
 ):
-    # Never serialize a request-scoped token into Redis/RQ job data.
-    if llm_gateway_token and not settings.inline_execution:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Request-scoped gateway tokens are supported only "
-                "with inline execution. Use configured service-level "
-                "LLM credentials for queued runs."
-            ),
-        )
+    gateway_token = (llm_gateway_token or "").strip()
+    encrypted_gateway_token: bytes | None = None
+    gateway_session_remaining: int | None = None
 
-    run_id = repo.create_pending_run(
-        request.workflow.value
-    )
+    if gateway_token:
+        if len(gateway_token) > 8192 or any(char.isspace() for char in gateway_token):
+            raise HTTPException(
+                status_code=400,
+                detail="The Gateway session token is invalid.",
+            )
+        gateway_session_remaining = verify_flowpilot_gateway_session(gateway_token)
+        if not settings.inline_execution:
+            if not settings.database_url.strip():
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Queued Gateway sessions require persistent PostgreSQL storage. "
+                        "Use the service-level LLM key or configure PostgreSQL."
+                    ),
+                )
+            try:
+                vault = GatewayCredentialVault(
+                    settings.gateway_job_credential_encryption_key,
+                    settings.gateway_job_credential_ttl_seconds,
+                )
+                encrypted_gateway_token = vault.encrypt(gateway_token)
+            except GatewayCredentialError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=str(exc),
+                ) from None
 
+    run_id = repo.create_pending_run(request.workflow.value)
     payload = dict(request.payload)
+    credential_id: str | None = None
 
     if settings.inline_execution:
         execute_run(
             run_id,
             request.workflow.value,
             payload,
-            use_request_context=True,
+            use_request_context=bool(gateway_token),
         )
     else:
-        queue().enqueue(
-            execute_run,
-            run_id,
-            request.workflow.value,
-            payload,
-            job_id=run_id,
-        )
+        try:
+            if encrypted_gateway_token is not None:
+                credential_ttl = min(
+                    settings.gateway_job_credential_ttl_seconds,
+                    gateway_session_remaining or settings.gateway_job_credential_ttl_seconds,
+                )
+                credential_id = repo.store_gateway_job_credential(
+                    run_id,
+                    encrypted_gateway_token,
+                    credential_ttl,
+                )
+
+            enqueue_kwargs = {"job_id": run_id}
+            if credential_id is not None:
+                # Redis receives only this opaque reference, never the bearer.
+                enqueue_kwargs["gateway_credential_id"] = credential_id
+
+            queue().enqueue(
+                execute_run,
+                run_id,
+                request.workflow.value,
+                payload,
+                **enqueue_kwargs,
+            )
+        except Exception:
+            if credential_id is not None:
+                try:
+                    repo.delete_gateway_job_credential(run_id, credential_id)
+                except Exception:
+                    logger.exception(
+                        "gateway_credential_cleanup_failed run_id=%s",
+                        run_id,
+                    )
+            logger.exception("workflow_enqueue_failed run_id=%s", run_id)
+            try:
+                repo.save_result({
+                    "run_id": run_id,
+                    "workflow": request.workflow.value,
+                    "status": "failed",
+                    "output": {
+                        "error": "Workflow could not be queued.",
+                        "recovery": "Check Redis and worker availability, then retry.",
+                    },
+                    "evidence": [],
+                    "duration_ms": 0,
+                    "created_at": datetime.now(UTC),
+                    "usage": None,
+                    "warnings": ["Queue dispatch failed before worker execution."],
+                })
+            except Exception:
+                logger.exception("workflow_dispatch_failure_persist_failed run_id=%s", run_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Workflow could not be queued. Check queue availability and retry.",
+            ) from None
 
     result = repo.get_run(run_id)
-
     if not result:
         raise HTTPException(
             status_code=500,
             detail="Failed to create workflow run",
         )
-
     return result
 
 

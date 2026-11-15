@@ -10,9 +10,14 @@ from app.core.auth import (
 from app.core.config import Settings
 
 
+def _settings(**overrides):
+    """Create deterministic settings without reading a developer .env file."""
+    return Settings(_env_file=None, app_env="test", **overrides)
+
+
 @pytest.fixture
 def rbac_settings():
-    return Settings(
+    return _settings(
         api_auth_enabled=True,
         api_viewer_keys="viewer-test-key",
         api_operator_keys="operator-test-key",
@@ -98,7 +103,7 @@ def test_invalid_key_is_rejected(rbac_settings):
 
 
 def test_legacy_api_key_remains_admin_for_dashboard():
-    settings = Settings(
+    settings = _settings(
         api_auth_enabled=True,
         api_key="legacy-dashboard-key",
         api_viewer_keys="viewer-key",
@@ -117,7 +122,7 @@ def test_legacy_api_key_remains_admin_for_dashboard():
 
 
 def test_auth_disabled_allows_local_development():
-    settings = Settings(
+    settings = _settings(
         api_auth_enabled=False,
     )
 
@@ -133,7 +138,7 @@ def test_auth_disabled_allows_local_development():
 
 def test_same_credential_cannot_be_reused_across_roles():
     with pytest.raises(ValidationError):
-        Settings(
+        _settings(
             api_auth_enabled=True,
             api_viewer_keys="shared-key",
             api_operator_keys="shared-key",
@@ -144,7 +149,7 @@ def test_same_credential_cannot_be_reused_across_roles():
 
 def test_auth_enabled_requires_at_least_one_key():
     with pytest.raises(ValidationError):
-        Settings(
+        _settings(
             api_auth_enabled=True,
         )
 
@@ -152,7 +157,7 @@ def test_auth_enabled_requires_at_least_one_key():
 def test_client_cannot_choose_its_own_role():
     principal = authenticate_api_key(
         "viewer-test-key",
-        Settings(
+        _settings(
             api_auth_enabled=True,
             api_viewer_keys="viewer-test-key",
             api_admin_keys="admin-test-key",
@@ -161,3 +166,35 @@ def test_client_cannot_choose_its_own_role():
 
     assert principal.role == "viewer"
     assert principal.permissions == ROLE_PERMISSIONS["viewer"]
+
+def test_internal_production_service_can_start_without_api_keys():
+    """Workers/scheduler do not serve HTTP routes and need no API keys."""
+    settings = Settings(
+        _env_file=None,
+        app_env="production",
+        api_auth_enabled=True,
+        api_auth_require_keys=False,
+    )
+
+    assert settings.api_auth_enabled is True
+    assert settings.api_auth_require_keys is False
+
+
+def test_production_api_still_requires_api_authentication():
+    """Disabling key validation must not disable production API authentication."""
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            api_auth_enabled=False,
+            api_auth_require_keys=False,
+        )
+
+
+def test_production_api_requires_at_least_one_key_by_default():
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            api_auth_enabled=True,
+        )

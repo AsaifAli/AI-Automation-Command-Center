@@ -1,4 +1,4 @@
-.PHONY: docker-up docker-down docker-logs docker-ps test lint format evaluate compile compose-config clean
+.PHONY: docker-up docker-down docker-logs docker-ps test lint format evaluate compile compose-config clean clean-volumes smoke
 
 docker-up:
 	docker compose up --build -d
@@ -25,12 +25,17 @@ format:
 	ruff format .
 
 evaluate:
-	python scripts/evaluate.py
+	PYTHONPATH=. python scripts/evaluate.py
 
 compile:
 	python -m compileall -q app ui tests scripts
 
 clean:
+	docker compose down --remove-orphans
+
+# Destructive by design: removes database, queue, metrics and Grafana volumes.
+clean-volumes:
+	@echo "WARNING: this permanently deletes persistent application and observability data."
 	docker compose down -v --remove-orphans
 
 smoke:

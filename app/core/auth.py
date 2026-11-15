@@ -1,12 +1,11 @@
 
 import hmac
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from fastapi import Header, HTTPException
 
 from app.core.config import get_settings
-
 
 ROLE_PERMISSIONS = {
     "viewer": frozenset(

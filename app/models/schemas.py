@@ -34,6 +34,7 @@ class Usage(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    cost_estimate_available: bool = True
 
 
 class WorkflowResult(BaseModel):

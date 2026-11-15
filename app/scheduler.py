@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from redis import Redis
@@ -31,7 +31,7 @@ def main() -> None:
         logger.info("scheduler_disabled")
         return
     scheduler = BlockingScheduler(timezone="UTC")
-    scheduler.add_job(enqueue_scheduled_run, "interval", minutes=max(1, settings.schedule_interval_minutes), id="automation-schedule", replace_existing=True, next_run_time=datetime.now(timezone.utc))
+    scheduler.add_job(enqueue_scheduled_run, "interval", minutes=max(1, settings.schedule_interval_minutes), id="automation-schedule", replace_existing=True, next_run_time=datetime.now(UTC))
     logger.info("scheduler_started interval_minutes=%s workflow=%s", settings.schedule_interval_minutes, settings.schedule_workflow)
     scheduler.start()
 

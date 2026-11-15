@@ -1,0 +1,228 @@
+# Durable production topology. This provisions paid Render resources:
+# - Starter web/worker services
+# - Render Postgres (15 GB, 0.5 CPU / 1 GB)
+# - Persistent 256 MB Render Key Value
+# Review current Render pricing before syncing this Blueprint.
+services:
+  - type: keyvalue
+    name: flowpilot-redis
+    plan: basic-256mb
+    maxmemoryPolicy: noeviction
+    persistenceMode: journal-snapshot
+    # Empty public allowlist keeps Key Value private; services use Render networking.
+    ipAllowList: []
+
+  - type: web
+    name: ai-automation-api
+    runtime: docker
+    plan: starter
+    region: singapore
+    autoDeployTrigger: checksPass
+    healthCheckPath: /ready
+    dockerCommand: 'uvicorn app.api.main:app --host 0.0.0.0 --port $PORT'
+    envVars:
+      - key: APP_NAME
+        value: FlowPilot AI Automation
+      - key: APP_VERSION
+        value: 3.5.0
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DEMO_MODE
+        value: "false"
+      - key: INLINE_EXECUTION
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: flowpilot-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: flowpilot-redis
+          property: connectionString
+      - key: QUEUE_NAME
+        value: automation
+      - key: API_AUTH_ENABLED
+        value: "true"
+      - key: API_AUTH_REQUIRE_KEYS
+        value: "true"
+      - key: API_OPERATOR_KEYS
+        generateValue: true
+      - key: API_REVIEWER_KEYS
+        generateValue: true
+      - key: API_ADMIN_KEYS
+        generateValue: true
+      - key: FLOWPILOT_GATEWAY_CREDENTIAL_KEY
+        generateValue: true
+      - key: GATEWAY_JOB_CREDENTIAL_TTL_SECONDS
+        value: "900"
+      - key: LLM_PROVIDER
+        value: openrouter
+      - key: OPENAI_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: OPENAI_MODEL
+        value: openai/gpt-4o-mini
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: LLM_GATEWAY_URL
+        sync: false
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "60"
+      - key: MAX_RETRIES
+        value: "2"
+      - key: CORS_ORIGINS
+        sync: false
+      - key: API_REVIEWER_NAME
+        value: FlowPilot Reviewer
+      - key: API_ADMIN_NAME
+        value: FlowPilot Administrator
+      - key: DEMO_CONFIG_PATH
+        value: /app/config.json
+      - key: SCHEDULE_ENABLED
+        value: "false"
+      - key: OTEL_ENABLED
+        value: "false"
+
+  - type: web
+    name: ai-automation-ui
+    runtime: docker
+    plan: starter
+    region: singapore
+    autoDeployTrigger: checksPass
+    healthCheckPath: /_stcore/health
+    dockerCommand: 'streamlit run ui/app.py --server.address=0.0.0.0 --server.port $PORT --server.headless=true'
+    envVars:
+      - key: API_HOST
+        fromService:
+          type: web
+          name: ai-automation-api
+          property: host
+      - key: API_PORT
+        fromService:
+          type: web
+          name: ai-automation-api
+          property: port
+      - key: API_OPERATOR_KEY
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: API_OPERATOR_KEYS
+      - key: PORTFOLIO_SESSION_GATEWAY_URL
+        sync: false
+
+  - type: worker
+    name: ai-automation-worker
+    runtime: docker
+    plan: starter
+    region: singapore
+    autoDeployTrigger: checksPass
+    maxShutdownDelaySeconds: 120
+    dockerCommand: python -m app.worker
+    envVars:
+      - key: APP_NAME
+        value: FlowPilot AI Automation
+      - key: APP_VERSION
+        value: 3.5.0
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DEMO_MODE
+        value: "false"
+      - key: INLINE_EXECUTION
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: flowpilot-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: flowpilot-redis
+          property: connectionString
+      - key: QUEUE_NAME
+        value: automation
+      - key: API_AUTH_ENABLED
+        value: "true"
+      - key: API_AUTH_REQUIRE_KEYS
+        value: "false"
+      - key: FLOWPILOT_GATEWAY_CREDENTIAL_KEY
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: FLOWPILOT_GATEWAY_CREDENTIAL_KEY
+      - key: GATEWAY_JOB_CREDENTIAL_TTL_SECONDS
+        value: "900"
+      - key: LLM_PROVIDER
+        value: openrouter
+      - key: OPENAI_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: OPENAI_MODEL
+        value: openai/gpt-4o-mini
+      - key: OPENAI_API_KEY
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: OPENAI_API_KEY
+      - key: LLM_GATEWAY_URL
+        sync: false
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "60"
+      - key: MAX_RETRIES
+        value: "2"
+      - key: DEMO_CONFIG_PATH
+        value: /app/config.json
+      - key: INTELLIGENCE_TIMEOUT_SECONDS
+        value: "10"
+      - key: MAX_INTELLIGENCE_ITEMS
+        value: "25"
+      - key: OTEL_ENABLED
+        value: "false"
+
+  - type: worker
+    name: ai-automation-scheduler
+    runtime: docker
+    plan: starter
+    region: singapore
+    autoDeployTrigger: checksPass
+    dockerCommand: python -m app.scheduler
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: API_AUTH_ENABLED
+        value: "true"
+      - key: API_AUTH_REQUIRE_KEYS
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: flowpilot-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: flowpilot-redis
+          property: connectionString
+      - key: QUEUE_NAME
+        value: automation
+      - key: SCHEDULE_ENABLED
+        value: "false"
+      - key: SCHEDULE_INTERVAL_MINUTES
+        value: "60"
+      - key: SCHEDULE_WORKFLOW
+        value: competitor
+      - key: SCHEDULE_COMPETITORS
+        value: Example Protocol,Example AI Startup
+      - key: DEMO_CONFIG_PATH
+        value: /app/config.json
+
+databases:
+  - name: flowpilot-postgres
+    region: singapore
+    plan: basic-1gb
+    databaseName: flowpilot
+    user: flowpilot
+    postgresMajorVersion: "17"
+    diskSizeGB: 15
+    ipAllowList: []

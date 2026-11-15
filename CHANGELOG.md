@@ -1,3 +1,17 @@
+## 3.5.0 — Hardened client-facing release
+
+- Client-facing workflow output uses structured cards and downloadable Markdown reports, not raw JSON.
+- Content Studio preserves complete briefs, one per line.
+- Provider/BYOK generation metadata and billing labels are explicit.
+- Client-facing failures are sanitized; diagnostic details remain in server logs.
+- Local bootstrap creates private secrets without overwriting existing configuration.
+- Scheduled jobs are opt-in by default; destructive volume cleanup is explicit.
+- Render demo and durable paid topology are clearly separated.
+- Prometheus bearer is mounted through a Docker Compose secret instead of a direct bind-mounted file.
+- Production dependencies are separated from test/lint tooling; unused LangChain OpenAI adapter removed.
+- Outreach reports preserve the workflow policy text and clearly mark each external draft as approval-required.
+- The Streamlit exchange now requires the Gateway response `target_project` to equal `flowpilot`; a missing or mismatched project is rejected.
+
 ## v3.3.3
 - Fixed FastAPI response validation when persisted demo/LLM usage omitted required `provider` metadata.
 - Normalized usage metadata at both the LLM provider and LangGraph workflow boundaries.

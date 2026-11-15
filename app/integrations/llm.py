@@ -18,11 +18,17 @@ class LLMProvider:
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    @property
+    def gateway_session_active(self) -> bool:
+        return bool(get_llm_gateway_token())
+
     def generate(self, system: str, user: str) -> dict[str, Any]:
         gateway_token = get_llm_gateway_token()
         gateway_url = (self.settings.llm_gateway_url or self.settings.llm_base_url).strip()
 
-        if not gateway_token and (self.settings.demo_mode or not self.settings.openai_api_key):
+        # An explicit user Gateway session takes precedence over service demo mode.
+        # Without either a session or a service key, live mode fails closed.
+        if self.settings.demo_mode and not gateway_token:
             return {
                 "text": self._demo(system, user),
                 "provider": "demo",
@@ -34,10 +40,20 @@ class LLMProvider:
                     "completion_tokens": 0,
                     "total_tokens": 0,
                     "estimated_cost_usd": 0.0,
+                    "cost_estimate_available": False,
                 },
             }
 
-        if gateway_token and gateway_url:
+        if gateway_token and not gateway_url:
+            raise RuntimeError(
+                "An LLM Gateway session is present, but the Gateway base URL is not configured."
+            )
+        if not gateway_token and not self.settings.openai_api_key.strip():
+            raise RuntimeError(
+                "No LLM credentials are configured. Set a service-level provider key or use an active Gateway session."
+            )
+
+        if gateway_token:
             url = gateway_url.rstrip("/") + "/chat/completions"
         else:
             url = self.settings.openai_base_url.rstrip("/") + "/chat/completions"
@@ -90,25 +106,28 @@ class LLMProvider:
 
                 return {
                     "text": data["choices"][0]["message"]["content"],
-                    "provider": self.settings.llm_provider,
+                    "provider": "portfolio-gateway" if gateway_token else self.settings.llm_provider,
                     "model": data.get(
                         "model",
-                        self.settings.openai_model,
+                        self.settings.llm_model or self.settings.openai_model,
                     ),
                     "usage": {
-                        "provider": self.settings.llm_provider,
+                        "provider": "portfolio-gateway" if gateway_token else self.settings.llm_provider,
                         "model": data.get(
                             "model",
-                            self.settings.openai_model,
+                            self.settings.llm_model or self.settings.openai_model,
                         ),
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,
-                        "estimated_cost_usd": round(cost, 8),
+                        # The shared Gateway does not return provider-specific
+                        # pricing. Never show a LiteLLM service-rate estimate for BYOK.
+                        "estimated_cost_usd": 0.0 if gateway_token else round(cost, 8),
+                        "cost_estimate_available": not bool(gateway_token),
                     },
                 }
 
-            except Exception as exc:
+            except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
                 status_code = (
                     exc.response.status_code
                     if isinstance(exc, httpx.HTTPStatusError)

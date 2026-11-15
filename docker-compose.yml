@@ -7,7 +7,7 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      OPENROUTER_LITELLM_MODEL: ${OPENROUTER_LITELLM_MODEL:-openrouter/free}
+      OPENROUTER_LITELLM_MODEL: ${OPENROUTER_LITELLM_MODEL:-openrouter/openrouter/free}
       GEMINI_LITELLM_MODEL: ${GEMINI_LITELLM_MODEL:-gemini/gemini-flash-lite-latest}
     volumes:
       - ./litellm_config.yaml:/app/config.yaml:ro
@@ -49,7 +49,7 @@ services:
     container_name: ai_automation_api
     environment:
       APP_NAME: ${APP_NAME:-AI Automation Command Center}
-      APP_VERSION: ${APP_VERSION:-3.3.2}
+      APP_VERSION: ${APP_VERSION:-3.5.0}
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@postgres:5432/automation
@@ -60,10 +60,17 @@ services:
       OPENAI_API_KEY: ${LITELLM_MASTER_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://litellm:4000/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-portfolio-free}
+      LLM_GATEWAY_URL: ${LLM_GATEWAY_URL:-}
+      FLOWPILOT_GATEWAY_CREDENTIAL_KEY: ${FLOWPILOT_GATEWAY_CREDENTIAL_KEY:-}
+      GATEWAY_JOB_CREDENTIAL_TTL_SECONDS: ${GATEWAY_JOB_CREDENTIAL_TTL_SECONDS:-900}
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-30}
       MAX_RETRIES: ${MAX_RETRIES:-2}
       API_AUTH_ENABLED: ${API_AUTH_ENABLED:-true}
+      API_AUTH_REQUIRE_KEYS: "true"
       API_KEY: ${API_KEY:-}
+      API_OPERATOR_KEYS: ${API_OPERATOR_KEYS:-}
+      API_REVIEWER_KEYS: ${API_REVIEWER_KEYS:-}
+      API_ADMIN_KEYS: ${API_ADMIN_KEYS:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8501}
       DEMO_CONFIG_PATH: /app/config.json
       INTELLIGENCE_TIMEOUT_SECONDS: ${INTELLIGENCE_TIMEOUT_SECONDS:-10}
@@ -101,7 +108,7 @@ services:
     container_name: ai_automation_worker
     environment:
       APP_NAME: ${APP_NAME:-AI Automation Command Center}
-      APP_VERSION: ${APP_VERSION:-3.3.2}
+      APP_VERSION: ${APP_VERSION:-3.5.0}
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@postgres:5432/automation
@@ -112,8 +119,13 @@ services:
       OPENAI_API_KEY: ${LITELLM_MASTER_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://litellm:4000/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-portfolio-free}
+      LLM_GATEWAY_URL: ${LLM_GATEWAY_URL:-}
+      FLOWPILOT_GATEWAY_CREDENTIAL_KEY: ${FLOWPILOT_GATEWAY_CREDENTIAL_KEY:-}
+      GATEWAY_JOB_CREDENTIAL_TTL_SECONDS: ${GATEWAY_JOB_CREDENTIAL_TTL_SECONDS:-900}
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-30}
       MAX_RETRIES: ${MAX_RETRIES:-2}
+      API_AUTH_ENABLED: "true"
+      API_AUTH_REQUIRE_KEYS: "false"
       DEMO_CONFIG_PATH: /app/config.json
       INTELLIGENCE_TIMEOUT_SECONDS: ${INTELLIGENCE_TIMEOUT_SECONDS:-10}
       MAX_INTELLIGENCE_ITEMS: ${MAX_INTELLIGENCE_ITEMS:-25}
@@ -142,11 +154,13 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_AUTH_ENABLED: "true"
+      API_AUTH_REQUIRE_KEYS: "false"
       DATABASE_URL: postgresql://automation:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@postgres:5432/automation
       REDIS_URL: redis://redis:6379/0
       QUEUE_NAME: automation
       DEMO_CONFIG_PATH: /app/config.json
-      SCHEDULE_ENABLED: ${SCHEDULE_ENABLED:-true}
+      SCHEDULE_ENABLED: ${SCHEDULE_ENABLED:-false}
       SCHEDULE_INTERVAL_MINUTES: ${SCHEDULE_INTERVAL_MINUTES:-60}
       SCHEDULE_WORKFLOW: ${SCHEDULE_WORKFLOW:-competitor}
       SCHEDULE_COMPETITORS: ${SCHEDULE_COMPETITORS:-Example Protocol,Example AI Startup}
@@ -165,7 +179,10 @@ services:
     container_name: ai_automation_ui
     environment:
       API_BASE_URL: http://api:8000
-      API_KEY: ${API_KEY:-}
+      API_OPERATOR_KEY: ${API_OPERATOR_KEY:-}
+      API_REVIEWER_KEY: ${API_REVIEWER_KEY:-}
+      API_ADMIN_KEY: ${API_ADMIN_KEY:-}
+      PORTFOLIO_SESSION_GATEWAY_URL: ${PORTFOLIO_SESSION_GATEWAY_URL:-}
     command: ["streamlit", "run", "ui/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
     ports:
       - "${UI_PORT:-8501}:8501"

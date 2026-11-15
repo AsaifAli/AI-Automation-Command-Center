@@ -10,3 +10,18 @@ env/
 .streamlit/secrets.toml
 
 /secrets/
+.coverage
+coverage.xml
+.mypy_cache/
+.tox/
+.nox/
+*.log
+*.DS_Store
+.flowpilot-upgrade-backup-*/
+dist/
+build/
+.venv312/
+.python-version
+.coverage.*
+htmlcov/
+.hypothesis/

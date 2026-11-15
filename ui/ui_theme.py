@@ -8,42 +8,42 @@ def apply_theme() -> None:
     """Apply the polished FlowPilot visual system without changing app logic."""
     try:
         mode = st.context.theme.type or "light"
-    except Exception:
+    except Exception:  # noqa: BLE001
         mode = "light"
     dark = mode.lower() == "dark"
 
     if dark:
-        tokens = dict(
-            page="#070b13",
-            surface="#0d1422",
-            surface2="#111a2a",
-            border="rgba(148,163,184,.18)",
-            border_strong="rgba(148,163,184,.28)",
-            text="#f3f7fb",
-            text2="#d6e0ec",
-            muted="#91a0b2",
-            faint="#718096",
-            field="#0d1422",
-            shadow="0 18px 48px rgba(0,0,0,.24)",
-            tint="rgba(37,99,235,.10)",
-            sidebar="#0a101b",
-        )
+        tokens = {
+            "page": "#070b13",
+            "surface": "#0d1422",
+            "surface2": "#111a2a",
+            "border": "rgba(148,163,184,.18)",
+            "border_strong": "rgba(148,163,184,.28)",
+            "text": "#f3f7fb",
+            "text2": "#d6e0ec",
+            "muted": "#91a0b2",
+            "faint": "#718096",
+            "field": "#0d1422",
+            "shadow": "0 18px 48px rgba(0,0,0,.24)",
+            "tint": "rgba(37,99,235,.10)",
+            "sidebar": "#0a101b",
+        }
     else:
-        tokens = dict(
-            page="#f5f7fb",
-            surface="#ffffff",
-            surface2="#f3f5fa",
-            border="rgba(100,116,139,.20)",
-            border_strong="rgba(100,116,139,.30)",
-            text="#172033",
-            text2="#334155",
-            muted="#64748b",
-            faint="#7b8797",
-            field="#ffffff",
-            shadow="0 18px 48px rgba(15,23,42,.08)",
-            tint="rgba(37,99,235,.07)",
-            sidebar="#f7f8fc",
-        )
+        tokens = {
+            "page": "#f5f7fb",
+            "surface": "#ffffff",
+            "surface2": "#f3f5fa",
+            "border": "rgba(100,116,139,.20)",
+            "border_strong": "rgba(100,116,139,.30)",
+            "text": "#172033",
+            "text2": "#334155",
+            "muted": "#64748b",
+            "faint": "#7b8797",
+            "field": "#ffffff",
+            "shadow": "0 18px 48px rgba(15,23,42,.08)",
+            "tint": "rgba(37,99,235,.07)",
+            "sidebar": "#f7f8fc",
+        }
 
     css = f"""
     <style>

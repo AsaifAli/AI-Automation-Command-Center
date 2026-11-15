@@ -3,7 +3,7 @@ import ipaddress
 import logging
 import socket
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -116,52 +116,51 @@ class IntelligenceSource:
             timeout=timeout,
             follow_redirects=False,
             trust_env=False,
-        ) as client:
-            with client.stream(
-                "GET",
-                url,
-                headers={
-                    "Accept": (
-                        "application/rss+xml, application/atom+xml, "
-                        "application/xml, text/xml"
+        ) as client, client.stream(
+            "GET",
+            url,
+            headers={
+                "Accept": (
+                    "application/rss+xml, application/atom+xml, "
+                    "application/xml, text/xml"
+                )
+            },
+        ) as response:
+
+            if 300 <= response.status_code < 400:
+                raise UnsafeFeedURL("Feed redirects are not allowed")
+
+            response.raise_for_status()
+
+            content_length = response.headers.get("content-length")
+
+            if content_length:
+                try:
+                    declared_size = int(content_length)
+                except ValueError as exc:
+                    raise ValueError(
+                        "Feed response has an invalid Content-Length"
+                    ) from exc
+
+                if declared_size > MAX_FEED_BYTES:
+                    raise FeedTooLarge(
+                        "Feed response exceeds the size limit"
                     )
-                },
-            ) as response:
 
-                if 300 <= response.status_code < 400:
-                    raise UnsafeFeedURL("Feed redirects are not allowed")
+            chunks = []
+            total_bytes = 0
 
-                response.raise_for_status()
+            for chunk in response.iter_bytes():
+                total_bytes += len(chunk)
 
-                content_length = response.headers.get("content-length")
+                if total_bytes > MAX_FEED_BYTES:
+                    raise FeedTooLarge(
+                        "Feed response exceeds the size limit"
+                    )
 
-                if content_length:
-                    try:
-                        declared_size = int(content_length)
-                    except ValueError as exc:
-                        raise ValueError(
-                            "Feed response has an invalid Content-Length"
-                        ) from exc
+                chunks.append(chunk)
 
-                    if declared_size > MAX_FEED_BYTES:
-                        raise FeedTooLarge(
-                            "Feed response exceeds the size limit"
-                        )
-
-                chunks = []
-                total_bytes = 0
-
-                for chunk in response.iter_bytes():
-                    total_bytes += len(chunk)
-
-                    if total_bytes > MAX_FEED_BYTES:
-                        raise FeedTooLarge(
-                            "Feed response exceeds the size limit"
-                        )
-
-                    chunks.append(chunk)
-
-                return b"".join(chunks)
+            return b"".join(chunks)
 
     def collect(
         self,
@@ -184,7 +183,7 @@ class IntelligenceSource:
                     self._parse_feed(body, source_name, url)
                 )
 
-            except Exception as exc:
+            except (httpx.HTTPError, ValueError, ET.ParseError, OSError) as exc:
                 # Never log URLs, query strings, credentials or response bodies.
                 logger.warning(
                     "intelligence_source_failed error_type=%s",
@@ -242,7 +241,7 @@ class IntelligenceSource:
                 "title": title.strip(),
                 "url": link,
                 "published": published,
-                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "observed_at": datetime.now(UTC).isoformat(),
             })
 
         return results

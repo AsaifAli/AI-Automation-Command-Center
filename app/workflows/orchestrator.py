@@ -1,6 +1,7 @@
+import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -17,6 +18,9 @@ try:
     from opentelemetry.trace import Status, StatusCode
 except ImportError:  # pragma: no cover
     trace = None
+
+
+logger = logging.getLogger(__name__)
 
 
 class State(TypedDict, total=False):
@@ -90,9 +94,22 @@ class WorkflowEngine:
             usage.setdefault("completion_tokens", 0)
             usage.setdefault("total_tokens", int(usage.get("prompt_tokens", 0)) + int(usage.get("completion_tokens", 0)))
             usage.setdefault("estimated_cost_usd", 0.0)
+            usage.setdefault(
+                "cost_estimate_available",
+                not self.llm.settings.demo_mode
+                and not getattr(self.llm, "gateway_session_active", False),
+            )
         except Exception as exc:
             status = "failed"
-            output = {"error": str(exc), "recovery": "Inspect worker logs and retry after correcting the input/provider."}
+            logger.exception(
+                "workflow_execution_failed workflow=%s run_id=%s",
+                workflow,
+                run_id,
+            )
+            output = {
+                "error": "This workflow could not be completed.",
+                "recovery": "Retry the workflow. If the issue persists, share its run reference with an administrator.",
+            }
             warnings = ["Workflow execution failed before validation completed."]
             usage = None
             if span_context:
@@ -104,7 +121,7 @@ class WorkflowEngine:
                 span_context.__exit__(None, None, None)
 
         duration_ms = int((time.perf_counter() - started) * 1000)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         evidence = [{
             "source": "workflow-engine",
             "title": "Execution trace",

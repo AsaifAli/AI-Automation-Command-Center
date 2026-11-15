@@ -1,11 +1,17 @@
 import os
 import time
-from datetime import datetime
+from datetime import UTC, datetime
+from html import escape
 
 import requests
 import streamlit as st
-
+from api_access import build_api_headers
+from content_input import parse_topic_briefs
+from gateway_handoff import GatewayHandoffError, exchange_handoff_code
+from output_formatting import build_client_report_markdown
+from output_renderer import render_workflow_output
 from sidebar_toggle import render_sidebar_toggle
+from streamlit.errors import StreamlitAPIException
 from ui_theme import apply_theme
 
 API = os.getenv("API_BASE_URL", "").strip()
@@ -13,10 +19,14 @@ if not API:
     api_host = os.getenv("API_HOST", "localhost").strip()
     api_port = os.getenv("API_PORT", "8000").strip()
     API = f"http://{api_host}:{api_port}"
-API_KEY = os.getenv("API_KEY", "")
-HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
-API_REVIEWER_KEY = os.getenv("API_REVIEWER_KEY", "")
-API_ADMIN_KEY = os.getenv("API_ADMIN_KEY", "")
+
+# UI credentials are role-scoped. API_KEY remains a local backwards-compatible
+# fallback for deployments that have not yet provisioned separate role keys.
+LEGACY_API_KEY = os.getenv("API_KEY", "").strip()
+API_OPERATOR_KEY = os.getenv("API_OPERATOR_KEY", "").strip()
+API_REVIEWER_KEY = os.getenv("API_REVIEWER_KEY", "").strip()
+API_ADMIN_KEY = os.getenv("API_ADMIN_KEY", "").strip()
+PORTFOLIO_SESSION_GATEWAY_URL = os.getenv("PORTFOLIO_SESSION_GATEWAY_URL", "").strip()
 
 WORKFLOW_META = {
     "content": {
@@ -35,7 +45,7 @@ WORKFLOW_META = {
     },
     "outreach": {
         "icon": "🤝",
-        "title": "Reachout Agent",
+        "title": "Outreach Agent",
         "purpose": "Qualify opportunities and draft outreach. External sending requires approval.",
         "output": "Approval-ready draft",
         "stages": ["Qualification", "Context enrichment", "Draft generation", "Human approval"],
@@ -50,17 +60,95 @@ WORKFLOW_META = {
 }
 
 
-def request_headers() -> dict[str, str]:
-    """Build request headers, including a portfolio-issued gateway session when present."""
-    headers = dict(HEADERS)
+def _remove_query_parameter(name: str) -> str:
+    """Read and immediately remove a sensitive handoff parameter from the URL."""
     try:
-        gateway_token = st.query_params.get("portfolio_llm_session", "")
-    except Exception:
-        gateway_token = ""
-    gateway_token = str(gateway_token or "").strip()
-    if gateway_token:
-        headers["X-LLM-Gateway-Token"] = gateway_token
-    return headers
+        value = st.query_params.get(name, "")
+        if name in st.query_params:
+            del st.query_params[name]
+    except (AttributeError, KeyError, RuntimeError, StreamlitAPIException):
+        return ""
+    return str(value or "").strip()
+
+
+def _clear_gateway_session() -> None:
+    st.session_state.pop("llm_gateway_session_token", None)
+    st.session_state.pop("llm_gateway_session_expires_at", None)
+    st.session_state.pop("gateway_session_provider", None)
+
+
+def _process_gateway_handoff() -> None:
+    """Consume a one-time handoff; never accept a reusable token from the URL."""
+    legacy_token = _remove_query_parameter("portfolio_llm_session")
+    if legacy_token:
+        _clear_gateway_session()
+        st.session_state["gateway_handoff_error"] = (
+            "This older session link is no longer supported. Reopen the demo from the portfolio."
+        )
+        return
+
+    handoff_code = _remove_query_parameter("portfolio_llm_handoff")
+    if not handoff_code:
+        return
+
+    _clear_gateway_session()
+    try:
+        exchanged = exchange_handoff_code(
+            handoff_code,
+            PORTFOLIO_SESSION_GATEWAY_URL,
+        )
+    except GatewayHandoffError as exc:
+        st.session_state["gateway_handoff_error"] = str(exc)
+        return
+
+    st.session_state["llm_gateway_session_token"] = exchanged["access_token"]
+    st.session_state["llm_gateway_session_expires_at"] = (
+        datetime.now(UTC).timestamp() + exchanged["expires_in"]
+    )
+    st.session_state["gateway_session_provider"] = exchanged.get("provider", "")
+    st.session_state.pop("gateway_handoff_error", None)
+
+
+def _manual_reviewer_key() -> str:
+    key = str(st.session_state.get("manual_reviewer_api_key", "")).strip()
+    try:
+        expires_at = float(st.session_state.get("manual_reviewer_expires_at", 0))
+    except (TypeError, ValueError):
+        expires_at = 0
+    if not key or expires_at <= time.time():
+        st.session_state.pop("manual_reviewer_api_key", None)
+        st.session_state.pop("manual_reviewer_expires_at", None)
+        return ""
+    return key
+
+
+def gateway_session_is_active() -> bool:
+    """Return whether this Streamlit server session holds a non-expired Gateway bearer."""
+    token = str(st.session_state.get("llm_gateway_session_token", "")).strip()
+    try:
+        expires_at = float(st.session_state.get("llm_gateway_session_expires_at", 0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return bool(token and expires_at > time.time())
+
+
+def request_headers(role: str = "operator") -> dict[str, str]:
+    """Build role-scoped API headers plus a non-expired server-side LLM session."""
+    role_keys = {
+        "operator": API_OPERATOR_KEY or LEGACY_API_KEY,
+        "reviewer": (
+            API_REVIEWER_KEY
+            or _manual_reviewer_key()
+            or LEGACY_API_KEY
+        ),
+        "admin": API_ADMIN_KEY or LEGACY_API_KEY,
+    }
+    api_key = role_keys.get(role, "")
+    return build_api_headers(
+        api_key,
+        str(st.session_state.get("llm_gateway_session_token", "")),
+        st.session_state.get("llm_gateway_session_expires_at"),
+    )
 
 
 st.set_page_config(
@@ -70,25 +158,28 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+_process_gateway_handoff()
 apply_theme()
 render_sidebar_toggle()
+if st.session_state.get("gateway_handoff_error"):
+    st.warning(st.session_state["gateway_handoff_error"])
 
 
-def api_get(path: str):
-    return requests.get(f"{API}{path}", headers=request_headers(), timeout=8)
+def api_get(path: str, role: str = "operator"):
+    return requests.get(f"{API}{path}", headers=request_headers(role), timeout=8)
 
 
-def api_post(path: str, body: dict):
+def api_post(path: str, body: dict, role: str = "operator"):
     return requests.post(
         f"{API}{path}",
-        headers={**request_headers(), "Content-Type": "application/json"},
+        headers={**request_headers(role), "Content-Type": "application/json"},
         json=body,
         timeout=15,
     )
 
 
-def api_delete(path: str):
-    return requests.delete(f"{API}{path}", headers=request_headers(), timeout=15)
+def api_delete(path: str, role: str = "admin"):
+    return requests.delete(f"{API}{path}", headers=request_headers(role), timeout=15)
 
 
 def queue_workflow(workflow_name: str, payload: dict) -> str:
@@ -98,16 +189,28 @@ def queue_workflow(workflow_name: str, payload: dict) -> str:
 
 
 def response_json(response: requests.Response, context: str):
-    """Safely decode an API response and expose useful diagnostics in the UI."""
+    """Decode API responses without leaking internal server errors to the UI."""
     if not response.ok:
-        detail = response.text.strip() or "empty response body"
-        raise RuntimeError(f"{context} failed ({response.status_code}): {detail[:500]}")
+        detail = None
+        try:
+            body = response.json()
+            detail = body.get("detail") if isinstance(body, dict) else None
+        except ValueError:
+            detail = None
+        if response.status_code == 429:
+            message = "The service is receiving too many requests. Please wait and retry."
+        elif response.status_code < 500 and isinstance(detail, str) and detail.strip():
+            message = detail.strip()[:240]
+        elif response.status_code >= 500:
+            message = "The service could not complete this request. Please retry or share the run reference with an administrator."
+        else:
+            message = "The request was not accepted. Check the submitted details and your access permissions."
+        raise RuntimeError(f"{context} failed ({response.status_code}): {message}")
     try:
         return response.json()
     except ValueError as exc:
-        detail = response.text.strip() or "empty response body"
         raise RuntimeError(
-            f"{context} returned a non-JSON response ({response.status_code}): {detail[:500]}"
+            f"{context} returned an unexpected response. Please retry or contact an administrator."
         ) from exc
 
 
@@ -158,21 +261,35 @@ def workflow_preview(meta: dict, mode_label: str) -> None:
 try:
     health = response_json(api_get("/health"), "Health check")
     metrics = response_json(api_get("/metrics"), "Metrics request")
-except Exception as exc:
+except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
     st.error(f"API unavailable: {exc}")
     st.stop()
 
-mode_label = "Demo" if health["demo_mode"] else "LLM"
+gateway_active = gateway_session_is_active()
+mode_label = (
+    "BYOK Gateway"
+    if gateway_active
+    else "Demo"
+    if health["demo_mode"]
+    else "Service LLM"
+)
+environment_label = (
+    "BYOK GATEWAY SESSION"
+    if gateway_active
+    else "DEMO ENVIRONMENT"
+    if health["demo_mode"]
+    else "SERVICE LLM"
+)
 
 st.markdown(
     f"""
     <section class="premium-hero">
       <div class="hero-topline">
         <div class="premium-kicker">FLOWPILOT · AI OPERATIONS</div>
-        <span class="environment-badge"><span class="status-dot"></span>{'DEMO ENVIRONMENT' if health['demo_mode'] else 'LLM ENVIRONMENT'}</span>
+        <span class="environment-badge"><span class="status-dot"></span>{environment_label}</span>
       </div>
       <div class="premium-title">⚡ AI Automation Command Center</div>
-      <div class="premium-subtitle">A portfolio-grade control plane for async AI workflows — with evidence, human approval, auditability, and operational visibility built into the experience.</div>
+      <div class="premium-subtitle">An operations workspace for AI-powered business workflows — combining evidence, human approvals, audit trails, and operational visibility.</div>
       <div class="premium-strip">
         <span class="premium-chip"><span class="premium-dot"></span>Async workflows</span>
         <span class="premium-chip"><span class="premium-dot"></span>Evidence-aware</span>
@@ -218,7 +335,7 @@ workflow = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.markdown('<div class="premium-kicker">SYSTEM HEALTH</div>', unsafe_allow_html=True)
 st.sidebar.markdown(
-    f'<div class="sidebar-health"><div><span class="status-dot"></span>API Online</div><small>Version · {health["version"]}</small><small>Queue · Redis + worker</small></div>',
+    f'<div class="sidebar-health"><div><span class="status-dot"></span>API Online</div><small>Version · {escape(str(health["version"]))}</small><small>Queue · Redis + worker</small></div>',
     unsafe_allow_html=True,
 )
 st.sidebar.divider()
@@ -236,8 +353,20 @@ with left:
     )
 
     if workflow == "content":
-        topics = st.text_input("Topics", "AI agents, DeFi infrastructure")
-        payload["topics"] = [x.strip() for x in topics.split(",") if x.strip()]
+        brief_text = st.text_area(
+            "Content briefs",
+            "AI agents in enterprise finance operations, including reconciliation and exception handling",
+            height=120,
+            max_chars=5000,
+            help="Enter up to five complete briefs, one per line. Commas, punctuation, and full sentences are preserved; do not separate ideas with commas.",
+            placeholder="One complete brief per line…",
+        )
+        topic_briefs = parse_topic_briefs(brief_text)
+        if len(topic_briefs) > 5:
+            st.warning("A single run supports up to five briefs. Remove the extra lines before queuing.")
+            payload["topics"] = []
+        else:
+            payload["topics"] = topic_briefs
         payload["channels"] = st.multiselect(
             "Channels",
             ["linkedin", "x", "telegram"],
@@ -267,7 +396,15 @@ with left:
     with action_col1:
         queue_clicked = st.button("▶  Queue automation", type="primary", use_container_width=True)
     with action_col2:
-        demo_clicked = st.button("⚡ Run demo", use_container_width=True, help="Queue the current workflow with its portfolio-safe sample inputs.")
+        if health["demo_mode"] and not gateway_active:
+            demo_clicked = st.button(
+                "⚡ Run sample",
+                use_container_width=True,
+                help="Queue a safe sample workflow using demo-mode output.",
+            )
+        else:
+            demo_clicked = False
+            st.caption("Live model generation · provider usage may incur charges.")
 
 with right:
     workflow_preview(meta, mode_label)
@@ -282,14 +419,19 @@ if queue_clicked or demo_clicked:
                 "outreach": {"candidates": [{"name": "Demo Partner", "type": "partner", "context": "AI infrastructure collaboration", "channel": "linkedin"}]},
                 "kpi": {"updates": [{"entity": "Demo Portfolio", "metric": "weekly progress", "value": "on track", "blocker": "None reported"}]},
             }[workflow]
-        run_id = queue_workflow(workflow, run_payload)
-        st.session_state["active_run_id"] = run_id
-        st.session_state["result"] = None
-        st.session_state["poll_count"] = 0
-        st.session_state["demo_run"] = demo_clicked
-        st.rerun()
-    except Exception as exc:
-        st.error(str(exc))
+        if workflow == "content" and not run_payload.get("topics"):
+            st.warning("Add at least one complete content brief before queuing this workflow.")
+        elif workflow == "content" and not run_payload.get("channels"):
+            st.warning("Select at least one destination channel before queuing this workflow.")
+        else:
+            run_id = queue_workflow(workflow, run_payload)
+            st.session_state["active_run_id"] = run_id
+            st.session_state["result"] = None
+            st.session_state["poll_count"] = 0
+            st.session_state["demo_run"] = demo_clicked
+            st.rerun()
+    except (requests.RequestException, RuntimeError, ValueError, KeyError):
+        st.error("FlowPilot could not queue this workflow. Check the service status and submitted details, then retry.")
 
 active_run_id = st.session_state.get("active_run_id")
 if active_run_id:
@@ -299,7 +441,7 @@ if active_run_id:
         st.markdown('<div class="demo-note">⚡ Portfolio demo run · using safe sample inputs</div>', unsafe_allow_html=True)
     try:
         result = fetch_run(active_run_id)
-    except Exception as exc:
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
         poll_count = st.session_state.get("poll_count", 0) + 1
         st.session_state["poll_count"] = poll_count
         st.warning(f"Waiting for the run to become available… {exc}")
@@ -314,18 +456,24 @@ if active_run_id:
     live_col, detail_col = st.columns([1.35, 1], gap="large")
     with live_col:
         st.markdown(
-            f'<div class="live-card"><div class="live-card-top"><div><div class="ops-label">CURRENT EXECUTION</div><div class="live-title">{meta["icon"]} {meta["title"]}</div></div><span class="run-id">{active_run_id[:12]}</span></div><div class="live-status">',
+            f'<div class="live-card"><div class="live-card-top"><div><div class="ops-label">CURRENT EXECUTION</div><div class="live-title">{meta["icon"]} {escape(str(meta["title"]))}</div></div><span class="run-id">{escape(active_run_id[:12])}</span></div><div class="live-status">',
             unsafe_allow_html=True,
         )
         render_status_pill(status)
         st.markdown("</div></div>", unsafe_allow_html=True)
     with detail_col:
         usage = result.get("usage") or {}
+        cost_available = usage.get("cost_estimate_available", True)
+        cost_label = (
+            f"${usage.get('estimated_cost_usd', 0):.6f}"
+            if cost_available
+            else "Billed by provider"
+        )
         st.markdown(
             f"""
             <div class="ops-grid">
               <div class="ops-panel"><div class="ops-label">LATENCY</div><div class="ops-value">{result.get('duration_ms', 0)} ms</div></div>
-              <div class="ops-panel"><div class="ops-label">EST. COST</div><div class="ops-value">${usage.get('estimated_cost_usd', 0):.6f}</div></div>
+              <div class="ops-panel"><div class="ops-label">COST</div><div class="ops-value">{cost_label}</div></div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -369,10 +517,30 @@ if result:
     c2.metric("Latency", f"{result['duration_ms']} ms")
     c3.metric("Run ID", result["run_id"][:8])
     usage = result.get("usage") or {}
-    c4.metric("Est. cost", f"${usage.get('estimated_cost_usd', 0):.6f}")
-    tab1, tab2, tab3 = st.tabs(["Output", "Evidence", "Operations"])
+    c4.metric(
+        "Est. cost",
+        f"${usage.get('estimated_cost_usd', 0):.6f}"
+        if usage.get("cost_estimate_available", True)
+        else "Provider billed",
+    )
+    tab1, tab2, tab3 = st.tabs(["Client-ready output", "Evidence", "Operations"])
+    result_workflow = str(result.get("workflow") or workflow)
     with tab1:
-        st.json(result["output"])
+        output = result.get("output", {})
+        report_markdown = build_client_report_markdown(
+            result_workflow,
+            output,
+            result,
+        )
+        st.download_button(
+            "Download client-ready report",
+            data=report_markdown,
+            file_name=f"flowpilot-{result_workflow}-{str(result.get('run_id', 'run'))[:8]}.md",
+            mime="text/markdown",
+            use_container_width=True,
+            key=f"download_report_{result.get('run_id', 'latest')}",
+        )
+        render_workflow_output(result_workflow, output)
     with tab2:
         evidence = result.get("evidence", [])
         if not evidence:
@@ -382,23 +550,73 @@ if result:
         for warning in result.get("warnings", []):
             st.warning(warning)
     with tab3:
-        st.code(result["run_id"])
-        if workflow == "outreach" and result["status"] != "failed":
-            reviewer = st.text_input("Reviewer", "Portfolio Reviewer", key="reviewer")
-            note = st.text_input("Approval note", "Reviewed for demo", key="approval_note")
-            a, b = st.columns(2)
-            if a.button("Approve", use_container_width=True):
-                response = api_post(
-                    f"/api/v1/runs/{result['run_id']}/approval",
-                    {"decision": "approved", "reviewer": reviewer, "note": note},
+        st.caption(f"Run reference · {result['run_id']}")
+        usage = result.get("usage") or {}
+        st.markdown("#### Generation details")
+        generation_cols = st.columns(4)
+        generation_cols[0].metric("Provider", str(usage.get("provider") or "Not recorded"))
+        generation_cols[1].metric("Model", str(usage.get("model") or "Not recorded"))
+        generation_cols[2].metric("Tokens", int(usage.get("total_tokens", 0) or 0))
+        generation_cols[3].metric(
+            "Cost estimate",
+            f"${float(usage.get('estimated_cost_usd', 0) or 0):.6f}"
+            if usage.get("cost_estimate_available", True)
+            else "Provider billed",
+        )
+        st.caption("Token counts are provider-reported where available. BYOK provider charges are not estimated or billed by FlowPilot.")
+        if result_workflow == "outreach" and result["status"] != "failed":
+            effective_reviewer_key = (
+                API_REVIEWER_KEY
+                or _manual_reviewer_key()
+                or LEGACY_API_KEY
+            )
+            if not effective_reviewer_key:
+                with st.expander("Authorized reviewer access", expanded=False):
+                    st.caption("Reviewer credentials are never preloaded into the public UI. Enter your assigned reviewer key to unlock approval controls for this browser session.")
+                    reviewer_entry = st.text_input(
+                        "Reviewer API key",
+                        type="password",
+                        key="reviewer_api_key_entry",
+                    )
+                    if st.button("Unlock reviewer controls", use_container_width=True):
+                        if reviewer_entry.strip():
+                            st.session_state["manual_reviewer_api_key"] = reviewer_entry.strip()
+                            st.session_state["manual_reviewer_expires_at"] = time.time() + 900
+                            st.rerun()
+                        st.warning("Enter a reviewer key to continue.")
+            else:
+                note = st.text_area(
+                    "Reviewer decision note",
+                    "Reviewed for fit, accuracy and policy compliance.",
+                    max_chars=1000,
+                    key="approval_note",
+                    height=80,
                 )
-                st.success("Approval recorded in the audit trail.") if response.ok else st.error(response.text)
-            if b.button("Reject", use_container_width=True):
-                response = api_post(
-                    f"/api/v1/runs/{result['run_id']}/approval",
-                    {"decision": "rejected", "reviewer": reviewer, "note": note},
-                )
-                st.warning("Rejection recorded in the audit trail.") if response.ok else st.error(response.text)
+                a, b = st.columns(2)
+                if a.button("Approve draft", use_container_width=True, type="primary"):
+                    response = api_post(
+                        f"/api/v1/runs/{result['run_id']}/approval",
+                        {"decision": "approved", "note": note},
+                        role="reviewer",
+                    )
+                    if response.ok:
+                        st.success("Approval recorded in the audit trail.")
+                        st.rerun()
+                    st.error("Approval could not be recorded. Check reviewer permissions and run status.")
+                if b.button("Reject draft", use_container_width=True):
+                    response = api_post(
+                        f"/api/v1/runs/{result['run_id']}/approval",
+                        {"decision": "rejected", "note": note},
+                        role="reviewer",
+                    )
+                    if response.ok:
+                        st.warning("Rejection recorded in the audit trail.")
+                        st.rerun()
+                    st.error("Rejection could not be recorded. Check reviewer permissions and run status.")
+                if st.button("Disconnect reviewer", key="disconnect_reviewer"):
+                    st.session_state.pop("manual_reviewer_api_key", None)
+                    st.session_state.pop("manual_reviewer_expires_at", None)
+                    st.rerun()
 
 st.divider()
 st.markdown('<div class="section-kicker">OPERATIONS</div>', unsafe_allow_html=True)
@@ -428,6 +646,8 @@ with approval_col:
             '<div class="approval-card muted"><div class="approval-number">0</div><div><strong>No decisions yet</strong><small>Outreach approvals will appear here.</small></div></div>',
             unsafe_allow_html=True,
         )
+    if not (API_REVIEWER_KEY or LEGACY_API_KEY or st.session_state.get("manual_reviewer_api_key")):
+        st.caption("Reviewer actions are restricted. Authorized reviewers can unlock them inside an outreach run. Reviewer access expires after 15 minutes.")
 
 st.divider()
 header_col, action_col = st.columns([7, 1.6], vertical_alignment="center")
@@ -435,8 +655,14 @@ with header_col:
     st.markdown('<div class="section-kicker">AUDIT TRAIL</div>', unsafe_allow_html=True)
     st.markdown('<div class="subsection-title">Recent executions</div>', unsafe_allow_html=True)
 with action_col:
-    if st.button("Clear history", use_container_width=True, help="Permanently remove completed and failed run history."):
+    if (API_ADMIN_KEY or LEGACY_API_KEY) and st.button(
+        "Clear history",
+        use_container_width=True,
+        help="Permanently remove completed and failed run history.",
+    ):
         st.session_state["confirm_clear_history"] = True
+    elif not (API_ADMIN_KEY or LEGACY_API_KEY):
+        st.caption("Admin-only action")
 
 if st.session_state.get("confirm_clear_history"):
     st.warning("This permanently removes completed and failed runs, including their audit events and approvals. Queued/running runs are protected.")
@@ -444,7 +670,7 @@ if st.session_state.get("confirm_clear_history"):
     with confirm_col:
         if st.button("Confirm clear", type="primary", use_container_width=True):
             try:
-                response = api_delete("/api/v1/runs/history")
+                response = api_delete("/api/v1/runs/history", role="admin")
                 cleared = response_json(response, "Clear run history")
                 st.session_state["confirm_clear_history"] = False
                 st.session_state["active_run_id"] = None
@@ -452,7 +678,7 @@ if st.session_state.get("confirm_clear_history"):
                 st.session_state["poll_count"] = 0
                 st.success(f"Cleared {cleared.get('deleted_runs', 0)} run(s) from history.")
                 st.rerun()
-            except Exception as exc:
+            except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
                 st.error(str(exc))
     with cancel_col:
         if st.button("Cancel", use_container_width=True):
@@ -466,7 +692,7 @@ try:
     for run in runs:
         created = run["created_at"]
         if isinstance(created, str):
-            created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            created = datetime.fromisoformat(created)
         run_meta = WORKFLOW_META.get(run["workflow"], {"icon": "⚙️", "title": run["workflow"]})
         status_label = run["status"].replace("_", " ").upper()
         st.markdown(
@@ -483,10 +709,10 @@ try:
             detail_a, detail_b, detail_c = st.columns(3)
             detail_a.markdown(f'<div class="detail-stat"><span>STATUS</span><strong>{status_label}</strong></div>', unsafe_allow_html=True)
             detail_b.markdown(f'<div class="detail-stat"><span>DURATION</span><strong>{run["duration_ms"]} ms</strong></div>', unsafe_allow_html=True)
-            detail_c.markdown(f'<div class="detail-stat"><span>RUN ID</span><strong>{run["run_id"][:12]}</strong></div>', unsafe_allow_html=True)
-            st.markdown('<div class="detail-label">OUTPUT</div>', unsafe_allow_html=True)
-            st.json(run["output"])
-except Exception as exc:
+            detail_c.markdown(f'<div class="detail-stat"><span>RUN ID</span><strong>{escape(str(run["run_id"])[:12])}</strong></div>', unsafe_allow_html=True)
+            st.markdown('<div class="detail-label">CLIENT-READY RESULT</div>', unsafe_allow_html=True)
+            render_workflow_output(run.get("workflow", ""), run.get("output", {}))
+except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
     st.caption(f"Run history unavailable: {exc}")
 
 st.markdown(

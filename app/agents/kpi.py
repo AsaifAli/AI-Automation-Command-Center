@@ -24,15 +24,36 @@ class KPIAgent(Agent):
             normalized.append(record)
             if record["status"] == "at_risk":
                 risks.append(record)
+
+        total = len(normalized)
+        risk_count = len(risks)
+        on_track = total - risk_count
+        if not total:
+            leadership_brief = "No KPI updates were supplied. Add reporting data before drawing performance conclusions."
+        elif risk_count:
+            leadership_brief = (
+                f"{total} update(s) were reviewed: {on_track} on track and {risk_count} at risk. "
+                "Resolve or assign the reported blockers before treating the period as on plan."
+            )
+        else:
+            leadership_brief = (
+                f"{total} update(s) were reviewed and no blockers were reported. "
+                "Confirm the source data and reporting owners before using this as an executive status."
+            )
+
         llm_note = self.llm.generate(
-            "You are a leadership briefing assistant. Highlight risks, decisions, and missing evidence.",
+            (
+                "You are a leadership briefing assistant. Highlight risks, decisions, owners and missing evidence. "
+                "Do not invent targets, baselines, progress percentages or deadlines. Distinguish reported values "
+                "from recommendations and state when the input is insufficient."
+            ),
             f"Updates: {normalized}",
         )
         return {
             "normalized_updates": normalized,
-            "risk_count": len(risks),
+            "risk_count": risk_count,
             "risks": risks,
-            "leadership_brief": "Progress is summarized from submitted updates. Validate source data before executive decisions.",
+            "leadership_brief": leadership_brief,
             "executive_note": llm_note["text"],
             "_usage": llm_note.get("usage", {}),
         }

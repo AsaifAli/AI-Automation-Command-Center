@@ -1,13 +1,14 @@
 
 from functools import lru_cache
 
-from pydantic import model_validator
+from cryptography.fernet import Fernet
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     app_name: str = "AI Automation Command Center"
-    app_version: str = "3.0.0"
+    app_version: str = "3.5.0"
     app_env: str = "development"
     log_level: str = "INFO"
     api_host: str = "0.0.0.0"
@@ -30,10 +31,19 @@ class Settings(BaseSettings):
     request_timeout_seconds: int = 30
     max_retries: int = 2
     inline_execution: bool = False
+    # Queue BYOK tokens only as encrypted PostgreSQL records; RQ stores UUID references.
+    gateway_job_credential_encryption_key: str = Field(
+        default="",
+        validation_alias="FLOWPILOT_GATEWAY_CREDENTIAL_KEY",
+    )
+    gateway_job_credential_ttl_seconds: int = 900
 
     # API / security
     api_base_url: str = "http://localhost:8000"
     api_auth_enabled: bool = False
+    # API processes require configured credentials. Internal worker/scheduler
+    # processes still keep production auth enabled but do not serve API routes.
+    api_auth_require_keys: bool = True
 
     # Existing dashboard key: retained as admin.
     api_key: str = ""
@@ -61,7 +71,7 @@ class Settings(BaseSettings):
     output_cost_per_million: float = 0.60
 
     # Scheduler
-    schedule_enabled: bool = True
+    schedule_enabled: bool = False
     schedule_interval_minutes: int = 60
     schedule_workflow: str = "competitor"
     schedule_competitors: str = "Example Protocol,Example AI Startup"
@@ -73,6 +83,17 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_api_credentials(self):
+        if not 60 <= self.gateway_job_credential_ttl_seconds <= 1800:
+            raise ValueError(
+                "GATEWAY_JOB_CREDENTIAL_TTL_SECONDS must be between 60 and 1800"
+            )
+        if self.gateway_job_credential_encryption_key.strip():
+            try:
+                Fernet(self.gateway_job_credential_encryption_key.strip().encode("ascii"))
+            except (TypeError, ValueError, UnicodeEncodeError) as exc:
+                raise ValueError(
+                    "FLOWPILOT_GATEWAY_CREDENTIAL_KEY must be a valid Fernet key"
+                ) from exc
         if self.app_env.strip().lower() in {"prod", "production"} and not self.api_auth_enabled:
             raise ValueError("API_AUTH_ENABLED must be true in production")
 
@@ -110,7 +131,7 @@ class Settings(BaseSettings):
 
                 configured[candidate] = role
 
-        if self.api_auth_enabled and not configured:
+        if self.api_auth_enabled and self.api_auth_require_keys and not configured:
             raise ValueError(
                 "API_AUTH_ENABLED requires at least one configured API role key"
             )
@@ -121,6 +142,7 @@ class Settings(BaseSettings):
         env_file=".env",
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
 
 
