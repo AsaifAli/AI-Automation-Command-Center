@@ -12,7 +12,6 @@ from typing import Any
 
 import requests
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS: list[tuple[str, dict[str, Any]]] = [
     (
