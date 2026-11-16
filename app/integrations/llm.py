@@ -83,6 +83,15 @@ class LLMProvider:
                 response.raise_for_status()
 
                 data = response.json()
+                choices = data.get("choices")
+                message = (
+                    choices[0].get("message")
+                    if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+                    else None
+                )
+                content = message.get("content") if isinstance(message, dict) else None
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("Provider returned an empty text completion")
                 usage = data.get("usage", {})
                 prompt_tokens = int(usage.get("prompt_tokens", 0))
                 completion_tokens = int(usage.get("completion_tokens", 0))
@@ -105,7 +114,7 @@ class LLMProvider:
                 )
 
                 return {
-                    "text": data["choices"][0]["message"]["content"],
+                    "text": content.strip(),
                     "provider": "portfolio-gateway" if gateway_token else self.settings.llm_provider,
                     "model": data.get(
                         "model",

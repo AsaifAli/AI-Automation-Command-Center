@@ -188,8 +188,8 @@ def main() -> int:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=90,
-        help="Maximum seconds to wait for each workflow (default: 90)",
+        default=240,
+        help="Maximum seconds to wait for each workflow (default: 240)",
     )
     parser.add_argument(
         "--env-file",

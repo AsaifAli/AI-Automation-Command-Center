@@ -5,7 +5,7 @@ from html import escape
 
 import requests
 import streamlit as st
-from api_access import build_api_headers
+from api_access import api_timeout_for, build_api_headers
 from content_input import parse_topic_briefs
 from gateway_handoff import GatewayHandoffError, exchange_handoff_code
 from output_formatting import build_client_report_markdown
@@ -174,7 +174,7 @@ def api_post(path: str, body: dict, role: str = "operator"):
         f"{API}{path}",
         headers={**request_headers(role), "Content-Type": "application/json"},
         json=body,
-        timeout=15,
+        timeout=api_timeout_for(path),
     )
 
 

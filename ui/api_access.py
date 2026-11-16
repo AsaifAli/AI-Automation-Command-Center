@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 
@@ -31,3 +32,23 @@ def build_api_headers(
             headers["X-LLM-Gateway-Token"] = gateway_token.strip()
 
     return headers
+
+def api_timeout_for(path: str, *, run_timeout_seconds: int | str | None = None) -> int:
+    """Return a bounded HTTP timeout for the inline workflow-create request.
+
+    Normal UI reads/writes remain short. The public Render demo executes a
+    workflow inline, so POST /api/v1/runs must wait longer than a routine API
+    call while the LLM completes.
+    """
+    route = (path or "").split("?", 1)[0].rstrip("/") or "/"
+    if route != "/api/v1/runs":
+        return 15
+
+    raw_value = run_timeout_seconds
+    if raw_value is None:
+        raw_value = os.getenv("RUN_REQUEST_TIMEOUT_SECONDS", "75")
+    try:
+        timeout = int(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        timeout = 75
+    return max(30, min(timeout, 180))

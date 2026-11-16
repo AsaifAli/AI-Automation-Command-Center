@@ -1,79 +1,53 @@
-# LLM Gateway
+# LLM Gateway and BYOK
 
-This project uses a small LiteLLM proxy as the deployment-time LLM boundary. The application talks to an internal OpenAI-compatible endpoint instead of embedding an LLM model in the project container.
+FlowPilot supports two live inference paths:
 
-## Default routing
+- **Portfolio BYOK:** the user connects a provider in the portfolio, which launches FlowPilot with a short-lived, project-scoped handoff code.
+- **Local service key:** the local Docker Compose stack can route through its LiteLLM proxy when a provider key has been configured in `.env`.
 
-`portfolio-free` -> OpenRouter `openrouter/free` -> LiteLLM fallback -> Gemini Flash Lite.
+## Portfolio handoff
 
-OpenRouter's `openrouter/free` router dynamically selects an available free model. The exact upstream model can be pinned later with `OPENROUTER_LITELLM_MODEL` without changing application code.
+The handoff is project-bound and single-use. FlowPilot removes the `portfolio_llm_handoff` query parameter immediately, posts the code to the shared Gateway exchange endpoint from the Streamlit server, validates `target_project=flowpilot`, and stores the returned short-lived bearer only in Streamlit server-side session state. The old reusable `portfolio_llm_session` query parameter is rejected.
 
-## Environment
+The API receives the session only through `X-LLM-Gateway-Token` and checks the Gateway status response for:
 
-Create `.env` from `.env.example` and set:
+- `active=true`
+- `project=flowpilot`
+- `session_project=portfolio`
+- a valid, sufficiently long remaining expiry
 
-- `LITELLM_MASTER_KEY` — an internal gateway key; generate a strong random value.
-- `OPENROUTER_API_KEY` — your own OpenRouter key.
-- `GEMINI_API_KEY` — optional fallback key.
-- `OPENROUTER_LITELLM_MODEL` — defaults to `openrouter/free`.
-- `GEMINI_LITELLM_MODEL` — defaults to `gemini/gemini-flash-lite-latest`.
+The current shared Gateway status endpoint returns both `project` and `session_project`. The former is the delegated demo project; the latter is the original portfolio session. Keep this contract aligned if the Gateway response schema changes.
 
-Never commit `.env` or provider API keys. Only `.env.example` belongs in Git.
+Configure:
 
-## Local run
-
-```bash
-docker compose up --build
+```dotenv
+PORTFOLIO_SESSION_GATEWAY_URL=https://<gateway-origin>
+LLM_GATEWAY_URL=https://<gateway-origin>/v1
 ```
 
-If no upstream provider key is configured, the application may start but LLM requests will fail rather than silently using a bundled model. This keeps deployment behavior explicit and avoids shipping multi-GB model weights.
+The UI uses the origin for `/v1/demo/session/exchange`. The API uses the `/v1` base for `/demo/session/status` and `/chat/completions`.
 
-## Optional self-hosted inference
+## Queued local BYOK
 
-Projects that already support Ollama or vLLM retain those local/self-hosted paths. They are intentionally not required by the default public deployment.
+For the local queued topology, the API validates the Gateway bearer, encrypts it with `FLOWPILOT_GATEWAY_CREDENTIAL_KEY`, and stores the ciphertext with a short TTL. RQ receives only an opaque credential reference. A worker consumes the reference, decrypts the bearer in memory for the LLM request, then clears the request context.
 
-
-
-## Secure queued BYOK handoff
-
-FlowPilot UI exchanges the portfolio's single-use `flowpilot` handoff code on
-the server and keeps the short-lived Gateway bearer in Streamlit server-side
-session state. When a user queues a workflow, the API verifies the bearer
-against the Gateway session-status endpoint and requires `project=flowpilot`
-and `session_project=portfolio`. The API then receives the bearer only in
-`X-LLM-Gateway-Token`.
-
-For asynchronous runs, the API encrypts the bearer with the application Fernet
-key `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` and stores the ciphertext in the
-PostgreSQL `gateway_job_credentials` table with a short TTL. RQ/Redis receives
-only a random credential UUID, never the bearer. The worker atomically
-consumes the row, decrypts the bearer in memory, uses it for that workflow,
-and clears the request context afterward. The reusable bearer is never
-included in RQ arguments, Redis job payloads, workflow payload JSON, or logs.
-
-Configure both URLs separately:
-
-- `PORTFOLIO_SESSION_GATEWAY_URL=https://your-gateway-host` (UI handoff-code exchange)
-- `LLM_GATEWAY_URL=https://your-gateway-host/v1` (API verification and worker inference)
-
-Generate a Fernet key with:
+Generate a Fernet key when setting up the local queued path:
 
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Set the resulting `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` identically for the API
-and worker. Keep it stable while queued BYOK jobs may exist. Queued BYOK
-requires PostgreSQL; it is deliberately rejected when only ephemeral in-memory
-storage is configured. The default encrypted credential TTL is 900 seconds
-and may be set between 60 and 1800 seconds, capped by the Gateway session's
-remaining lifetime. If a job starts after expiry or after another worker has
-consumed the reference, it fails closed and requires a fresh portfolio
-handoff.
+Use the same key in the API and worker environments. Never commit `.env` or share the generated key. The public Render demo uses inline execution and does not require the queued-worker credential-storage path.
 
-The service-level LiteLLM key remains the route for runs without a Gateway
-session. A valid FlowPilot Gateway session takes precedence over demo mode.
-The shared Portfolio LLM Gateway must allow the `flowpilot` project slug.
-Gateway BYOK usage reports token counts but does not provide provider-specific
-pricing, so FlowPilot marks the BYOK cost estimate unavailable rather than
-applying its service-level LiteLLM price assumptions.
+## Local LiteLLM
+
+The Compose topology exposes an OpenAI-compatible LiteLLM endpoint to the API. Configure the applicable provider credentials in `.env`. The configured OpenRouter model may dynamically select an available model, and the Gemini route is a fallback only when its key is configured. A missing fallback key can make fallback requests fail even when the primary route is healthy.
+
+For content workflows that return structured multi-channel output, a 30-second per-attempt timeout proved too short in the observed local run. Use the recommended local settings:
+
+```dotenv
+REQUEST_TIMEOUT_SECONDS=90
+MAX_RETRIES=1
+```
+
+The smoke test waits up to 240 seconds for each queued workflow by default so it can observe a completed result or a real failure instead of timing out before the worker finishes.

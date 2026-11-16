@@ -4,6 +4,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 env/
+.bundle-backups/
 .env
 *.db
 .DS_Store
@@ -25,3 +26,6 @@ build/
 .coverage.*
 htmlcov/
 .hypothesis/
+
+# Local backup snapshots
+.flowpilot-demo-refinement-backup-*/

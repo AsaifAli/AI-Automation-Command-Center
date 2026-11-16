@@ -43,7 +43,7 @@ services:
       - key: REQUEST_TIMEOUT_SECONDS
         value: "60"
       - key: MAX_RETRIES
-        value: "2"
+        value: "0"
       - key: SCHEDULE_ENABLED
         value: "false"
       - key: OTEL_ENABLED
@@ -75,5 +75,7 @@ services:
           type: web
           name: ai-automation-api
           envVarKey: API_OPERATOR_KEYS
+      - key: RUN_REQUEST_TIMEOUT_SECONDS
+        value: "75"
       - key: PORTFOLIO_SESSION_GATEWAY_URL
         sync: false

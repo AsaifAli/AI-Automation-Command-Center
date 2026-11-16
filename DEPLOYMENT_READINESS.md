@@ -1,46 +1,45 @@
 # FlowPilot Deployment Readiness
 
-## Previous user-verified local baseline (15 November 2026)
+Audit snapshot: 15 November 2026. Default branch: `main`.
 
-The user ran these checks on the existing project before the final 3.5.0 cleanup edits:
+## Verified from the live repository
 
-- Python 3.12 compile check: passed.
+Latest commit: `c8bad65` — `fix: organize smoke test imports`.
+
+Latest inspected GitHub Actions run: [CI #28](https://github.com/AsaifAli/AI-Automation-Command-Center/actions/runs/43744181012), successful.
+
 - Ruff: all checks passed.
-- Full automated test suite: 52 passed.
-- Workflow evaluation suite: 4/4 passed.
-- Docker Compose configuration: valid.
-- Local Docker end-to-end smoke test: content, competitor, outreach and KPI workflows completed; approval flow passed; 8/8 recorded runs completed with zero failures.
-- Docker service stack: API, UI, PostgreSQL, Redis, worker, scheduler, LiteLLM, Prometheus, Grafana, Jaeger and OTel collector observed running.
-- Real LiteLLM inference: successful completion through `portfolio-free`, with provider usage metadata returned.
-- Streamlit Gateway import collision: corrected; UI rebuilt and confirmed working.
+- Automated tests: 85 passed, 3 non-blocking deprecation warnings.
+- Workflow evaluations: 4/4 passed.
+- Python compile check: passed.
+- `docker compose config --quiet`: passed.
+- Application Docker image build: passed.
 
-## Validation performed for this 3.5.0 release candidate
+Earlier user-provided local Docker logs also showed the four workflow types completing and an outreach approval being recorded. Those local results are useful evidence, but they are not a live Render acceptance test.
 
-- Python compileall: passed.
-- Targeted tests for content generation, formatted reports, UI handoff, queued credential vault/worker, input parsing and bootstrap: 22 passed.
-- Broader available test subset, excluding the two API test modules that could not be imported because this validation environment lacks the `redis` Python package: 59 passed.
-- YAML parsing: `render.yaml`, `render.production.yaml`, Compose, LiteLLM, Prometheus and OTel configuration parsed successfully.
-- Render plan IDs checked against the published Render Blueprint schema enum.
-- Ruff, full test collection, LangGraph evaluation suite and Docker build/runtime were not executed in this validation container because Ruff, Redis/RQ, LangGraph, Streamlit and Docker are not installed here. Re-run them in the user's Python 3.12/Docker environment before deployment.
+## Not yet production-accepted
 
-## Current Render demo topology
+1. Tenant/session ownership is not enforced on run history or run lookup. The public UI shares a server-side operator credential and reads shared run history. Do not use the public demo for confidential multi-client data until this is fixed.
+2. Public live inference has no verified per-session/user quota, concurrency limit, or spend ceiling.
+3. Approval endpoint does not currently enforce completed-only decisions or prevent conflicting repeated decisions.
+4. Queue dispatch and PostgreSQL run creation are not protected by a transactional outbox; stale `queued`/`running` jobs need recovery/reconciliation.
+5. The durable Render Blueprint has not been shown deployed and acceptance-tested in this audit.
+6. Production Blueprint sets `OTEL_ENABLED=false`; the local monitoring stack is not provisioned in that Render topology.
+7. Database restore, queue restart recovery, and rollback have not been demonstrated against the deployed topology.
+8. Shared Gateway project allowlist, live one-time BYOK handoff, encrypted credential persistence, worker consumption, and real model output still need live acceptance.
+9. Root README was previously an internal smoke-test patch note and should be replaced by the bundled project README.
+10. `main` branch protection is disabled. Require CI checks before merging/releasing.
 
-`render.yaml` defines the existing two-service public demo (FastAPI + Streamlit). It runs with `INLINE_EXECUTION=true` and no Render Postgres/Key Value/worker/scheduler. State is ephemeral. This is suitable for inline BYOK and live inference checks, but not durable queued operations.
+## Deployment modes
 
-## Durable Render topology
+### `render.yaml`
 
-`render.production.yaml` is an alternate paid topology. It provisions API, UI, RQ worker, scheduler, Render Postgres and private persistent Key Value. It is intended for queued BYOK with durable encrypted credential storage. It must be reviewed for cost and existing-resource ownership before syncing; it is not automatically applied by a push to the current `render.yaml` Blueprint.
+Two web services: API and UI. It uses inline execution and ephemeral run state. No Render PostgreSQL, persistent Key Value, RQ worker, or scheduler is provisioned. Treat it as a controlled portfolio demo, not a durable production service.
 
-## Remaining production acceptance tests
+### `render.production.yaml`
 
-1. Deploy the shared Portfolio LLM Gateway allowlist change for project slug `flowpilot`.
-2. Configure the exact Gateway origin on the UI and `/v1` base URL on the API/worker.
-3. Confirm active session status returns `project=flowpilot`, `session_project=portfolio`, and a bounded remaining TTL.
-4. Queue a BYOK run against durable Render services and verify the Redis job contains only an opaque credential reference.
-5. Verify the credential row is encrypted, expires, and is atomically consumed by one worker.
-6. Verify a real model-generated Content Studio result, with provider/model/usage metadata and human-review status.
-7. Verify approval/rejection and that no external publish/send occurs automatically.
-8. Restart API/worker and verify Postgres history/audit records and queue recovery.
-9. Verify monitoring targets, dashboards and traces.
+Paid durable topology: API, UI, worker, scheduler, PostgreSQL, and persistent Key Value. It requires resource/cost review, secrets configuration, shared Gateway allowlist configuration, monitoring plan, backup plan, and all live acceptance tests in `docs/PRODUCTION_ACCEPTANCE.md`.
 
-**Status:** the previous user-verified baseline passed local tests and basic real inference. This exact release candidate has 59 passing tests in the available subset; its full API test collection, Ruff, evaluation suite and Docker deployment still need verification in the user's fully provisioned environment. Production BYOK and durable Render acceptance remain pending.
+## Status language
+
+Use **CI passing** for the current code state. Do not describe FlowPilot as a fully validated production deployment until the P0/P1 blockers in `docs/PRODUCTION_GAP_REGISTER.md` are closed and the live acceptance tests have evidence attached.
