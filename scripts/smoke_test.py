@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Authenticated Docker Compose end-to-end smoke test for FlowPilot."""
 
 from __future__ import annotations
@@ -230,7 +229,7 @@ def main() -> int:
         print(f"READY: {ready}")
 
         completed = 0
-        outreach_run_id: str | None = None
+        approvals_completed = 0
 
         for workflow, payload in WORKFLOWS:
             queued = call(
@@ -239,48 +238,52 @@ def main() -> int:
                 f"{base}/api/v1/runs",
                 json={"workflow": workflow, "payload": payload},
             ).json()
-
             run_id = queued["run_id"]
             print(f"QUEUED: {workflow} -> {run_id}")
 
-            result = wait_for_run(
-                operator_session,
-                base,
-                run_id,
-                args.timeout,
-            )
-            print(
-                f"RESULT: {workflow} -> {result['status']} "
-                f"({result['duration_ms']} ms)"
-            )
-
-            if result["status"] not in {"completed", "completed_with_warnings"}:
-                print(
-                    f"FAILURE OUTPUT: {result.get('output')}",
-                    file=sys.stderr,
-                )
-                return 1
-
+            result = wait_for_run(operator_session, base, run_id, args.timeout)
+            print(f"RESULT: {workflow} -> {result['status']} ({result['duration_ms']} ms)")
             if result["run_id"] != run_id:
                 raise AssertionError("run_id changed between queue and completion")
 
-            if workflow == "outreach":
-                outreach_run_id = run_id
-            completed += 1
-
-        if outreach_run_id:
-            approval = call(
-                approval_session,
-                "POST",
-                f"{base}/api/v1/runs/{outreach_run_id}/approval",
-                json={
-                    "decision": "approved",
-                    "note": "Automated end-to-end verification",
-                },
-            ).json()
-            print(
-                f"APPROVAL: {approval['decision']} -> {approval['approval_id']}"
-            )
+            if workflow in {"content", "outreach"}:
+                if result["status"] != "awaiting_approval":
+                    failure_output = result.get("output") or {}
+                    error = failure_output.get("error") or "No error detail returned by the API."
+                    recovery = failure_output.get("recovery") or "Inspect the worker logs for the run reference."
+                    warnings = result.get("warnings") or []
+                    print(
+                        f"APPROVAL GATE NOT REACHED: workflow={workflow} "
+                        f"status={result['status']} error={error} "
+                        f"recovery={recovery} warnings={warnings}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                approval_request = (result.get("output") or {}).get("approval") or {}
+                if approval_request.get("status") != "pending":
+                    print(f"MISSING APPROVAL REQUEST: {workflow}", file=sys.stderr)
+                    return 1
+                inbox = call(approval_session, "GET", f"{base}/api/v1/approvals?limit=50").json()
+                if not any(item.get("run_id") == run_id for item in inbox.get("approvals", [])):
+                    print(f"RUN NOT VISIBLE IN APPROVAL INBOX: {workflow}", file=sys.stderr)
+                    return 1
+                decision = call(
+                    approval_session,
+                    "POST",
+                    f"{base}/api/v1/runs/{run_id}/approval",
+                    json={"decision": "approved", "note": "Automated end-to-end verification"},
+                ).json()
+                print(f"APPROVAL: {workflow} {decision['decision']} -> {decision['approval_id']}")
+                approved_run = call(operator_session, "GET", f"{base}/api/v1/runs/{run_id}").json()
+                if approved_run["status"] != "approved":
+                    print(f"APPROVAL STATE NOT PERSISTED: {approved_run['status']}", file=sys.stderr)
+                    return 1
+                approvals_completed += 1
+            elif result["status"] in {"completed", "completed_with_warnings"}:
+                completed += 1
+            else:
+                print(f"FAILURE OUTPUT: {result.get('output')}", file=sys.stderr)
+                return 1
 
         metrics = call(
             operator_session,
@@ -289,8 +292,10 @@ def main() -> int:
         ).json()
         print(f"METRICS: {metrics}")
 
-        assert completed == len(WORKFLOWS)
-        assert metrics["workflow_runs_completed"] >= len(WORKFLOWS)
+        assert completed == 2
+        assert approvals_completed == 2
+        assert metrics["workflow_runs_completed"] >= completed
+        assert metrics.get("workflow_approvals_approved", 0) >= approvals_completed
         print("E2E SMOKE TEST PASSED")
         return 0
 

@@ -8,7 +8,8 @@ It is a demonstration of the engineering pattern and the workflow experience. It
 
 - **Content Studio:** creates channel-aware drafts from complete briefs, with structured output and character limits.
 - **Competitor Intelligence:** gathers bounded RSS/Atom signals and turns them into an evidence-oriented briefing.
-- **Outreach Agent:** qualifies a candidate and prepares a draft; the workflow remains approval-gated.
+- **Outreach Agent:** qualifies a candidate and prepares a draft; the workflow pauses for an authorized reviewer.
+- **Approval Inbox:** reviewers see pending content-publishing and outreach proposals, inspect the exact drafts, and approve or reject with an auditable decision.
 - **KPI & Progress:** normalizes updates, highlights blockers and prepares a leadership summary.
 
 The UI presents run status, output, evidence, usage and review state. External publishing, sending or other external-impact actions are not silently performed by the demo.
@@ -105,7 +106,7 @@ docker compose config --quiet
 python scripts/smoke_test.py --base-url http://localhost:8000 --timeout 240
 ```
 
-The smoke test exercises the four workflows and the outreach approval path. A workflow is only counted as successful when its final API state is `completed` or `completed_with_warnings`; a worker process merely exiting successfully is not enough.
+The smoke test exercises all four workflows. Content and Outreach must first appear in the reviewer inbox as `awaiting_approval`, then transition to `approved` after the test reviewer records a decision. Competitor and KPI must finish as `completed` or `completed_with_warnings`. A worker process merely exiting successfully is not enough.
 
 ## Render demo configuration
 
@@ -125,3 +126,8 @@ No paid durable deployment, multi-tenant onboarding system, customer-data isolat
 - Shared Portfolio LLM Gateway: <https://github.com/AsaifAli/shared-Portfolio-LLM-Gateway>
 - EvidenceFlow: <https://github.com/AsaifAli/LangGraph-RAG>
 - QuoteSense: <https://github.com/AsaifAli/quotation-analyzer>
+
+
+## Human approval behavior
+
+Content and outreach runs enter `awaiting_approval` after their drafts are prepared. Competitor and KPI workflows complete automatically. Approvals are role-checked, persisted with the audit history, and cannot be replayed. Approval authorizes the proposed action only: because this portfolio demo has no live publishing or sending connector, it never sends a message or publishes content.

@@ -23,11 +23,14 @@ Do not use a successful liveness probe as proof that the queue, database, LLM pr
 
 The current release still needs durable outbox/reconciliation implementation. Until that ships, do not manually replay arbitrary RQ jobs without checking the matching PostgreSQL row and job ID. Avoid duplicate external actions. Once recovery is implemented, follow the runbook added by that change.
 
-## Provider outage
+## Provider outage and structured content validation
 
 - Check provider status and LiteLLM/Gateway health.
 - Preserve the run reference and error type; do not expose provider response bodies to public users.
 - Verify retry count and timeout remain bounded.
+- Content drafts use preferred channel targets below the enforced hard limits. If a structurally complete response exceeds a hard limit, Content makes one targeted regeneration attempt for the complete draft set.
+- Hard character validation remains active after that attempt. Drafts are never silently truncated or allowed into the approval inbox while over limit.
+- If the correction still fails, inspect the sanitized worker error and rerun only after confirming the input/provider behavior.
 - Avoid raising timeouts globally just to mask provider degradation.
 - Pause scheduled runs if retries amplify provider load.
 

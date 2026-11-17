@@ -78,7 +78,13 @@ Agents contain business logic. They do not know about HTTP, authentication or pe
 
 ## Human-in-the-loop policy
 
-Outreach never performs an external send. It produces an approval-required candidate and persists reviewer decisions separately from workflow output.
+Content and outreach agents finish their preparation work, then set the run to `awaiting_approval`. The run is visible in the reviewer-only Approval Inbox with the proposed action, draft content, workflow reference and evidence/output context.
+
+- Content publishing and outreach sending require an authenticated reviewer or admin decision.
+- Competitor intelligence and KPI reporting remain automatic because they prepare internal analysis and do not perform an external side effect.
+- The decision is recorded atomically with the run status and audit event. A second or stale decision returns a conflict.
+- `approved` means the action was authorized, not executed. This demo has no publishing/sending connector; the API records `execution_status=not_configured` and does not claim an external action occurred.
+- Pending approval runs are protected from Clear History.
 
 ## Reliability
 

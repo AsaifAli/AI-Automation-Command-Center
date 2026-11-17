@@ -12,7 +12,7 @@
 - CORS is configurable rather than open by default.
 - Security response headers are added by API middleware.
 - Application containers run as a non-root user.
-- Outreach side effects are blocked behind human approval.
+- Content-publishing and outreach proposals pause behind a reviewer-only, replay-protected human approval gate; no external send/publish connector is configured in the demo.
 - Workflow state, approvals, audit events and encrypted one-time Gateway job credentials are stored in PostgreSQL in the durable topology.
 - Redis and PostgreSQL are not exposed to the host by default.
 

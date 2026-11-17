@@ -21,8 +21,8 @@ class FakeRepo:
         self.runs[run_id] = {
             "run_id": run_id,
             "workflow": workflow,
-            "status": "queued",
-            "output": {},
+            "status": "awaiting_approval" if workflow in {"content", "outreach"} else "queued",
+            "output": ({"approval": {"status": "pending", "action": "send_outreach" if workflow == "outreach" else "publish_content", "title": "Review requested", "summary": "Test approval request", "items": []}} if workflow in {"content", "outreach"} else {}),
             "evidence": [],
             "duration_ms": 0,
             "created_at": datetime.now(UTC),
@@ -38,6 +38,12 @@ class FakeRepo:
     def list_runs(self, limit):
         return list(self.runs.values())[:limit]
 
+    def list_pending_approvals(self, limit):
+        return [
+            {"run_id": run["run_id"], "workflow": run["workflow"], "status": run["status"], "created_at": run["created_at"], "approval": run["output"].get("approval", {}), "output": run["output"]}
+            for run in self.runs.values() if run["status"] == "awaiting_approval"
+        ][:limit]
+
     def clear_history(self):
         count = len(self.runs)
         self.runs.clear()
@@ -51,6 +57,7 @@ class FakeRepo:
             "workflow_runs_failed": 0,
             "workflow_runs_queued": len(self.runs),
             "workflow_runs_running": 0,
+            "workflow_approvals_pending": sum(run["status"] == "awaiting_approval" for run in self.runs.values()),
             "workflow_approvals_total": len(self.approvals),
             "workflow_approvals_approved": sum(
                 item["decision"] == "approved"
@@ -74,6 +81,11 @@ class FakeRepo:
             "decided_at": datetime.now(UTC),
         }
 
+        run = self.runs[run_id]
+        if run["status"] != "awaiting_approval":
+            raise ValueError("This run is no longer awaiting approval")
+        run["status"] = decision
+        run["output"].setdefault("approval", {}).update({"status": decision, "decision": decision, "reviewer": reviewer, "note": note, "execution_status": "not_configured"})
         self.approvals.append(result)
         return result
 

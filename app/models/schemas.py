@@ -85,5 +85,6 @@ class MetricResponse(BaseModel):
     workflow_runs_failed: int
     workflow_approvals_total: int
     workflow_approvals_approved: int
+    workflow_approvals_pending: int = 0
     workflow_runs_queued: int = 0
     workflow_runs_running: int = 0

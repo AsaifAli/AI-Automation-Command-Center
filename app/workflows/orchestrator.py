@@ -23,6 +23,42 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+def _approval_request(workflow: str, output: dict[str, Any], created_at: datetime) -> dict[str, Any] | None:
+    """Build a review request for workflows that stage external-impact actions."""
+    if workflow == "content" and output.get("posts"):
+        posts = output.get("posts", [])
+        return {
+            "status": "pending",
+            "action": "publish_content",
+            "title": "Review and authorize content publishing",
+            "summary": f"{len(posts)} channel-specific content draft(s) are ready for approval.",
+            "items": [
+                {"topic": post.get("topic"), "channel": post.get("channel"), "draft": post.get("draft")}
+                for post in posts
+            ],
+            "created_at": created_at.isoformat(),
+        }
+    if workflow == "outreach" and output.get("candidates"):
+        candidates = output.get("candidates", [])
+        return {
+            "status": "pending",
+            "action": "send_outreach",
+            "title": "Review and authorize outreach",
+            "summary": f"{len(candidates)} outreach message(s) are ready for approval.",
+            "items": [
+                {
+                    "name": candidate.get("name"),
+                    "channel": candidate.get("channel"),
+                    "message": candidate.get("message"),
+                    "reason": candidate.get("reason"),
+                }
+                for candidate in candidates
+            ],
+            "created_at": created_at.isoformat(),
+        }
+    return None
+
+
 class State(TypedDict, total=False):
     payload: dict[str, Any]
     output: dict[str, Any]
@@ -99,6 +135,11 @@ class WorkflowEngine:
                 not self.llm.settings.demo_mode
                 and not getattr(self.llm, "gateway_session_active", False),
             )
+            approval = _approval_request(workflow, output, datetime.now(UTC))
+            if approval and status in {"completed", "completed_with_warnings"}:
+                output["approval"] = approval
+                # This is an approval checkpoint, not an external execution.
+                status = "awaiting_approval"
         except Exception as exc:
             status = "failed"
             logger.exception(

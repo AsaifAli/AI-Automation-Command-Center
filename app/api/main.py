@@ -51,6 +51,7 @@ PROM_METRICS = {
         "workflow_runs_running",
         "workflow_approvals_total",
         "workflow_approvals_approved",
+        "workflow_approvals_pending",
     )
 }
 
@@ -488,6 +489,27 @@ def run_workflow(
 
 
 @app.get(
+    "/api/v1/approvals",
+    tags=["approvals"],
+)
+def list_pending_approvals(
+    limit: int = 50,
+    _: Principal = Depends(require_permission("approvals:decide")),
+):
+    """List pending review requests for authorized reviewers and admins."""
+    try:
+        safe_limit = min(max(limit, 1), 100)
+        approvals = repo.list_pending_approvals(safe_limit)
+        return {"approvals": approvals, "total": len(approvals)}
+    except Exception:
+        logger.exception("pending_approvals_lookup_failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Pending approvals are temporarily unavailable",
+        ) from None
+
+
+@app.get(
     "/api/v1/runs",
     response_model=RunListResponse,
     tags=["workflows"],
@@ -602,17 +624,22 @@ def decide_approval(
             detail="Run not found",
         )
 
-    if result["workflow"] != "outreach":
+    if result["workflow"] not in {"content", "outreach"}:
         raise HTTPException(
             status_code=400,
-            detail="Only outreach runs support human approval",
+            detail="This workflow has no external-impact action requiring approval",
         )
 
     # The authenticated principal determines reviewer identity.
     # The legacy request.reviewer field is deliberately ignored.
-    return repo.create_approval(
-        run_id,
-        request.decision,
-        principal.subject,
-        request.note,
-    )
+    try:
+        return repo.create_approval(
+            run_id,
+            request.decision,
+            principal.subject,
+            request.note,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Run not found") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None

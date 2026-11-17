@@ -29,3 +29,6 @@ htmlcov/
 
 # Local backup snapshots
 .flowpilot-demo-refinement-backup-*/
+
+# Local backups created by the Human Approval Center bundle
+.approval-center-backups/

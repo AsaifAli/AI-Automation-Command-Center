@@ -138,6 +138,7 @@ def request_headers(role: str = "operator") -> dict[str, str]:
         "operator": API_OPERATOR_KEY or LEGACY_API_KEY,
         "reviewer": (
             API_REVIEWER_KEY
+            or API_ADMIN_KEY
             or _manual_reviewer_key()
             or LEGACY_API_KEY
         ),
@@ -222,9 +223,9 @@ def fetch_run(run_id: str):
 def render_status_pill(status: str) -> None:
     normalized = (status or "unknown").lower()
     dot_class = "status-dot"
-    if normalized in {"pending", "rejected"}:
+    if normalized in {"pending", "awaiting_approval", "rejected"}:
         dot_class = "status-dot warn"
-    elif normalized not in {"queued", "running", "completed", "completed_with_warnings", "approved"}:
+    elif normalized not in {"queued", "running", "awaiting_approval", "completed", "completed_with_warnings", "approved", "rejected"}:
         dot_class = "status-dot fail"
     label = normalized.replace("_", " ").upper()
     st.markdown(
@@ -479,10 +480,15 @@ if active_run_id:
             unsafe_allow_html=True,
         )
 
-    stage_state = "active" if status in {"queued", "running"} else ("complete" if status in {"completed", "completed_with_warnings", "approved"} else "failed")
+    stage_state = "active" if status in {"queued", "running"} else ("complete" if status in {"completed", "completed_with_warnings", "approved", "rejected"} else "failed")
     steps = []
     for index, stage in enumerate(meta["stages"]):
-        if stage_state == "complete":
+        if status == "awaiting_approval":
+            if index < len(meta["stages"]) - 1:
+                marker, cls = "✓", "complete"
+            else:
+                marker, cls = "Ⅱ", "active"
+        elif stage_state == "complete":
             marker, cls = "✓", "complete"
         elif stage_state == "failed":
             marker, cls = "!", "failed"
@@ -564,59 +570,83 @@ if result:
             else "Provider billed",
         )
         st.caption("Token counts are provider-reported where available. BYOK provider charges are not estimated or billed by FlowPilot.")
-        if result_workflow == "outreach" and result["status"] != "failed":
-            effective_reviewer_key = (
-                API_REVIEWER_KEY
-                or _manual_reviewer_key()
-                or LEGACY_API_KEY
-            )
-            if not effective_reviewer_key:
-                with st.expander("Authorized reviewer access", expanded=False):
-                    st.caption("Reviewer credentials are never preloaded into the public UI. Enter your assigned reviewer key to unlock approval controls for this browser session.")
-                    reviewer_entry = st.text_input(
-                        "Reviewer API key",
-                        type="password",
-                        key="reviewer_api_key_entry",
-                    )
-                    if st.button("Unlock reviewer controls", use_container_width=True):
-                        if reviewer_entry.strip():
-                            st.session_state["manual_reviewer_api_key"] = reviewer_entry.strip()
-                            st.session_state["manual_reviewer_expires_at"] = time.time() + 900
-                            st.rerun()
-                        st.warning("Enter a reviewer key to continue.")
-            else:
-                note = st.text_area(
-                    "Reviewer decision note",
-                    "Reviewed for fit, accuracy and policy compliance.",
-                    max_chars=1000,
-                    key="approval_note",
-                    height=80,
-                )
-                a, b = st.columns(2)
-                if a.button("Approve draft", use_container_width=True, type="primary"):
+        review_state = result.get("output", {}).get("approval", {})
+        if result.get("status") == "awaiting_approval":
+            st.info("This run is paused in the Approval Inbox. An authorized reviewer must approve or reject the proposed action.")
+        elif review_state.get("status") == "approved":
+            st.success("Authorization recorded. This demo has no live publish/send connector; nothing was sent or published.")
+        elif review_state.get("status") == "rejected":
+            st.warning("The proposed action was rejected. No external action was performed.")
+
+st.divider()
+st.markdown('<div class="section-kicker">HUMAN IN THE LOOP</div>', unsafe_allow_html=True)
+st.markdown('<div class="subsection-title">Approval Inbox</div>', unsafe_allow_html=True)
+st.caption("Content publishing and outreach sending stop here until an authorized reviewer decides. Approval records authorization only; no external connector is configured in this demo.")
+
+reviewer_key_available = bool(
+    API_REVIEWER_KEY
+    or API_ADMIN_KEY
+    or _manual_reviewer_key()
+    or LEGACY_API_KEY
+)
+if not reviewer_key_available:
+    with st.expander("Authorized reviewer access", expanded=False):
+        st.caption("Enter an assigned reviewer or admin API key. Access is held in this browser session for 15 minutes.")
+        reviewer_entry = st.text_input("Reviewer API key", type="password", key="approval_inbox_reviewer_key")
+        if st.button("Unlock approval inbox", key="unlock_approval_inbox"):
+            if reviewer_entry.strip():
+                st.session_state["manual_reviewer_api_key"] = reviewer_entry.strip()
+                st.session_state["manual_reviewer_expires_at"] = time.time() + 900
+                st.rerun()
+            st.warning("Enter a reviewer key to continue.")
+else:
+    try:
+        pending_response = api_get("/api/v1/approvals?limit=50", role="reviewer")
+        pending_items = response_json(pending_response, "Load approval inbox").get("approvals", [])
+        if not pending_items:
+            st.markdown('<div class="empty-state"><strong>No pending approvals</strong><span>New content and outreach proposals appear here after their agents finish.</span></div>', unsafe_allow_html=True)
+        for pending_item in pending_items:
+            approval = pending_item.get("approval", {})
+            workflow_name = str(pending_item.get("workflow", "")).lower()
+            meta_item = WORKFLOW_META.get(workflow_name, {"icon": "⚙️", "title": workflow_name.title()})
+            with st.container(border=True):
+                st.subheader(f"{meta_item['icon']} {approval.get('title') or meta_item['title']}")
+                st.caption(f"Run {str(pending_item.get('run_id', ''))[:12]} · {approval.get('action', 'review')} · {pending_item.get('created_at', '')}")
+                st.write(approval.get("summary", "Review this proposed action."))
+                for draft in approval.get("items", []):
+                    if not isinstance(draft, dict):
+                        continue
+                    if workflow_name == "content":
+                        st.markdown(f"**{draft.get('channel', 'channel')} · {draft.get('topic', 'Content draft')}**")
+                        st.write(draft.get("draft", ""))
+                    else:
+                        st.markdown(f"**{draft.get('name', 'Prospect')} · {draft.get('channel', 'channel')}**")
+                        st.write(draft.get("message", ""))
+                        if draft.get("reason"):
+                            st.caption(draft["reason"])
+                decision_note = st.text_area("Reviewer note", key=f"approval_note_{pending_item.get('run_id')}", max_chars=1000)
+                approve_col, reject_col = st.columns(2)
+                if approve_col.button("Approve action", type="primary", use_container_width=True, key=f"approve_{pending_item.get('run_id')}"):
                     response = api_post(
-                        f"/api/v1/runs/{result['run_id']}/approval",
-                        {"decision": "approved", "note": note},
+                        f"/api/v1/runs/{pending_item.get('run_id')}/approval",
+                        {"decision": "approved", "note": decision_note},
                         role="reviewer",
                     )
-                    if response.ok:
-                        st.success("Approval recorded in the audit trail.")
-                        st.rerun()
-                    st.error("Approval could not be recorded. Check reviewer permissions and run status.")
-                if b.button("Reject draft", use_container_width=True):
-                    response = api_post(
-                        f"/api/v1/runs/{result['run_id']}/approval",
-                        {"decision": "rejected", "note": note},
-                        role="reviewer",
-                    )
-                    if response.ok:
-                        st.warning("Rejection recorded in the audit trail.")
-                        st.rerun()
-                    st.error("Rejection could not be recorded. Check reviewer permissions and run status.")
-                if st.button("Disconnect reviewer", key="disconnect_reviewer"):
-                    st.session_state.pop("manual_reviewer_api_key", None)
-                    st.session_state.pop("manual_reviewer_expires_at", None)
+                    response_json(response, "Approve action")
+                    st.success("Authorization recorded. No message was sent and no content was published.")
                     st.rerun()
+                if reject_col.button("Reject action", use_container_width=True, key=f"reject_{pending_item.get('run_id')}"):
+                    response = api_post(
+                        f"/api/v1/runs/{pending_item.get('run_id')}/approval",
+                        {"decision": "rejected", "note": decision_note},
+                        role="reviewer",
+                    )
+                    response_json(response, "Reject action")
+                    st.warning("Proposal rejected. No external action was performed.")
+                    st.rerun()
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+        st.error(f"Approval inbox unavailable: {exc}")
+
 
 st.divider()
 st.markdown('<div class="section-kicker">OPERATIONS</div>', unsafe_allow_html=True)
@@ -636,9 +666,9 @@ with health_col:
     )
 with approval_col:
     st.markdown('<div class="subsection-title">Approval center</div>', unsafe_allow_html=True)
-    if metrics["workflow_approvals_total"]:
+    if metrics["workflow_approvals_total"] or metrics.get("workflow_approvals_pending", 0):
         st.markdown(
-            f'<div class="approval-card"><div class="approval-number">{metrics["workflow_approvals_approved"]}</div><div><strong>approved decisions</strong><small>{metrics["workflow_approvals_total"]} total human decisions recorded</small></div></div>',
+            f'<div class="approval-card"><div class="approval-number">{metrics["workflow_approvals_pending"]}</div><div><strong>pending review</strong><small>{metrics["workflow_approvals_approved"]} approved · {metrics["workflow_approvals_total"]} total decisions</small></div></div>',
             unsafe_allow_html=True,
         )
     else:

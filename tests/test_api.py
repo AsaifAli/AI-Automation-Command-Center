@@ -14,11 +14,12 @@ class FakeRepo:
         return None
 
     def create_pending_run(self, workflow):
+        requires_approval = workflow in {"content", "outreach"}
         self.run = {
             "run_id": "11111111-1111-1111-1111-111111111111",
             "workflow": workflow,
-            "status": "queued",
-            "output": {},
+            "status": "awaiting_approval" if requires_approval else "queued",
+            "output": ({"approval": {"status": "pending", "action": "send_outreach" if workflow == "outreach" else "publish_content", "title": "Review requested", "summary": "Test approval request", "items": []}} if requires_approval else {}),
             "evidence": [],
             "duration_ms": 0,
             "created_at": datetime.now(UTC),
@@ -41,6 +42,10 @@ class FakeRepo:
         return {"workflow_runs_total": 0, "workflow_runs_completed": 0, "workflow_runs_failed": 0, "workflow_runs_queued": 1 if self.run else 0, "workflow_runs_running": 0, "workflow_approvals_total": 0, "workflow_approvals_approved": 0}
 
     def create_approval(self, run_id, decision, reviewer, note):
+        if not self.run or self.run["status"] != "awaiting_approval":
+            raise ValueError("This run is no longer awaiting approval")
+        self.run["status"] = decision
+        self.run["output"].setdefault("approval", {}).update({"status": decision, "decision": decision, "reviewer": reviewer, "note": note, "execution_status": "not_configured"})
         return {"approval_id": "22222222-2222-2222-2222-222222222222", "run_id": run_id, "decision": decision, "reviewer": reviewer, "note": note, "decided_at": datetime.now(UTC)}
 
 
@@ -62,13 +67,13 @@ def test_health():
 
 
 def test_queue_workflow():
-    response = client.post("/api/v1/runs", json={"workflow": "content", "payload": {"topics": ["AI"]}})
+    response = client.post("/api/v1/runs", json={"workflow": "competitor", "payload": {"competitors": ["AI"]}})
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
 
 
 def test_clear_run_history():
-    client.post("/api/v1/runs", json={"workflow": "content", "payload": {"topics": ["AI"]}})
+    client.post("/api/v1/runs", json={"workflow": "kpi", "payload": {"updates": []}})
     response = client.delete("/api/v1/runs/history")
     assert response.status_code == 200
     assert response.json()["deleted_runs"] == 1

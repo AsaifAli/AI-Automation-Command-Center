@@ -330,10 +330,10 @@ class Repository:
     def clear_history(self) -> int:
         if self._use_memory:
             with self._memory_lock:
-                active = [run for run in self._memory_runs.values() if run["status"] in ("queued", "running")]
+                active = [run for run in self._memory_runs.values() if run["status"] in ("queued", "running", "awaiting_approval")]
                 if active:
-                    raise ValueError("Cannot clear history while queued or running workflows exist")
-                doomed = [run_id for run_id, run in self._memory_runs.items() if run["status"] not in ("queued", "running")]
+                    raise ValueError("Cannot clear history while queued, running, or awaiting-approval workflows exist")
+                doomed = [run_id for run_id, run in self._memory_runs.items() if run["status"] not in ("queued", "running", "awaiting_approval")]
                 for run_id in doomed:
                     self._memory_runs.pop(run_id, None)
                     for approval_id, approval in list(self._memory_approvals.items()):
@@ -341,13 +341,50 @@ class Repository:
                             self._memory_approvals.pop(approval_id, None)
                 return len(doomed)
         with self._connect() as conn:
-            active = conn.execute("SELECT COUNT(*) AS count FROM workflow_runs WHERE status IN ('queued', 'running')").fetchone()
+            active = conn.execute("SELECT COUNT(*) AS count FROM workflow_runs WHERE status IN ('queued', 'running', 'awaiting_approval')").fetchone()
             if int(active["count"] or 0) > 0:
-                raise ValueError("Cannot clear history while queued or running workflows exist")
-            result = conn.execute("DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running') RETURNING run_id")
+                raise ValueError("Cannot clear history while queued, running, or awaiting-approval workflows exist")
+            result = conn.execute("DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running', 'awaiting_approval') RETURNING run_id")
             return sum(1 for _ in result)
 
+    def list_pending_approvals(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return runs paused at an approval gate, newest first."""
+        safe_limit = min(max(int(limit), 1), 100)
+        if self._use_memory:
+            with self._memory_lock:
+                runs = [
+                    copy.deepcopy(run)
+                    for run in self._memory_runs.values()
+                    if run.get("status") == "awaiting_approval"
+                    and isinstance(run.get("output", {}).get("approval"), dict)
+                ]
+            runs.sort(key=lambda item: item["created_at"], reverse=True)
+        else:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """SELECT * FROM workflow_runs
+                       WHERE status='awaiting_approval'
+                         AND output_json ? 'approval'
+                       ORDER BY created_at DESC LIMIT %s""",
+                    (safe_limit,),
+                ).fetchall()
+            runs = [self._row_to_run(row) for row in rows]
+        return [
+            {
+                "run_id": run["run_id"],
+                "workflow": run["workflow"],
+                "status": run["status"],
+                "created_at": run["created_at"],
+                "approval": run.get("output", {}).get("approval", {}),
+                "output": run.get("output", {}),
+            }
+            for run in runs[:safe_limit]
+        ]
+
     def create_approval(self, run_id: str, decision: str, reviewer: str, note: str) -> dict[str, Any]:
+        """Record one reviewer decision and atomically close the pending gate."""
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("Approval decision must be approved or rejected")
         approval_id = str(uuid.uuid4())
         decided_at = datetime.now(UTC)
         approval = {
@@ -358,15 +395,68 @@ class Repository:
             "note": note,
             "decided_at": decided_at,
         }
+        next_status = "approved" if decision == "approved" else "rejected"
         if self._use_memory:
             with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run:
+                    raise KeyError("Run not found")
+                if run.get("status") != "awaiting_approval":
+                    raise ValueError("This run is no longer awaiting approval")
+                output = run.setdefault("output", {})
+                request = output.get("approval")
+                if not isinstance(request, dict) or request.get("status") != "pending":
+                    raise ValueError("No pending approval exists for this run")
+                request.update({
+                    "status": next_status,
+                    "decision": decision,
+                    "reviewer": reviewer,
+                    "note": note,
+                    "decided_at": decided_at.isoformat(),
+                    "execution_status": "not_configured",
+                    "execution_note": (
+                        "Approval recorded. No external action was performed because no publishing or sending connector is configured."
+                    ),
+                })
+                run["status"] = next_status
                 self._memory_approvals[approval_id] = approval
             return copy.deepcopy(approval)
+
         with self._connect() as conn:
-            conn.execute("INSERT INTO approvals VALUES (%s,%s,%s,%s,%s,%s)", (approval_id, run_id, decision, reviewer, note, decided_at))
+            row = conn.execute(
+                "SELECT status, output_json FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError("Run not found")
+            if row["status"] != "awaiting_approval":
+                raise ValueError("This run is no longer awaiting approval")
+            output = row["output_json"] or {}
+            request = output.get("approval")
+            if not isinstance(request, dict) or request.get("status") != "pending":
+                raise ValueError("No pending approval exists for this run")
+            request.update({
+                "status": next_status,
+                "decision": decision,
+                "reviewer": reviewer,
+                "note": note,
+                "decided_at": decided_at.isoformat(),
+                "execution_status": "not_configured",
+                "execution_note": (
+                    "Approval recorded. No external action was performed because no publishing or sending connector is configured."
+                ),
+            })
+            conn.execute(
+                "UPDATE workflow_runs SET status=%s, output_json=%s WHERE run_id=%s",
+                (next_status, _json_dumps(output), run_id),
+            )
+            conn.execute(
+                "INSERT INTO approvals VALUES (%s,%s,%s,%s,%s,%s)",
+                (approval_id, run_id, decision, reviewer, note, decided_at),
+            )
             conn.execute(
                 "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
-                (run_id, "human_approval", json.dumps({"approval_id": approval_id, "decision": decision, "reviewer": reviewer}), decided_at),
+                (run_id, "human_approval", _json_dumps({"approval_id": approval_id, "decision": decision, "reviewer": reviewer}), decided_at),
             )
         return approval
 
@@ -381,6 +471,7 @@ class Repository:
                 "workflow_runs_failed": sum(1 for run in runs if run["status"] == "failed"),
                 "workflow_runs_queued": sum(1 for run in runs if run["status"] == "queued"),
                 "workflow_runs_running": sum(1 for run in runs if run["status"] == "running"),
+                "workflow_approvals_pending": sum(1 for run in runs if run["status"] == "awaiting_approval"),
                 "workflow_approvals_total": len(approvals),
                 "workflow_approvals_approved": sum(1 for item in approvals if item["decision"] == "approved"),
             }
@@ -391,6 +482,7 @@ class Repository:
                           COUNT(*) FILTER (WHERE status='failed') AS failed,
                           COUNT(*) FILTER (WHERE status='queued') AS queued,
                           COUNT(*) FILTER (WHERE status='running') AS running
+                          ,COUNT(*) FILTER (WHERE status='awaiting_approval') AS pending
                    FROM workflow_runs"""
             ).fetchone()
             approvals = conn.execute("SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE decision='approved') AS approved FROM approvals").fetchone()
@@ -400,6 +492,7 @@ class Repository:
             "workflow_runs_failed": int(runs["failed"] or 0),
             "workflow_runs_queued": int(runs["queued"] or 0),
             "workflow_runs_running": int(runs["running"] or 0),
+            "workflow_approvals_pending": int(runs["pending"] or 0),
             "workflow_approvals_total": int(approvals["total"] or 0),
             "workflow_approvals_approved": int(approvals["approved"] or 0),
         }
