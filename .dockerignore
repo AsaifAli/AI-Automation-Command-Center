@@ -22,5 +22,15 @@ build
 .nox
 htmlcov
 .hypothesis
-tests/
+.flowpilot-demo-refinement-backup-*
+.approval-center-backups
+.bundle-backups
+
+# Tests are needed by the explicit Docker build target but are not included
+# in the default runtime build's application COPY instructions.
+!tests/
+!tests/**
+tests/.DS_Store
+tests/**/__pycache__/
+tests/**/*.pyc
 secrets/

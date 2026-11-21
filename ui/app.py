@@ -6,6 +6,7 @@ from html import escape
 import requests
 import streamlit as st
 from api_access import api_timeout_for, build_api_headers
+from api_startup import APIStartupError, load_api_startup_data
 from content_input import parse_topic_briefs
 from gateway_handoff import GatewayHandoffError, exchange_handoff_code
 from output_formatting import build_client_report_markdown
@@ -259,12 +260,23 @@ def workflow_preview(meta: dict, mode_label: str) -> None:
     )
 
 
+startup_message = st.empty()
 try:
-    health = response_json(api_get("/health"), "Health check")
-    metrics = response_json(api_get("/metrics"), "Metrics request")
-except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
-    st.error(f"API unavailable: {exc}")
+    with st.spinner("Connecting to the FlowPilot API…"):
+        health, metrics = load_api_startup_data(
+            api_get,
+            response_json,
+            on_retry=lambda attempt, wait_seconds: startup_message.caption(
+                f"API service is waking up · retry {attempt} in {wait_seconds:.0f}s"
+            ),
+        )
+except APIStartupError as exc:
+    startup_message.empty()
+    st.error(str(exc))
+    st.info("The UI is running, but the API service is not ready yet. Refresh this page after the API finishes waking up.")
     st.stop()
+finally:
+    startup_message.empty()
 
 gateway_active = gateway_session_is_active()
 mode_label = (

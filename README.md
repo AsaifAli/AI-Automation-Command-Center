@@ -80,9 +80,11 @@ For live service-level inference, configure the relevant provider key(s) and Lit
 Recommended local LLM timing defaults for complete structured outputs:
 
 ```dotenv
-REQUEST_TIMEOUT_SECONDS=90
-MAX_RETRIES=1
-RUN_REQUEST_TIMEOUT_SECONDS=75
+REQUEST_TIMEOUT_SECONDS=120
+MAX_RETRIES=0
+RUN_REQUEST_TIMEOUT_SECONDS=150
+API_STARTUP_TIMEOUT_SECONDS=90
+API_STARTUP_RETRY_INTERVAL_SECONDS=4
 ```
 
 Start the stack and open the UI:
@@ -113,8 +115,10 @@ The smoke test exercises all four workflows. Content and Outreach must first app
 `render.yaml` remains the existing low-cost API + UI portfolio deployment:
 
 - API runs inline, so a create-run request stays open while the workflow completes.
-- The Streamlit UI waits longer for `/api/v1/runs` than for ordinary API calls.
-- Hosted provider inference is bounded to one attempt so a slow upstream does not create a long chain of retries inside one public request.
+- The Streamlit UI retries API startup checks for up to 90 seconds, allowing a sleeping Free API service to wake without forcing the user to restart the UI.
+- The inline workflow request can wait up to 150 seconds; ordinary API reads remain short.
+- FlowPilot makes one Gateway request per inference attempt. The shared Gateway owns provider-level transient retries, avoiding nested retry chains in the public workflow request.
+- Provider/model `404` responses and empty or malformed successful completions are reported as actionable failures and are not retried as transient network errors.
 - The UI receives the operator API credential only; reviewer/admin credentials are not injected into the public UI.
 - Run state on the free demo instance is ephemeral and can reset when the service restarts.
 

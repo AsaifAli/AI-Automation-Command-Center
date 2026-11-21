@@ -46,9 +46,9 @@ def api_timeout_for(path: str, *, run_timeout_seconds: int | str | None = None) 
 
     raw_value = run_timeout_seconds
     if raw_value is None:
-        raw_value = os.getenv("RUN_REQUEST_TIMEOUT_SECONDS", "75")
+        raw_value = os.getenv("RUN_REQUEST_TIMEOUT_SECONDS", "150")
     try:
         timeout = int(raw_value)
     except (TypeError, ValueError, OverflowError):
-        timeout = 75
+        timeout = 150
     return max(30, min(timeout, 180))

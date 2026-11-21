@@ -41,7 +41,7 @@ services:
       - key: LLM_GATEWAY_URL
         sync: false
       - key: REQUEST_TIMEOUT_SECONDS
-        value: "60"
+        value: "120"
       - key: MAX_RETRIES
         value: "0"
       - key: SCHEDULE_ENABLED
@@ -76,6 +76,10 @@ services:
           name: ai-automation-api
           envVarKey: API_OPERATOR_KEYS
       - key: RUN_REQUEST_TIMEOUT_SECONDS
-        value: "75"
+        value: "150"
+      - key: API_STARTUP_TIMEOUT_SECONDS
+        value: "90"
+      - key: API_STARTUP_RETRY_INTERVAL_SECONDS
+        value: "4"
       - key: PORTFOLIO_SESSION_GATEWAY_URL
         sync: false
