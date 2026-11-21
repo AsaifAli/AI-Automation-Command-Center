@@ -219,11 +219,15 @@ The Render demo uses `render.yaml` to create two web services:
 - FastAPI API
 - Streamlit UI
 
-The cloud API runs with `INLINE_EXECUTION=true`; this blueprint does not
-provision PostgreSQL, Redis, or an RQ worker. The local Compose topology
-remains the full distributed architecture. Render run history therefore uses
-ephemeral in-memory state and is intended for portfolio demonstrations, not
-for durable production operations.
+The cloud API runs with `INLINE_EXECUTION=true`; the create-run endpoint stores
+an in-memory run reference, returns immediately, and continues model execution
+in a FastAPI in-process background task. This avoids holding the UI's HTTP
+request open for the full model latency. This blueprint does not provision
+PostgreSQL, Redis, or an RQ worker. The local Compose topology remains the full
+distributed architecture. Render run history therefore uses ephemeral
+in-memory state and is intended for portfolio demonstrations, not durable
+production operations. A service restart or deploy can interrupt an active
+background run and clears its in-memory history.
 
 Secrets and Gateway settings:
 - `OPENAI_API_KEY` is supplied in the Render dashboard for the service-level fallback.
@@ -232,11 +236,12 @@ Secrets and Gateway settings:
 - Set `PORTFOLIO_SESSION_GATEWAY_URL` on the UI service to `https://<gateway-origin>` (no `/v1`).
 - Set `CORS_ORIGINS` on the API service to the exact HTTPS Streamlit UI origin; do not use `*`.
 
-Because Render runs inline, a verified Gateway bearer stays in API request
-context and is not placed in a queue; no queued-credential encryption key is
-needed for this blueprint. For queued BYOK, use Docker Compose with
-PostgreSQL and Redis, set the same `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` in API
-and worker, and keep `INLINE_EXECUTION=false`.
+Because the Render demo uses an in-process background task, a verified Gateway
+bearer is passed directly to that task in process memory; it is not placed in a
+queue or persisted. No queued-credential encryption key is needed for this
+blueprint. For durable queued BYOK, use the PostgreSQL + Redis/RQ topology,
+set the same `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` in API and worker, and keep
+`INLINE_EXECUTION=false`.
 
 ## Durable Render topology
 

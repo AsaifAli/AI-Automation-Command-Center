@@ -34,11 +34,11 @@ def build_api_headers(
     return headers
 
 def api_timeout_for(path: str, *, run_timeout_seconds: int | str | None = None) -> int:
-    """Return a bounded HTTP timeout for the inline workflow-create request.
+    """Return a bounded timeout for workflow creation and normal API writes.
 
-    Normal UI reads/writes remain short. The public Render demo executes a
-    workflow inline, so POST /api/v1/runs must wait longer than a routine API
-    call while the LLM completes.
+    Workflow creation now returns a run reference immediately; model work
+    continues in an in-process background task on the demo API service.
+    This timeout is a safety bound for the create request, not model latency.
     """
     route = (path or "").split("?", 1)[0].rstrip("/") or "/"
     if route != "/api/v1/runs":
@@ -46,9 +46,9 @@ def api_timeout_for(path: str, *, run_timeout_seconds: int | str | None = None) 
 
     raw_value = run_timeout_seconds
     if raw_value is None:
-        raw_value = os.getenv("RUN_REQUEST_TIMEOUT_SECONDS", "150")
+        raw_value = os.getenv("RUN_REQUEST_TIMEOUT_SECONDS", "30")
     try:
         timeout = int(raw_value)
     except (TypeError, ValueError, OverflowError):
-        timeout = 150
+        timeout = 30
     return max(30, min(timeout, 180))

@@ -54,6 +54,7 @@ class HealthResponse(BaseModel):
     service: str
     version: str
     demo_mode: bool
+    execution_mode: str = "redis_worker"
 
 
 class ApprovalRequest(BaseModel):

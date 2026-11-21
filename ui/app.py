@@ -6,7 +6,7 @@ from html import escape
 import requests
 import streamlit as st
 from api_access import api_timeout_for, build_api_headers
-from api_startup import APIStartupError, load_api_startup_data
+from api_resilience import RETRYABLE_GET_STATUSES, resilient_get
 from content_input import parse_topic_briefs
 from gateway_handoff import GatewayHandoffError, exchange_handoff_code
 from output_formatting import build_client_report_markdown
@@ -168,7 +168,15 @@ if st.session_state.get("gateway_handoff_error"):
 
 
 def api_get(path: str, role: str = "operator"):
-    return requests.get(f"{API}{path}", headers=request_headers(role), timeout=8)
+    # GETs are safe to retry on transient Render throttling and 5xx responses.
+    # POSTs are intentionally not retried automatically to avoid duplicate runs.
+    return resilient_get(
+        lambda: requests.get(
+            f"{API}{path}",
+            headers=request_headers(role),
+            timeout=8,
+        )
+    )
 
 
 def api_post(path: str, body: dict, role: str = "operator"):
@@ -190,6 +198,14 @@ def queue_workflow(workflow_name: str, payload: dict) -> str:
     return queued["run_id"]
 
 
+class APIResponseError(RuntimeError):
+    """Safe API error with a status code so callers can stop retrying permanent failures."""
+
+    def __init__(self, context: str, status_code: int, message: str) -> None:
+        super().__init__(f"{context} failed ({status_code}): {message}")
+        self.status_code = status_code
+
+
 def response_json(response: requests.Response, context: str):
     """Decode API responses without leaking internal server errors to the UI."""
     if not response.ok:
@@ -200,14 +216,14 @@ def response_json(response: requests.Response, context: str):
         except ValueError:
             detail = None
         if response.status_code == 429:
-            message = "The service is receiving too many requests. Please wait and retry."
+            message = "The service is receiving too many requests. Wait briefly and retry."
         elif response.status_code < 500 and isinstance(detail, str) and detail.strip():
             message = detail.strip()[:240]
         elif response.status_code >= 500:
             message = "The service could not complete this request. Please retry or share the run reference with an administrator."
         else:
             message = "The request was not accepted. Check the submitted details and your access permissions."
-        raise RuntimeError(f"{context} failed ({response.status_code}): {message}")
+        raise APIResponseError(context, response.status_code, message)
     try:
         return response.json()
     except ValueError as exc:
@@ -260,23 +276,76 @@ def workflow_preview(meta: dict, mode_label: str) -> None:
     )
 
 
-startup_message = st.empty()
-try:
-    with st.spinner("Connecting to the FlowPilot API…"):
-        health, metrics = load_api_startup_data(
-            api_get,
-            response_json,
-            on_retry=lambda attempt, wait_seconds: startup_message.caption(
-                f"API service is waking up · retry {attempt} in {wait_seconds:.0f}s"
-            ),
+DEFAULT_METRICS = {
+    "workflow_runs_total": 0,
+    "workflow_runs_completed": 0,
+    "workflow_runs_failed": 0,
+    "workflow_runs_queued": 0,
+    "workflow_runs_running": 0,
+    "workflow_approvals_total": 0,
+    "workflow_approvals_approved": 0,
+    "workflow_approvals_pending": 0,
+}
+API_SNAPSHOT_TTL_SECONDS = 20
+
+
+def load_api_snapshot() -> tuple[dict, dict, str | None]:
+    """Cache health/metrics per Streamlit session and degrade gracefully on metrics failures."""
+    now = time.monotonic()
+    cached = st.session_state.get("_flowpilot_api_snapshot")
+    checked_at = st.session_state.get("_flowpilot_api_snapshot_at", 0.0)
+    if isinstance(cached, dict) and now - float(checked_at) < API_SNAPSHOT_TTL_SECONDS:
+        return cached["health"], cached["metrics"], cached.get("metrics_warning")
+
+    health_warning = None
+    try:
+        health = response_json(api_get("/health"), "Health check")
+        st.session_state["_flowpilot_last_good_health"] = health
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+        last_good_health = st.session_state.get("_flowpilot_last_good_health")
+        transient = isinstance(exc, requests.RequestException) or (
+            isinstance(exc, APIResponseError)
+            and exc.status_code in RETRYABLE_GET_STATUSES
         )
-except APIStartupError as exc:
-    startup_message.empty()
-    st.error(str(exc))
-    st.info("The UI is running, but the API service is not ready yet. Refresh this page after the API finishes waking up.")
+        if not transient or not isinstance(last_good_health, dict):
+            raise
+        health = dict(last_good_health)
+        health_warning = (
+            "The API health endpoint is temporarily throttled or unavailable. "
+            "Showing the last successful health result; new workflow requests may still be affected."
+        )
+
+    metrics_warning = health_warning
+    try:
+        metrics = response_json(api_get("/metrics"), "Metrics request")
+        st.session_state["_flowpilot_last_good_metrics"] = metrics
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+        last_good = st.session_state.get("_flowpilot_last_good_metrics")
+        metrics = dict(last_good) if isinstance(last_good, dict) else dict(DEFAULT_METRICS)
+        warning = (
+            "Operational metrics are temporarily unavailable. Workflow execution can still be attempted. "
+            f"Details: {exc}"
+        )
+        metrics_warning = f"{metrics_warning} {warning}" if metrics_warning else warning
+
+    st.session_state["_flowpilot_api_snapshot"] = {
+        "health": health,
+        "metrics": metrics,
+        "metrics_warning": metrics_warning,
+    }
+    st.session_state["_flowpilot_api_snapshot_at"] = now
+    return health, metrics, metrics_warning
+
+
+try:
+    health, metrics, metrics_warning = load_api_snapshot()
+except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+    st.error(f"FlowPilot API health check failed: {exc}")
+    st.caption("The dashboard is available, but workflows cannot be started until the API responds successfully.")
     st.stop()
-finally:
-    startup_message.empty()
+
+if metrics_warning:
+    st.warning(metrics_warning)
 
 gateway_active = gateway_session_is_active()
 mode_label = (
@@ -347,8 +416,13 @@ workflow = st.sidebar.radio(
 )
 st.sidebar.divider()
 st.sidebar.markdown('<div class="premium-kicker">SYSTEM HEALTH</div>', unsafe_allow_html=True)
+execution_label = (
+    "API background execution"
+    if health.get("execution_mode") == "inline_background"
+    else "Redis + worker"
+)
 st.sidebar.markdown(
-    f'<div class="sidebar-health"><div><span class="status-dot"></span>API Online</div><small>Version · {escape(str(health["version"]))}</small><small>Queue · Redis + worker</small></div>',
+    f'<div class="sidebar-health"><div><span class="status-dot"></span>API Online</div><small>Version · {escape(str(health["version"]))}</small><small>Execution · {escape(execution_label)}</small></div>',
     unsafe_allow_html=True,
 )
 st.sidebar.divider()
@@ -443,8 +517,8 @@ if queue_clicked or demo_clicked:
             st.session_state["poll_count"] = 0
             st.session_state["demo_run"] = demo_clicked
             st.rerun()
-    except (requests.RequestException, RuntimeError, ValueError, KeyError):
-        st.error("FlowPilot could not queue this workflow. Check the service status and submitted details, then retry.")
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+        st.error(f"FlowPilot could not queue this workflow: {exc}")
 
 active_run_id = st.session_state.get("active_run_id")
 if active_run_id:
@@ -455,13 +529,19 @@ if active_run_id:
     try:
         result = fetch_run(active_run_id)
     except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+        if isinstance(exc, APIResponseError) and exc.status_code not in RETRYABLE_GET_STATUSES:
+            st.error(f"The run status request was rejected: {exc}")
+            st.stop()
         poll_count = st.session_state.get("poll_count", 0) + 1
         st.session_state["poll_count"] = poll_count
-        st.warning(f"Waiting for the run to become available… {exc}")
-        if poll_count >= 40:
-            st.error("Unable to retrieve the run after multiple attempts. Check the API and worker logs.")
+        st.warning(f"Waiting for the run status service to respond… {exc}")
+        if poll_count >= 80:
+            st.error("Unable to retrieve this run after repeated attempts. The run may still be active; check Recent executions or continue monitoring.")
+            if st.button("Continue monitoring", key=f"continue_fetch_{active_run_id}"):
+                st.session_state["poll_count"] = 0
+                st.rerun()
         else:
-            time.sleep(1.5)
+            time.sleep(3.0)
             st.rerun()
         st.stop()
 
@@ -518,10 +598,13 @@ if active_run_id:
         poll_count = st.session_state.get("poll_count", 0) + 1
         st.session_state["poll_count"] = poll_count
         st.progress(25 if status == "queued" else 65, text="Worker is processing the workflow…")
-        if poll_count >= 40:
-            st.warning("The run is taking longer than expected. It remains active in the worker queue; check Recent executions later.")
+        if poll_count >= 80:
+            st.warning("This run is still active after several minutes. It remains available for status checks; continue monitoring or check Recent executions.")
+            if st.button("Continue monitoring", key=f"continue_run_{active_run_id}"):
+                st.session_state["poll_count"] = 0
+                st.rerun()
         else:
-            time.sleep(1.5)
+            time.sleep(3.0)
             st.rerun()
     else:
         st.session_state["result"] = result

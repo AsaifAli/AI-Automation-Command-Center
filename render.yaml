@@ -1,5 +1,6 @@
-# Portfolio/demo topology. This intentionally uses inline execution and
-# ephemeral run state. See render.production.yaml for the durable paid topology.
+# Portfolio/demo topology. Workflows run as in-process background tasks and
+# use ephemeral run state; HTTP requests return the run reference immediately.
+# See render.production.yaml for the durable PostgreSQL + Redis worker topology.
 services:
   - type: web
     name: ai-automation-api
@@ -41,9 +42,9 @@ services:
       - key: LLM_GATEWAY_URL
         sync: false
       - key: REQUEST_TIMEOUT_SECONDS
-        value: "120"
+        value: "60"
       - key: MAX_RETRIES
-        value: "0"
+        value: "1"
       - key: SCHEDULE_ENABLED
         value: "false"
       - key: OTEL_ENABLED
@@ -76,10 +77,6 @@ services:
           name: ai-automation-api
           envVarKey: API_OPERATOR_KEYS
       - key: RUN_REQUEST_TIMEOUT_SECONDS
-        value: "150"
-      - key: API_STARTUP_TIMEOUT_SECONDS
-        value: "90"
-      - key: API_STARTUP_RETRY_INTERVAL_SECONDS
-        value: "4"
+        value: "30"
       - key: PORTFOLIO_SESSION_GATEWAY_URL
         sync: false

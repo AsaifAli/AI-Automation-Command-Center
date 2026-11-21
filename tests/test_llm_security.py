@@ -1,9 +1,8 @@
-
 import httpx
 import pytest
 
 from app.core.config import Settings
-from app.integrations.llm import LLMProvider
+from app.integrations.llm import LLMProvider, LLMProviderError
 
 
 def make_provider(max_retries: int = 1) -> LLMProvider:
@@ -23,40 +22,30 @@ def test_provider_exception_details_are_not_logged_or_returned(
     caplog,
 ):
     provider = make_provider(max_retries=0)
-
-    sensitive_url = (
-        "https://provider.invalid/v1/chat/completions"
-        "?token=do-not-log"
-    )
+    sensitive_url = "https://provider.invalid/v1/chat/completions?token=do-not-log"
 
     def failing_post(*args, **kwargs):
         request = httpx.Request("POST", sensitive_url)
-        raise httpx.ConnectError(
-            "private upstream detail",
-            request=request,
-        )
+        raise httpx.ConnectError("private upstream detail", request=request)
 
-    monkeypatch.setattr(
-        "app.integrations.llm.httpx.post",
-        failing_post,
-    )
+    monkeypatch.setattr("app.integrations.llm.httpx.post", failing_post)
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(LLMProviderError) as exc_info:
         provider.generate("system", "user")
 
-    assert str(exc_info.value) == (
-        "LLM provider request failed after configured retries."
-    )
-    assert "private upstream detail" not in str(exc_info.value)
-    assert "do-not-log" not in str(exc_info.value)
+    error = exc_info.value
+    assert error.failure_code == "provider_connection_failed"
+    assert "FlowPilot could not connect" in str(error)
+    assert "private upstream detail" not in str(error)
+    assert "do-not-log" not in str(error)
     assert "private upstream detail" not in caplog.text
     assert "do-not-log" not in caplog.text
-    assert "error_type=ConnectError" in caplog.text
+    assert "failure_code=provider_connection_failed" in caplog.text
+    assert "error_type=ConnectError" not in caplog.text
 
 
 def test_provider_retry_count_and_backoff_are_preserved(monkeypatch):
     provider = make_provider(max_retries=2)
-
     calls = []
     sleeps = []
 
@@ -66,23 +55,15 @@ def test_provider_retry_count_and_backoff_are_preserved(monkeypatch):
             "POST",
             "https://provider.invalid/v1/chat/completions",
         )
-        raise httpx.ConnectError(
-            "upstream unavailable",
-            request=request,
-        )
+        raise httpx.ConnectError("upstream unavailable", request=request)
 
-    monkeypatch.setattr(
-        "app.integrations.llm.httpx.post",
-        failing_post,
-    )
-    monkeypatch.setattr(
-        "app.integrations.llm.time.sleep",
-        sleeps.append,
-    )
+    monkeypatch.setattr("app.integrations.llm.httpx.post", failing_post)
+    monkeypatch.setattr("app.integrations.llm.time.sleep", sleeps.append)
 
-    with pytest.raises(RuntimeError, match="configured retries"):
+    with pytest.raises(LLMProviderError) as exc_info:
         provider.generate("system", "user")
 
+    assert exc_info.value.failure_code == "provider_connection_failed"
     assert len(calls) == 3
     assert sleeps == [1, 2]
 
@@ -96,8 +77,7 @@ def test_http_status_is_logged_without_upstream_response_details(
     def failing_post(*args, **kwargs):
         request = httpx.Request(
             "POST",
-            "https://provider.invalid/v1/chat/completions"
-            "?token=private-token",
+            "https://provider.invalid/v1/chat/completions?token=private-token",
         )
         return httpx.Response(
             503,
@@ -105,14 +85,13 @@ def test_http_status_is_logged_without_upstream_response_details(
             text="private upstream response",
         )
 
-    monkeypatch.setattr(
-        "app.integrations.llm.httpx.post",
-        failing_post,
-    )
+    monkeypatch.setattr("app.integrations.llm.httpx.post", failing_post)
 
-    with pytest.raises(RuntimeError, match="configured retries"):
+    with pytest.raises(LLMProviderError) as exc_info:
         provider.generate("system", "user")
 
+    assert exc_info.value.failure_code == "provider_temporarily_unavailable"
+    assert exc_info.value.status_code == 503
     assert "status_code=503" in caplog.text
     assert "private-token" not in caplog.text
     assert "private upstream response" not in caplog.text
@@ -127,8 +106,10 @@ def test_missing_provider_credentials_do_not_silently_switch_to_demo():
         )
     )
 
-    with pytest.raises(RuntimeError, match="No LLM credentials are configured"):
+    with pytest.raises(LLMProviderError) as exc_info:
         provider.generate("system", "user")
+
+    assert exc_info.value.failure_code == "provider_credentials_missing"
 
 
 def test_gateway_session_takes_precedence_over_demo_mode(monkeypatch):
@@ -145,8 +126,8 @@ def test_gateway_session_takes_precedence_over_demo_mode(monkeypatch):
     provider = LLMProvider(settings)
     calls = []
 
-    def fake_post(url, json, headers, timeout):
-        calls.append((url, json, headers))
+    def fake_post(url, json, headers, timeout, **kwargs):
+        calls.append((url, json, headers, kwargs))
         request = httpx.Request("POST", url)
         return httpx.Response(
             200,
@@ -172,3 +153,4 @@ def test_gateway_session_takes_precedence_over_demo_mode(monkeypatch):
     assert result["usage"]["estimated_cost_usd"] == 0.0
     assert calls[0][0] == "https://gateway.example/v1/chat/completions"
     assert calls[0][2]["Authorization"] == "Bearer short-lived-session-token"
+    assert calls[0][3]["follow_redirects"] is False

@@ -229,10 +229,16 @@ def render_workflow_output(workflow: str, output: Any) -> None:
     data = dict(output) if isinstance(output, Mapping) else {"result": output}
     name = str(workflow or "").lower()
     if data.get("error"):
-        st.error("This workflow could not be completed.")
-        st.caption(
-            "Retry the workflow. If the issue persists, share its run reference with an administrator."
-        )
+        st.error(str(data.get("error") or "This workflow could not be completed."))
+        failure_reason = data.get("failure_reason")
+        if isinstance(failure_reason, str) and failure_reason.strip():
+            st.warning(failure_reason.strip()[:320])
+        failure_code = data.get("failure_code")
+        if isinstance(failure_code, str) and failure_code.strip():
+            st.caption(f"Diagnostic: {failure_code.strip()[:80]}")
+        recovery = data.get("recovery")
+        if isinstance(recovery, str) and recovery.strip():
+            st.caption(recovery.strip()[:320])
         return
     if name == "content":
         _render_content(data)

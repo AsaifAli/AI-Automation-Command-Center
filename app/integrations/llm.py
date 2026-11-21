@@ -1,6 +1,12 @@
+"""Vendor-neutral OpenAI-compatible LLM boundary with bounded retries and safe errors."""
+
+from __future__ import annotations
+
+import email.utils
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -10,7 +16,131 @@ from app.core.llm_gateway_context import get_llm_gateway_token
 
 logger = logging.getLogger(__name__)
 
-RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 500, 502, 503, 504, 529})
+RETRYABLE_HTTP_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+
+
+class LLMProviderError(RuntimeError):
+    """Sanitized provider failure suitable for a workflow result and UI display."""
+
+    def __init__(
+        self,
+        failure_code: str,
+        public_message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(public_message)
+        self.failure_code = failure_code
+        self.public_message = public_message
+        self.status_code = status_code
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _completion_url(base_url: str) -> str:
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise LLMProviderError(
+            "provider_url_missing",
+            "The model provider URL is not configured. Check the service provider URL or Gateway URL.",
+        )
+    if base.endswith("/chat/completions"):
+        return base
+    return f"{base}/chat/completions"
+
+
+def _retry_after_seconds(headers: httpx.Headers, attempt: int) -> float:
+    raw = headers.get("Retry-After", "").strip()
+    delay: float | None = None
+    if raw:
+        try:
+            delay = float(raw)
+        except ValueError:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(raw)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                delay = (retry_at - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = None
+    if delay is None:
+        delay = min(1.0 * (2**attempt), 4.0)
+    return min(max(delay, 0.25), 5.0)
+
+
+def _safe_token_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                if part.strip():
+                    text_parts.append(part.strip())
+                continue
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in {"text", "output_text", None}:
+                continue
+            value = part.get("text", part.get("content"))
+            if isinstance(value, str) and value.strip():
+                text_parts.append(value.strip())
+        return "\n".join(text_parts).strip()
+    return ""
+
+
+def _http_failure(response: httpx.Response) -> LLMProviderError:
+    status = response.status_code
+    if status in {401, 403}:
+        return LLMProviderError(
+            "provider_auth_failed",
+            "The model provider rejected the configured credentials. Reopen the BYOK session or verify the service-level provider key.",
+            status_code=status,
+        )
+    if status == 404:
+        return LLMProviderError(
+            "provider_endpoint_not_found",
+            "The configured model endpoint returned 404. Verify that the Gateway base URL includes /v1 and that its chat-completions route is deployed.",
+            status_code=status,
+        )
+    if status == 429:
+        return LLMProviderError(
+            "provider_rate_limited",
+            "The model provider rate limit was reached. Wait briefly, then retry the workflow or choose a less busy model.",
+            status_code=status,
+            retryable=True,
+            retry_after_seconds=_retry_after_seconds(response.headers, 0),
+        )
+    if status in RETRYABLE_HTTP_STATUSES:
+        return LLMProviderError(
+            "provider_temporarily_unavailable",
+            f"The model provider is temporarily unavailable (HTTP {status}). Retry the workflow shortly.",
+            status_code=status,
+            retryable=True,
+            retry_after_seconds=_retry_after_seconds(response.headers, 0),
+        )
+    if status in {400, 404, 413, 422}:
+        return LLMProviderError(
+            "provider_request_rejected",
+            f"The model provider rejected the request (HTTP {status}). Verify the selected model and request configuration.",
+            status_code=status,
+        )
+    return LLMProviderError(
+        "provider_http_error",
+        f"The model provider returned HTTP {status}. Verify the provider configuration and retry.",
+        status_code=status,
+        retryable=False,
+    )
 
 
 class LLMProvider:
@@ -22,103 +152,6 @@ class LLMProvider:
     @property
     def gateway_session_active(self) -> bool:
         return bool(get_llm_gateway_token())
-
-    @staticmethod
-    def _safe_token_count(value: Any) -> int:
-        """Parse usage counters without turning malformed metadata into a failed run."""
-        if isinstance(value, bool):
-            return 0
-        try:
-            parsed = int(value or 0)
-        except (TypeError, ValueError, OverflowError):
-            return 0
-        return max(0, parsed)
-
-    @staticmethod
-    def _extract_text(message: dict[str, Any]) -> str:
-        content = message.get("content")
-        if isinstance(content, str):
-            return content.strip()
-
-        # Some OpenAI-compatible models return content as typed text blocks.
-        if isinstance(content, list):
-            parts = [
-                str(item.get("text", ""))
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
-            ]
-            return "\n".join(part for part in parts if part.strip()).strip()
-
-        refusal = message.get("refusal")
-        if isinstance(refusal, str):
-            return refusal.strip()
-        return ""
-
-    @staticmethod
-    def _retry_after(response: httpx.Response) -> str:
-        value = str(response.headers.get("Retry-After", "")).strip()
-        if value.isdigit() and len(value) <= 6:
-            return f" Retry after approximately {value} seconds."
-        return " Wait briefly and retry."
-
-    @staticmethod
-    def _status_error_message(status_code: int, response: httpx.Response) -> str:
-        if status_code == 401 or status_code == 403:
-            return (
-                f"The provider rejected the active API credential (HTTP {status_code}). "
-                "Reconnect BYOK with a valid provider key and check its permissions."
-            )
-        if status_code == 402:
-            return (
-                "The provider account has insufficient credits or billing capacity (HTTP 402). "
-                "Check the provider account before retrying."
-            )
-        if status_code == 404:
-            return (
-                "The selected provider or model was not found by the Gateway (HTTP 404). "
-                "Verify the provider and model ID, then reconnect the BYOK session."
-            )
-        if status_code == 429:
-            return (
-                "The selected provider rate-limited this request (HTTP 429)."
-                + LLMProvider._retry_after(response)
-            )
-        if status_code in {400, 413, 422}:
-            return (
-                f"The provider rejected the model or request parameters (HTTP {status_code}). "
-                "Check the selected model ID and request settings."
-            )
-        if status_code >= 500:
-            return (
-                f"The selected provider or Gateway is temporarily unavailable (HTTP {status_code}). "
-                "Please retry after a short wait."
-            )
-        return f"The LLM provider request was rejected (HTTP {status_code})."
-
-    @staticmethod
-    def _log_invalid_response(
-        response: httpx.Response,
-        data: Any,
-        *,
-        choice_count: int = 0,
-        finish_reason: str | None = None,
-        has_content: bool = False,
-        tool_call_count: int = 0,
-    ) -> None:
-        """Record only response shape metadata; never log provider text or credentials."""
-        keys = sorted(str(key) for key in data)[:20] if isinstance(data, dict) else []
-        logger.warning(
-            "llm_response_invalid status_code=%s content_type=%s response_bytes=%s "
-            "top_level_keys=%s choice_count=%s finish_reason=%s has_content=%s tool_call_count=%s",
-            response.status_code,
-            response.headers.get("content-type", "unknown")[:80],
-            len(response.content or b""),
-            keys,
-            choice_count,
-            str(finish_reason or "unknown")[:40],
-            has_content,
-            tool_call_count,
-        )
 
     def generate(self, system: str, user: str) -> dict[str, Any]:
         gateway_token = get_llm_gateway_token()
@@ -143,19 +176,18 @@ class LLMProvider:
             }
 
         if gateway_token and not gateway_url:
-            raise RuntimeError(
-                "An LLM Gateway session is present, but the Gateway base URL is not configured."
+            raise LLMProviderError(
+                "gateway_url_missing",
+                "A BYOK session is active, but the FlowPilot Gateway URL is not configured.",
             )
         if not gateway_token and not self.settings.openai_api_key.strip():
-            raise RuntimeError(
-                "No LLM credentials are configured. Set a service-level provider key or use an active Gateway session."
+            raise LLMProviderError(
+                "provider_credentials_missing",
+                "No model credentials are configured. Reopen the BYOK session or configure the service-level provider key.",
             )
 
-        if gateway_token:
-            url = gateway_url.rstrip("/") + "/chat/completions"
-        else:
-            url = self.settings.openai_base_url.rstrip("/") + "/chat/completions"
-
+        base_url = gateway_url if gateway_token else self.settings.openai_base_url
+        url = _completion_url(base_url)
         payload = {
             "model": self.settings.llm_model or self.settings.openai_model,
             "temperature": 0.2,
@@ -164,170 +196,154 @@ class LLMProvider:
                 {"role": "user", "content": user},
             ],
         }
-
         api_key = gateway_token or self.settings.openai_api_key
         headers = {"Authorization": f"Bearer {api_key}"}
-        max_retries = max(0, min(int(self.settings.max_retries), 3))
+
+        try:
+            configured_retries = int(self.settings.max_retries)
+        except (TypeError, ValueError, OverflowError):
+            configured_retries = 0
+        max_retries = max(0, min(configured_retries, 2))
 
         for attempt in range(max_retries + 1):
             started = time.perf_counter()
+            failure: LLMProviderError | None = None
+            retry_delay = min(1.0 * (2**attempt), 4.0)
+
             try:
                 response = httpx.post(
                     url,
                     json=payload,
                     headers=headers,
                     timeout=self.settings.request_timeout_seconds,
+                    follow_redirects=False,
                 )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                failed_response = exc.response
-                status_code = failed_response.status_code
-                retryable = status_code in RETRYABLE_HTTP_STATUS_CODES
-                logger.warning(
-                    "llm_request_failed provider=%s attempt=%s error_type=HTTPStatusError "
-                    "status_code=%s retryable=%s retry_after=%s",
-                    self.settings.llm_provider,
-                    attempt + 1,
-                    status_code,
-                    retryable,
-                    self._retry_after(failed_response).strip()[:60] if status_code == 429 else "",
+            except httpx.TimeoutException:
+                failure = LLMProviderError(
+                    "provider_timeout",
+                    "The model provider did not respond before the request timed out. Retry the workflow or use a faster model.",
+                    retryable=True,
+                )
+            except httpx.RequestError:
+                failure = LLMProviderError(
+                    "provider_connection_failed",
+                    "FlowPilot could not connect to the model provider. Check the Gateway/provider service and retry.",
+                    retryable=True,
+                )
+            else:
+                if response.status_code >= 400:
+                    failure = _http_failure(response)
+                    if failure.retry_after_seconds is not None:
+                        retry_delay = failure.retry_after_seconds
+                else:
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = None
+                        failure = LLMProviderError(
+                            "provider_invalid_json",
+                            "The model endpoint returned HTTP 200 but its response was not valid JSON.",
+                            retryable=True,
+                        )
+
+                    if failure is None:
+                        if not isinstance(data, dict):
+                            failure = LLMProviderError(
+                                "provider_invalid_response",
+                                "The model endpoint returned an unexpected response structure.",
+                                retryable=True,
+                            )
+                        else:
+                            choices = data.get("choices")
+                            choice = (
+                                choices[0]
+                                if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+                                else None
+                            )
+                            message = choice.get("message") if isinstance(choice, dict) else None
+                            if not isinstance(message, dict):
+                                failure = LLMProviderError(
+                                    "provider_missing_message",
+                                    "The model endpoint returned HTTP 200 without a chat message. Verify the model and Gateway response format.",
+                                    retryable=True,
+                                )
+                            else:
+                                content = _message_text(message)
+                                if not content:
+                                    if message.get("refusal"):
+                                        failure = LLMProviderError(
+                                            "model_refusal",
+                                            "The model declined to generate this output. Adjust the request and retry.",
+                                        )
+                                    elif message.get("tool_calls"):
+                                        failure = LLMProviderError(
+                                            "model_tool_call_unhandled",
+                                            "The model returned a tool call, but tools are not enabled for this FlowPilot workflow.",
+                                        )
+                                    else:
+                                        failure = LLMProviderError(
+                                            "provider_empty_completion",
+                                            "The model endpoint returned HTTP 200 but no text completion. Check the selected model and Gateway response format.",
+                                            retryable=True,
+                                        )
+                                else:
+                                    usage = data.get("usage")
+                                    usage = usage if isinstance(usage, dict) else {}
+                                    prompt_tokens = _safe_token_count(usage.get("prompt_tokens"))
+                                    completion_tokens = _safe_token_count(usage.get("completion_tokens"))
+                                    total_tokens = _safe_token_count(
+                                        usage.get("total_tokens", prompt_tokens + completion_tokens)
+                                    )
+                                    cost = (
+                                        prompt_tokens * self.settings.input_cost_per_million
+                                        + completion_tokens * self.settings.output_cost_per_million
+                                    ) / 1_000_000
+                                    model = data.get("model") or self.settings.llm_model or self.settings.openai_model
+                                    provider = "portfolio-gateway" if gateway_token else self.settings.llm_provider
+
+                                    logger.info(
+                                        "llm_request_complete provider=%s attempt=%s latency_ms=%s",
+                                        provider,
+                                        attempt + 1,
+                                        int((time.perf_counter() - started) * 1000),
+                                    )
+                                    return {
+                                        "text": content,
+                                        "provider": provider,
+                                        "model": model,
+                                        "usage": {
+                                            "provider": provider,
+                                            "model": model,
+                                            "prompt_tokens": prompt_tokens,
+                                            "completion_tokens": completion_tokens,
+                                            "total_tokens": total_tokens,
+                                            "estimated_cost_usd": 0.0 if gateway_token else round(cost, 8),
+                                            "cost_estimate_available": not bool(gateway_token),
+                                        },
+                                    }
+
+            if failure is None:  # pragma: no cover - defensive guard
+                failure = LLMProviderError(
+                    "provider_unknown_error",
+                    "The model provider request failed unexpectedly.",
                 )
 
-                if retryable and attempt < max_retries:
-                    time.sleep(min(2**attempt, 4))
-                    continue
-
-                if retryable:
-                    raise RuntimeError(
-                        "LLM provider request failed after configured retries."
-                    ) from None
-                raise RuntimeError(
-                    self._status_error_message(status_code, failed_response)
-                ) from None
-            except httpx.TransportError as exc:
-                logger.warning(
-                    "llm_request_failed provider=%s attempt=%s error_type=%s "
-                    "status_code=None retryable=True",
-                    self.settings.llm_provider,
-                    attempt + 1,
-                    type(exc).__name__,
-                )
-                if attempt < max_retries:
-                    time.sleep(min(2**attempt, 4))
-                    continue
-                raise RuntimeError(
-                    "LLM provider request failed after configured retries."
-                ) from None
-            except httpx.HTTPError as exc:
-                logger.warning(
-                    "llm_request_failed provider=%s attempt=%s error_type=%s "
-                    "status_code=None retryable=False",
-                    self.settings.llm_provider,
-                    attempt + 1,
-                    type(exc).__name__,
-                )
-                raise RuntimeError(
-                    "The LLM request could not be prepared or sent. Check the Gateway URL and request configuration."
-                ) from None
-
-            try:
-                data = response.json()
-            except ValueError:
-                self._log_invalid_response(response, None)
-                raise RuntimeError(
-                    "The Gateway returned an unreadable response instead of valid JSON. Please retry or reconnect BYOK."
-                ) from None
-
-            if not isinstance(data, dict):
-                self._log_invalid_response(response, data)
-                raise TypeError(
-                    "The Gateway returned an unexpected response format. Please retry or reconnect BYOK."
-                ) from None
-
-            choices = data.get("choices")
-            choice_count = len(choices) if isinstance(choices, list) else 0
-            first_choice = choices[0] if isinstance(choices, list) and choices else None
-            message = (
-                first_choice.get("message")
-                if isinstance(first_choice, dict)
-                else None
-            )
-            message = message if isinstance(message, dict) else {}
-            finish_reason = (
-                first_choice.get("finish_reason")
-                if isinstance(first_choice, dict)
-                else None
-            )
-            tool_calls = message.get("tool_calls")
-            tool_call_count = len(tool_calls) if isinstance(tool_calls, list) else 0
-            content = self._extract_text(message)
-
-            if not content:
-                self._log_invalid_response(
-                    response,
-                    data,
-                    choice_count=choice_count,
-                    finish_reason=finish_reason,
-                    has_content=False,
-                    tool_call_count=tool_call_count,
-                )
-                raise RuntimeError(
-                    "The Gateway returned an empty text completion. The selected model may not support this text workflow; verify the model and reconnect BYOK."
-                ) from None
-
-            usage_value = data.get("usage")
-            usage = usage_value if isinstance(usage_value, dict) else {}
-            prompt_tokens = self._safe_token_count(usage.get("prompt_tokens"))
-            completion_tokens = self._safe_token_count(usage.get("completion_tokens"))
-            total_tokens = self._safe_token_count(
-                usage.get("total_tokens", prompt_tokens + completion_tokens)
-            )
-            if total_tokens == 0 and (prompt_tokens or completion_tokens):
-                total_tokens = prompt_tokens + completion_tokens
-
-            cost = (
-                prompt_tokens * self.settings.input_cost_per_million
-                + completion_tokens * self.settings.output_cost_per_million
-            ) / 1_000_000
-
-            model_value = data.get("model")
-            model_name = (
-                model_value.strip()
-                if isinstance(model_value, str) and model_value.strip()
-                else self.settings.llm_model or self.settings.openai_model
-            )
-            provider_name = (
-                "portfolio-gateway" if gateway_token else self.settings.llm_provider
-            )
-
-            logger.info(
-                "llm_request_complete attempt=%s latency_ms=%s response_choices=%s "
-                "finish_reason=%s usage_present=%s",
+            logger.warning(
+                "llm_request_failed provider=%s attempt=%s failure_code=%s status_code=%s retryable=%s",
+                "portfolio-gateway" if gateway_token else self.settings.llm_provider,
                 attempt + 1,
-                int((time.perf_counter() - started) * 1000),
-                choice_count,
-                str(finish_reason or "unknown")[:40],
-                bool(usage),
+                failure.failure_code,
+                failure.status_code,
+                failure.retryable,
             )
+            if not failure.retryable or attempt >= max_retries:
+                raise failure
+            time.sleep(min(max(retry_delay, 0.25), 5.0))
 
-            return {
-                "text": content,
-                "provider": provider_name,
-                "model": model_name,
-                "usage": {
-                    "provider": provider_name,
-                    "model": model_name,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                    # The shared Gateway does not return provider-specific
-                    # pricing. Never show a LiteLLM service-rate estimate for BYOK.
-                    "estimated_cost_usd": 0.0 if gateway_token else round(cost, 8),
-                    "cost_estimate_available": not bool(gateway_token),
-                },
-            }
-
-        raise RuntimeError("LLM provider request failed after configured retries.") from None
+        raise LLMProviderError(
+            "provider_exhausted_retries",
+            "The model provider request failed after the configured retry attempts.",
+        )  # pragma: no cover
 
     @staticmethod
     def _demo(system: str, user: str) -> str:

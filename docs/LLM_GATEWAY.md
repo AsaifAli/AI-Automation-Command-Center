@@ -37,7 +37,7 @@ Generate a Fernet key when setting up the local queued path:
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Use the same key in the API and worker environments. Never commit `.env` or share the generated key. The public Render demo uses inline execution and does not require the queued-worker credential-storage path.
+Use the same key in the API and worker environments. Never commit `.env` or share the generated key. The public Render demo passes its verified Gateway bearer directly to an in-process background task and does not require the queued-worker credential-storage path. The bearer remains in process memory for that task and is never persisted in the run record.
 
 ## Local LiteLLM
 

@@ -2,58 +2,67 @@ import httpx
 import pytest
 
 from app.core.config import Settings
-from app.integrations.llm import LLMProvider
+from app.integrations.llm import LLMProvider, LLMProviderError
 
 
-def make_provider(max_retries=2):
-    return LLMProvider(Settings(
-        demo_mode=False,
-        llm_provider="portfolio-gateway",
-        openai_api_key="not-used-when-gateway-session-is-set",
-        llm_gateway_url="https://gateway.example/v1",
-        max_retries=max_retries,
-        request_timeout_seconds=5,
-    ))
+def make_provider(max_retries: int = 2) -> LLMProvider:
+    return LLMProvider(
+        Settings(
+            demo_mode=False,
+            llm_provider="portfolio-gateway",
+            openai_api_key="not-used-when-gateway-session-is-set",
+            llm_gateway_url="https://gateway.example/v1",
+            max_retries=max_retries,
+            request_timeout_seconds=5,
+        )
+    )
 
 
-def test_gateway_404_is_not_retried_and_explains_provider_model_mismatch(monkeypatch):
-    from app.core.llm_gateway_context import reset_llm_gateway_token, set_llm_gateway_token
+def _with_gateway_session(token: str = "short-lived-session-token"):
+    from app.core.llm_gateway_context import set_llm_gateway_token
+
+    return set_llm_gateway_token(token)
+
+
+def test_gateway_404_is_not_retried_and_reports_endpoint_failure(monkeypatch):
+    from app.core.llm_gateway_context import reset_llm_gateway_token
 
     provider = make_provider()
     calls = []
 
-    def missing_model(*args, **kwargs):
-        calls.append(1)
+    def missing_route(*args, **kwargs):
+        calls.append(True)
         request = httpx.Request("POST", "https://gateway.example/v1/chat/completions")
-        return httpx.Response(
-            404,
-            request=request,
-            json={"error": {"message": "not found"}},
-        )
+        return httpx.Response(404, request=request, json={"error": {"message": "not found"}})
 
-    monkeypatch.setattr("app.integrations.llm.httpx.post", missing_model)
+    monkeypatch.setattr("app.integrations.llm.httpx.post", missing_route)
     monkeypatch.setattr(
         "app.integrations.llm.time.sleep",
-        lambda _seconds: pytest.fail("404 is not retryable"),
+        lambda _seconds: pytest.fail("404 is permanent and must not be retried"),
     )
 
-    context = set_llm_gateway_token("short-lived-session-token")
+    context = _with_gateway_session()
     try:
-        with pytest.raises(RuntimeError, match="provider or model was not found"):
+        with pytest.raises(LLMProviderError) as exc_info:
             provider.generate("system", "user")
     finally:
         reset_llm_gateway_token(context)
 
+    assert exc_info.value.failure_code == "provider_endpoint_not_found"
+    assert exc_info.value.status_code == 404
+    assert "Gateway base URL includes /v1" in str(exc_info.value)
     assert len(calls) == 1
 
 
 def test_gateway_503_remains_retryable(monkeypatch):
+    from app.core.llm_gateway_context import reset_llm_gateway_token
+
     provider = make_provider(max_retries=1)
     calls = []
     sleeps = []
 
     def unavailable_then_success(*args, **kwargs):
-        calls.append(1)
+        calls.append(True)
         request = httpx.Request("POST", "https://gateway.example/v1/chat/completions")
         if len(calls) == 1:
             return httpx.Response(503, request=request, json={"detail": "temporarily unavailable"})
@@ -70,9 +79,7 @@ def test_gateway_503_remains_retryable(monkeypatch):
     monkeypatch.setattr("app.integrations.llm.httpx.post", unavailable_then_success)
     monkeypatch.setattr("app.integrations.llm.time.sleep", sleeps.append)
 
-    context = None
-    from app.core.llm_gateway_context import reset_llm_gateway_token, set_llm_gateway_token
-    context = set_llm_gateway_token("short-lived-session-token")
+    context = _with_gateway_session()
     try:
         result = provider.generate("system", "user")
     finally:

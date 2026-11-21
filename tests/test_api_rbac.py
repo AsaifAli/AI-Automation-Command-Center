@@ -445,3 +445,24 @@ def test_inline_gateway_token_is_request_scoped_and_not_persisted(monkeypatch):
     assert observed["token_during_execution"] == token
     assert observed["use_request_context"] is True
     assert token not in repr(fake_repo.runs)
+
+
+def test_inline_background_task_clears_gateway_context_after_failure(monkeypatch):
+    from app.core.llm_gateway_context import get_llm_gateway_token
+
+    def fail_execute_run(*args, **kwargs):
+        assert get_llm_gateway_token() == "one-run-session-token"
+        raise RuntimeError("simulated workflow failure")
+
+    monkeypatch.setattr(api_module, "execute_run", fail_execute_run)
+
+    # The background callback must not re-raise after the HTTP response has
+    # already been sent, and its short-lived BYOK context must always be reset.
+    api_module._execute_inline_background(
+        "run-1",
+        "content",
+        {"topics": ["test"]},
+        "one-run-session-token",
+    )
+
+    assert get_llm_gateway_token() == ""

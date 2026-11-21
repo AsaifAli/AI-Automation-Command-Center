@@ -62,3 +62,34 @@ The current repository does not include a verified production backup/restore res
 - Queue retry/dead-letter policy.
 - On-call owner and escalation path.
 - Provider budget and alert thresholds.
+
+## Diagnosing a failed workflow
+
+For a failed run, capture its run ID from the UI and search the API service logs
+for `workflow_execution_failed` or `inline_background_task_failed` with that ID.
+The stored result exposes a sanitized `failure_code`, `failure_reason`, and
+`recovery` message; do not paste API keys, BYOK bearer tokens, or full provider
+request headers into logs or support messages.
+
+Common provider failure codes:
+
+- `provider_credentials_missing` / `provider_auth_failed`: check the API
+  service's provider credential or reopen the portfolio BYOK session.
+- `provider_endpoint_not_found`: confirm the API's `LLM_GATEWAY_URL` ends in
+  `/v1` and that the Gateway's chat-completions route is deployed.
+- `provider_rate_limited`: wait for the provider's `Retry-After` window, then
+  start a new run. The client does not automatically retry workflow POSTs,
+  because retrying a POST can create duplicate runs.
+- `provider_timeout` / `provider_connection_failed`: check Gateway/provider
+  availability and request latency; retry only after the upstream recovers.
+- `provider_empty_completion` / `provider_invalid_response`: the endpoint
+  responded but did not return usable OpenAI-compatible text. Verify the model
+  and Gateway response contract.
+- `invalid_model_output`: the model responded, but the workflow's structured
+  output validation rejected the result; use a shorter, clearer brief.
+
+The public Render demo returns a run ID immediately and executes in an
+in-process background task. It is intentionally not a durable queue: a Render
+restart or deployment can interrupt an active run and clears in-memory run
+history. Use the PostgreSQL + Redis/RQ topology when durable execution is
+required.

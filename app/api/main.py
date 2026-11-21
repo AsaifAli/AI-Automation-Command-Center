@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, datetime
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
@@ -238,7 +238,7 @@ def root():
     )
 
     architecture = (
-        "api -> inline execution -> ephemeral in-memory state"
+        "api -> in-process background execution -> ephemeral in-memory state"
         if settings.inline_execution and not settings.database_url.strip()
         else "api -> execution -> persistent postgres state"
         if settings.database_url.strip()
@@ -265,6 +265,9 @@ def health():
         service=settings.app_name,
         version=settings.app_version,
         demo_mode=settings.demo_mode,
+        execution_mode=(
+            "inline_background" if settings.inline_execution else "redis_worker"
+        ),
     )
 
 
@@ -363,6 +366,34 @@ def workflows(
     }
 
 
+def _execute_inline_background(
+    run_id: str,
+    workflow: str,
+    payload: dict,
+    gateway_token: str = "",
+) -> None:
+    """Run a demo workflow after returning its run reference to the UI.
+
+    BYOK bearer tokens are captured only in process memory for this one task,
+    installed into the request context for execution, and always cleared.
+    They are never written to the run record or logs.
+    """
+    context_token = set_llm_gateway_token(gateway_token)
+    try:
+        execute_run(
+            run_id,
+            workflow,
+            payload,
+            use_request_context=True,
+        )
+    except Exception:  # noqa: BLE001 - deliberate isolation boundary for an in-process background task
+        # execute_run normally stores a failed result before re-raising. Do not
+        # let a post-response task exception surface as a failed HTTP request.
+        logger.error("inline_background_task_failed run_id=%s", run_id)
+    finally:
+        reset_llm_gateway_token(context_token)
+
+
 @app.post(
     "/api/v1/runs",
     response_model=WorkflowResult,
@@ -371,6 +402,7 @@ def workflows(
 )
 def run_workflow(
     request: RunRequest,
+    background_tasks: BackgroundTasks,
     llm_gateway_token: str = Header(
         default="",
         alias="X-LLM-Gateway-Token",
@@ -416,11 +448,15 @@ def run_workflow(
     credential_id: str | None = None
 
     if settings.inline_execution:
-        execute_run(
+        # Do not hold the HTTP request open for a potentially slow model call.
+        # This in-process task is appropriate for the Free demo topology, which
+        # already uses ephemeral in-memory run storage and does not provision RQ.
+        background_tasks.add_task(
+            _execute_inline_background,
             run_id,
             request.workflow.value,
             payload,
-            use_request_context=bool(gateway_token),
+            gateway_token,
         )
     else:
         try:

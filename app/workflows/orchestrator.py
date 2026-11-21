@@ -7,11 +7,11 @@ from typing import Any, TypedDict
 from langgraph.graph import END, StateGraph
 
 from app.agents.competitor import CompetitorAgent
-from app.agents.content import ContentAgent
+from app.agents.content import ContentAgent, ContentGenerationError
 from app.agents.kpi import KPIAgent
-from app.agents.outreach import OutreachAgent
+from app.agents.outreach import OutreachAgent, OutreachGenerationError
 from app.integrations.intelligence import IntelligenceSource
-from app.integrations.llm import LLMProvider
+from app.integrations.llm import LLMProvider, LLMProviderError
 
 try:
     from opentelemetry import trace
@@ -142,15 +142,36 @@ class WorkflowEngine:
                 status = "awaiting_approval"
         except Exception as exc:
             status = "failed"
+            failure_code = "workflow_execution_error"
+            failure_reason = None
+            recovery = "Retry the workflow. If the issue persists, share its run reference with an administrator."
+
+            if isinstance(exc, LLMProviderError):
+                failure_code = exc.failure_code
+                failure_reason = exc.public_message
+                recovery = (
+                    "Check the configured BYOK session or service provider, model endpoint, and provider availability. "
+                    "Then start a new run."
+                )
+            elif isinstance(exc, (ContentGenerationError, OutreachGenerationError)):
+                failure_code = "invalid_model_output"
+                failure_reason = str(exc)[:280]
+                recovery = "Retry with a shorter or clearer brief. The workflow will validate the regenerated output before returning it."
+
             logger.exception(
-                "workflow_execution_failed workflow=%s run_id=%s",
+                "workflow_execution_failed workflow=%s run_id=%s failure_code=%s error_type=%s",
                 workflow,
                 run_id,
+                failure_code,
+                type(exc).__name__,
             )
             output = {
                 "error": "This workflow could not be completed.",
-                "recovery": "Retry the workflow. If the issue persists, share its run reference with an administrator.",
+                "failure_code": failure_code,
+                "recovery": recovery,
             }
+            if failure_reason:
+                output["failure_reason"] = failure_reason
             warnings = ["Workflow execution failed before validation completed."]
             usage = None
             if span_context:
