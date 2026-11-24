@@ -91,3 +91,14 @@ A passing CI run establishes the checks included in that workflow; it does not b
 ## Portfolio positioning
 
 **FlowPilot — AI Workflow Automation:** a distinct AI application for orchestrating bounded workflows, tracking execution, and keeping consequential actions reviewable. It is not the shared Evaluation Harness dashboard and is not the private Agency OS.
+## Live portfolio demo verification
+
+The website-configured hosted endpoints were checked on November 25, 2026:
+
+- UI: `https://ai-automation-ui-ac2c.onrender.com` — Streamlit `/_stcore/health` returned `ok`.
+- API: `https://ai-automation-api.onrender.com/health` returned `status: ok`.
+- API: `https://ai-automation-api.onrender.com/ready` returned `status: ready`.
+
+The live API reported `execution_mode=inline_background` and `state_store=ephemeral-memory`. This is the lightweight portfolio/demo topology declared by the root `render.yaml`; it is not the durable PostgreSQL + Redis worker topology described in `render.production.yaml`. Run records from this hosted demo should therefore be treated as ephemeral. The durable topology requires its separately provisioned resources and configuration.
+
+These checks confirm service health/readiness only. A full live workflow execution with a real BYOK session and approval path still needs a synthetic end-to-end test.
