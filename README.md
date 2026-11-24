@@ -1,31 +1,93 @@
-# FlowPilot lint correction
+# FlowPilot — AI Workflow Automation
 
-This patch resolves the six Ruff findings shown by the current local and Docker test runs. It changes only three files:
+> An AI workflow automation workspace for launching, tracking, and reviewing bounded AI-assisted workflows.
 
-- `app/api/main.py`: keeps the intentional exception boundary around the in-process background task and documents the narrowly scoped BLE001 suppression. `execute_run` already records the failed run before re-raising; the background-task wrapper must prevent a post-response exception from surfacing as a failed request.
-- `app/integrations/llm.py`: uses Python 3.11+'s `datetime.UTC` alias for parsing and comparing `Retry-After` dates.
-- `ui/api_resilience.py`: imports `Callable` from `collections.abc` and uses `datetime.UTC`.
+FlowPilot combines a Streamlit operator workspace with a FastAPI workflow control plane. It is designed around explicit workflow definitions, asynchronous execution, role-scoped access, observable run state, and human approval boundaries for external-impact actions.
 
-No application behaviour, retry limits, BYOK handling, provider credentials, Render settings, or tests are changed by this lint-only patch.
+## What FlowPilot does
 
-## Apply
+The current workspace exposes four workflow types:
 
-From the FlowPilot repository root, extract this ZIP to a temporary directory and overlay its contents:
+| Workflow | Purpose | Typical output |
+|---|---|---|
+| Content Agent | Turn a topic or brief into channel-aware content drafts | Multi-channel draft for human review |
+| Competitor Intelligence | Process configured RSS/Atom sources and synthesize observed signals | Evidence-oriented intelligence brief |
+| Outreach Agent | Qualify an opportunity and prepare contextual outreach | Approval-ready draft; sending is not automatic |
+| KPI & Progress Tracker | Normalize updates and surface blockers | Leadership progress briefing |
+
+## Application workflow
+
+1. The operator selects a workflow and provides its bounded input.
+2. The UI submits an authenticated request to the FastAPI service.
+3. The API creates a run reference and schedules execution.
+4. Workflow execution records progress and a terminal result.
+5. The workspace polls the run and presents status, output, and review context.
+6. Actions with external impact remain subject to approval and role permissions.
+
+## Architecture
+
+- **Frontend:** Streamlit operator workspace (`ui/app.py`).
+- **API:** FastAPI control plane (`app/api/main.py`).
+- **Execution:** in-process background execution in the portfolio Render topology; the repository also contains a Redis/RQ worker topology for deployments that enable it.
+- **State:** persistent PostgreSQL/Redis support in the durable topology; the lightweight portfolio manifest documents ephemeral run state for the inline demo configuration.
+- **LLM access:** portfolio BYOK uses a short-lived, project-scoped Gateway session; raw provider credentials are not forwarded to the application.
+- **Observability:** health, run metrics, structured logs, and optional OpenTelemetry instrumentation.
+
+## BYOK and Gateway handoff
+
+When FlowPilot is launched from the portfolio website, the website owns provider selection and the user-supplied provider credential. FlowPilot receives a single-use handoff code, removes it from the URL, exchanges it server-side, and keeps the short-lived project token in Streamlit session state. The API validates the token for the FlowPilot project before using it for inference.
+
+Do not put provider API keys or reusable Gateway bearer tokens in source control, URL parameters, or browser storage.
+
+## Deployment
+
+The root `render.yaml` defines a portfolio/demo topology with two Render web services:
+
+- `ai-automation-api` — FastAPI API, using inline background execution and ephemeral run state.
+- `ai-automation-ui` — Streamlit workspace, configured to call the API service.
+
+This is intentionally a lightweight demo topology, not the durable PostgreSQL + Redis worker topology. See `render.production.yaml` for the separate durable deployment manifest and review its required secrets and resources before using it.
+
+Required or externally supplied Render configuration includes the LLM provider credential, Gateway URL, allowed CORS origins, and the Gateway handoff root URL. Generated API role keys are provisioned by the manifest. Never commit real values.
+
+## Local development
+
+Copy the example environment file, set local-only credentials, and start the Compose stack:
 
 ```bash
-unzip -o ~/Downloads/flowpilot-lint-fix.zip -d /tmp/flowpilot-lint-fix
-rsync -av /tmp/flowpilot-lint-fix/flowpilot-lint-fix/ ./
+cp .env.example .env
+docker compose up --build
 ```
 
-Then run the complete validation sequence:
+The Compose stack includes the API, Streamlit UI, LiteLLM, PostgreSQL, Redis, and observability services. The exact services and health checks are defined by `docker-compose.yml`.
+
+## Validation
+
+Run the repository checks from its root:
 
 ```bash
 ruff check app ui tests scripts
 python -m compileall -q app ui tests scripts
 pytest -q
+```
 
+For a Docker test run, build the test target first, then run the resulting image:
+
+```bash
 docker build --no-cache --target test -t flowpilot-test .
 docker run --rm flowpilot-test
 ```
 
-Run `docker run` only after the build succeeds. The previous `pull access denied` message occurred because the image was never created after the Docker build's Ruff step failed.
+A passing CI run establishes the checks included in that workflow; it does not by itself verify live provider credentials, Render environment configuration, external integrations, or hosted end-to-end behavior.
+
+## Safety and operating boundaries
+
+- Content and outreach workflows prepare drafts; external publishing or sending is not automatic.
+- API permissions are role-scoped.
+- Gateway tokens are short-lived and project-scoped.
+- Workflow execution and approval state are kept distinct.
+- A demo deployment should use synthetic/sample inputs, not confidential client material.
+
+## Portfolio positioning
+
+**FlowPilot — AI Workflow Automation:** a distinct AI application for orchestrating bounded workflows, tracking execution, and keeping consequential actions reviewable. It is not the shared Evaluation Harness dashboard and is not the private Agency OS.
