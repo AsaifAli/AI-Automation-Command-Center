@@ -1,4 +1,5 @@
 
+import asyncio
 import logging
 import time
 import uuid
@@ -21,6 +22,7 @@ from app.core.llm_gateway_context import (
     set_llm_gateway_token,
 )
 from app.core.logging import configure_logging
+from app.core.rate_limit import RateLimitBackendUnavailable, check_request_limits
 from app.core.telemetry import configure_telemetry
 from app.integrations.llm import LLMProvider
 from app.models.schemas import (
@@ -185,6 +187,37 @@ async def request_context(request: Request, call_next):
         "X-Request-ID",
         str(uuid.uuid4()),
     )
+
+    is_write_api = (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and request.url.path.startswith("/api/v1/")
+    )
+    if is_write_api:
+        client_ip = (
+            request.client.host
+            if request.client is not None
+            else "unknown"
+        )
+        try:
+            allowed, retry_after = await asyncio.to_thread(
+                check_request_limits,
+                client_ip=client_ip,
+                api_key=request.headers.get("X-API-Key", ""),
+                settings=settings,
+            )
+        except RateLimitBackendUnavailable:
+            logger.error("write_rate_limit_backend_unavailable request_id=%s", request_id)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Write service is temporarily unavailable."},
+                headers={"Retry-After": "5"},
+            )
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Write request limit reached. Retry later."},
+                headers={"Retry-After": str(retry_after)},
+            )
 
     content_length = request.headers.get("content-length")
 
