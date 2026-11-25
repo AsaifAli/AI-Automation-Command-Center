@@ -591,12 +591,26 @@ def run_workflow(
 )
 def list_pending_approvals(
     limit: int = 50,
-    _: Principal = Depends(require_permission("approvals:decide")),
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("approvals:decide")),
 ):
-    """List pending review requests for authorized reviewers and admins."""
+    """List pending review requests inside the verified owner's scope."""
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
     try:
         safe_limit = min(max(limit, 1), 100)
-        approvals = repo.list_pending_approvals(safe_limit)
+        approvals = repo.list_pending_approvals(
+            safe_limit,
+            owner_id=owner_id,
+            include_all=principal.role == "admin",
+        )
         return {"approvals": approvals, "total": len(approvals)}
     except Exception:
         logger.exception("pending_approvals_lookup_failed")
@@ -733,11 +747,23 @@ def get_run(
 def decide_approval(
     run_id: str,
     request: ApprovalRequest,
-    principal: Principal = Depends(
-        require_permission("approvals:decide")
-    ),
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("approvals:decide")),
 ):
-    result = repo.get_run(run_id)
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
+    result = repo.get_run(
+        run_id,
+        owner_id=owner_id,
+        include_all=principal.role == "admin",
+    )
 
     if not result:
         raise HTTPException(
