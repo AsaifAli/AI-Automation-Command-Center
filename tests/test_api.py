@@ -231,8 +231,9 @@ def test_upstash_workflow_dispatch_failure_marks_run_failed(monkeypatch):
 
 
 def test_upstash_workflow_envelope_rejects_malformed_owner_and_ciphertext():
-    import pytest
     import uuid
+
+    import pytest
 
     valid = {
         "run_id": str(uuid.uuid4()),
