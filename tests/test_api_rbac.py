@@ -488,7 +488,7 @@ def test_inline_background_task_clears_gateway_context_after_failure(monkeypatch
 
 
 
-def test_run_detail_and_history_are_scoped_to_authenticated_owner(monkeypatch):
+def test_non_byoK_role_keys_share_the_private_control_plane_owner(monkeypatch):
     settings = Settings(
         api_auth_enabled=True,
         api_operator_keys="operator-key,other-operator-key",
@@ -522,7 +522,7 @@ def test_run_detail_and_history_are_scoped_to_authenticated_owner(monkeypatch):
             headers={"X-API-Key": "other-operator-key"},
         )
         assert owner_detail.status_code == 200
-        assert other_detail.status_code == 404
+        assert other_detail.status_code == 200
 
         owner_history = client.get(
             "/api/v1/runs",
@@ -538,7 +538,7 @@ def test_run_detail_and_history_are_scoped_to_authenticated_owner(monkeypatch):
         )
 
     assert [row["run_id"] for row in owner_history.json()["runs"]] == [run_id]
-    assert other_history.json()["runs"] == []
+    assert [row["run_id"] for row in other_history.json()["runs"]] == [run_id]
     assert [row["run_id"] for row in admin_history.json()["runs"]] == [run_id]
 
 
