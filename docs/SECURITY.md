@@ -41,7 +41,7 @@ This is a source/config review, not a penetration test or production certificati
 |16|Strict CORS|PASS with deployment config — explicit `CORS_ORIGINS`, credentials disabled; production Render value must be set to exact trusted origin(s)|
 |17|Webhook signatures|N/A — no inbound third-party webhook receiver identified|
 |18|Source maps|N/A — Streamlit app, no client JS source-map build|
-|19|Clean production logs|PARTIAL/FAIL — JSON logging serializes arbitrary message/exception text; redact and test|
+|19|Clean production logs|PARTIAL — common credential patterns are redacted in JSON logging and tested; prohibit raw payload logging and extend PII review|
 |20|Dependency patching|UNVERIFIED — run resolver-aware Python audit and container image scan against the deployment image|
 
 ## External deployment actions
