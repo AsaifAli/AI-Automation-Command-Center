@@ -33,11 +33,22 @@ class FakeRepo:
 
         return run_id
 
-    def get_run(self, run_id):
-        return self.runs.get(run_id)
+    def get_run(self, run_id, *, owner_id=None, include_all=False):
+        run = self.runs.get(run_id)
+        if (
+            run is not None
+            and not include_all
+            and owner_id is not None
+            and run.get("owner_id", "legacy") != owner_id
+        ):
+            return None
+        return run
 
-    def list_runs(self, limit):
-        return list(self.runs.values())[:limit]
+    def list_runs(self, limit, *, owner_id=None, include_all=False):
+        runs = list(self.runs.values())
+        if not include_all and owner_id is not None:
+            runs = [run for run in runs if run.get("owner_id", "legacy") == owner_id]
+        return runs[:limit]
 
     def list_pending_approvals(self, limit):
         return [
@@ -467,3 +478,106 @@ def test_inline_background_task_clears_gateway_context_after_failure(monkeypatch
     )
 
     assert get_llm_gateway_token() == ""
+
+
+
+def test_run_detail_and_history_are_scoped_to_authenticated_owner(monkeypatch):
+    settings = Settings(
+        api_auth_enabled=True,
+        api_operator_keys="operator-key,other-operator-key",
+        api_admin_keys="admin-key",
+    )
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module.settings, "inline_execution", True)
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+
+    def finish_inline(run_id, workflow, payload, gateway_token=""):
+        fake_repo.runs[run_id]["status"] = "completed"
+
+    monkeypatch.setattr(api_module, "_execute_inline_background", finish_inline)
+
+    with TestClient(api_module.app) as client:
+        created = client.post(
+            "/api/v1/runs",
+            headers={"X-API-Key": "operator-key"},
+            json={"workflow": "competitor", "payload": {}},
+        )
+        assert created.status_code == 202
+        run_id = created.json()["run_id"]
+
+        owner_detail = client.get(
+            f"/api/v1/runs/{run_id}",
+            headers={"X-API-Key": "operator-key"},
+        )
+        other_detail = client.get(
+            f"/api/v1/runs/{run_id}",
+            headers={"X-API-Key": "other-operator-key"},
+        )
+        assert owner_detail.status_code == 200
+        assert other_detail.status_code == 404
+
+        owner_history = client.get(
+            "/api/v1/runs",
+            headers={"X-API-Key": "operator-key"},
+        )
+        other_history = client.get(
+            "/api/v1/runs",
+            headers={"X-API-Key": "other-operator-key"},
+        )
+        admin_history = client.get(
+            "/api/v1/runs",
+            headers={"X-API-Key": "admin-key"},
+        )
+
+    assert [row["run_id"] for row in owner_history.json()["runs"]] == [run_id]
+    assert other_history.json()["runs"] == []
+    assert [row["run_id"] for row in admin_history.json()["runs"]] == [run_id]
+
+
+def test_gateway_owner_scope_overrides_shared_ui_api_principal(monkeypatch):
+    settings = Settings(
+        api_auth_enabled=True,
+        api_operator_keys="shared-ui-key",
+        api_admin_keys="admin-key",
+    )
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module.settings, "inline_execution", True)
+    monkeypatch.setattr(
+        api_module,
+        "verify_flowpilot_gateway_session",
+        lambda _token: api_module.GatewaySessionLifetime(600, "a" * 64),
+    )
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "_execute_inline_background", lambda *args, **kwargs: None)
+
+    with TestClient(api_module.app) as client:
+        created = client.post(
+            "/api/v1/runs",
+            headers={
+                "X-API-Key": "shared-ui-key",
+                "X-LLM-Gateway-Token": "verified-gateway-token",
+            },
+            json={"workflow": "competitor", "payload": {}},
+        )
+        assert created.status_code == 202
+        run_id = created.json()["run_id"]
+
+        same_owner = client.get(
+            f"/api/v1/runs/{run_id}",
+            headers={
+                "X-API-Key": "shared-ui-key",
+                "X-LLM-Gateway-Token": "verified-gateway-token",
+            },
+        )
+        other_owner = client.get(
+            f"/api/v1/runs/{run_id}",
+            headers={
+                "X-API-Key": "shared-ui-key",
+                "X-LLM-Gateway-Token": "another-verified-gateway-token",
+            },
+        )
+
+    assert same_owner.status_code == 200
+    assert other_owner.status_code == 404
