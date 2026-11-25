@@ -247,4 +247,10 @@ set the same `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` in API and worker, and keep
 
 `render.production.yaml` is an alternate paid topology for queued operations. It provisions a paid API, UI, worker, scheduler, PostgreSQL and persistent Key Value service. It is not automatically selected by the existing Render Blueprint. Before switching an existing Render Blueprint to this file, review pricing, service names, data migration, database backups and resource ownership. Render warns against managing the same resource from multiple Blueprints.
 
+The durable topology uses the repository's existing **Redis Queue (RQ)** implementation; do not add Celery as a second queue system. The API runs with `INLINE_EXECUTION=false`, stores run state and encrypted short-lived BYOK job credentials in PostgreSQL, and sends only the opaque credential reference to Redis. The dedicated worker starts with `python -m app.worker` and consumes the same queue and database.
+
+Queued jobs use `WORKFLOW_JOB_TIMEOUT_SECONDS` (default 600 seconds, bounded to 60–1800). This is separate from `REQUEST_TIMEOUT_SECONDS`, which bounds an individual provider request. The durable Render manifest uses a 90-second provider timeout and up to two bounded provider retries; tune those values against the selected provider's limits and expected workflow duration. The worker shutdown grace period is configured to 300 seconds.
+
+For an existing deployment, use the durable manifest through the existing Blueprint after reviewing the required paid resources and data ownership. Do not create a second Blueprint that attempts to manage the same `ai-automation-api`, `ai-automation-ui`, database, or Key Value resources. Keep the demo manifest unchanged when intentionally choosing the lightweight, ephemeral portfolio mode.
+
 Do not enable scheduled runs until the configured schedule workflow and targets are intentional. The production Blueprint defaults scheduling off.
