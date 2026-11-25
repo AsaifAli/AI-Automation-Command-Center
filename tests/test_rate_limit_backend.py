@@ -55,6 +55,8 @@ def test_production_rate_limit_fails_closed_when_redis_is_unavailable(monkeypatc
     monkeypatch.setattr(rate_limit, "_redis_client", unavailable)
     settings = Settings(
         app_env="production",
+        api_auth_enabled=True,
+        api_admin_keys="test-admin-key",
         inline_execution=False,
         redis_url="redis://redis.example:6379/0",
     )
