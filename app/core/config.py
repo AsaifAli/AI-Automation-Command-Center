@@ -60,6 +60,10 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:8501"
     max_payload_bytes: int = 1_000_000
+    # Write quotas are shared through Redis in production and process-local in development.
+    api_write_ip_rate_limit_per_minute: int = 60
+    api_write_principal_rate_limit_per_minute: int = 20
+    api_rate_limit_window_seconds: int = 60
 
     # Intelligence
     demo_config_path: str = "config.json"
