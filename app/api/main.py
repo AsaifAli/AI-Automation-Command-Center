@@ -460,7 +460,7 @@ def run_workflow(
         default="",
         alias="X-LLM-Gateway-Token",
     ),
-    _: Principal = Depends(
+    principal: Principal = Depends(
         require_permission("runs:execute")
     ),
 ):
@@ -496,7 +496,15 @@ def run_workflow(
                     detail=str(exc),
                 ) from None
 
-    run_id = repo.create_pending_run(request.workflow.value)
+    gateway_owner_scope = (
+        getattr(gateway_session_remaining, "owner_scope", None)
+        if gateway_token and gateway_session_remaining is not None
+        else None
+    )
+    owner_id = gateway_owner_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
+    run_id = repo.create_pending_run(request.workflow.value, owner_id=owner_id)
     payload = dict(request.payload)
     credential_id: str | None = None
 
@@ -605,14 +613,26 @@ def list_pending_approvals(
 )
 def list_runs(
     limit: int = 20,
-    _: Principal = Depends(
-        require_permission("runs:read")
-    ),
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("runs:read")),
 ):
     safe_limit = min(max(limit, 1), 100)
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
 
     try:
-        runs = repo.list_runs(safe_limit)
+        runs = repo.list_runs(
+            safe_limit,
+            owner_id=owner_id,
+            include_all=principal.role == "admin",
+        )
 
         return {
             "runs": runs,
@@ -666,12 +686,24 @@ def clear_run_history(
 )
 def get_run(
     run_id: str,
-    _: Principal = Depends(
-        require_permission("runs:read")
-    ),
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("runs:read")),
 ):
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
     try:
-        result = repo.get_run(run_id)
+        result = repo.get_run(
+            run_id,
+            owner_id=owner_id,
+            include_all=principal.role == "admin",
+        )
 
     except Exception:
         logger.exception(
