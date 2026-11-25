@@ -7,16 +7,16 @@ This is a source/config review, not a penetration test or production certificati
 - Production settings require API authentication and configured role keys (`app/core/config.py`); Render production blueprint generates API role credentials.
 - CORS is configured from explicit origins and does not enable credentialed cross-origin requests (`app/api/main.py`).
 - Request bodies have a configured size limit; responses receive `nosniff`, frame-deny and no-store headers.
-- Gateway BYOK sessions are checked against the FlowPilot project audience. Queued job credentials are encrypted in PostgreSQL and RQ receives an opaque reference, not the token; inline credentials are request-scoped and cleared.
+- Gateway BYOK sessions are checked against the FlowPilot project audience and an HTTPS host allowlist before outbound verification. A verified Gateway owner scope (or a hash of the authenticated API key when no Gateway session is used) is assigned to each run. Run list/detail, approval queue and approval decisions enforce owner filters; admin has an explicit all-owner override. Queued job credentials are encrypted in PostgreSQL and RQ receives an opaque reference, not the token; inline credentials are request-scoped and cleared.
 - Intelligence feed fetching has SSRF defenses (DNS/private-address checks, disabled redirects, disabled environment proxy trust, response-size limits); regression coverage exists in `tests/test_intelligence_security.py`.
 - PostgreSQL and Redis are private in the production Render blueprint; role keys and encryption keys are generated/configured as deployment secrets.
 - Content/outreach actions are paused behind reviewer approval; the authenticated principal, not a client-supplied reviewer name, is used for audit identity.
 
 ## Findings requiring attention
 1. **Log redaction (Medium/High): PARTIALLY PATCHED in main.** `app/core/logging.py` redacts common bearer tokens, API/access/refresh keys, passwords and OpenAI-style keys before JSON serialization. `tests/test_logging_security.py` covers representative log messages. This pattern-based filter is defense in depth, not a substitute for never logging request bodies, prompts or credentials; broader call-site review remains required.
-2. **Rate limiting (High): PATCHED with deployment-mode caveat.** Mutating `/api/v1/*` routes have per-IP and API-key-fingerprint quotas (`app/core/rate_limit.py`). The active free-tier `render.yaml` defines inline execution, so that deployment uses bounded in-process counters on its single API instance. The queued-worker topology in `render.production.yaml` uses Redis-backed atomic fixed-window counters and fails closed if Redis is unavailable. Add edge/WAF limits as an additional perimeter control.
-3. **Read authorization / BOLA boundary (High where multiple principals are untrusted):** `runs:read` grants access to the global run list and `get_run(run_id)`; there is no per-user or tenant ownership field in the observed API path. This may be intentional for a single-owner private agency OS, but must not be presented as multi-tenant isolation. Keep the API private and add owner/tenant scoping before sharing across customers.
-4. **Gateway URL validation (High):** Gateway verification uses an environment-configured URL and disables redirects/proxy trust, but validate that production URL is HTTPS and matches the approved Gateway host. Never accept it from workflow payloads.
+2. **Rate limiting (High): PATCHED with external configuration.** Mutating `/api/v1/*` routes use atomic Upstash REST Lua counters in the active inline deployment (`flowpilot:ratelimit:v1:` namespaced keys). The queued `render.production.yaml` topology retains the existing private Redis atomic-counter path. Production write requests fail closed with 503 when the selected shared backend is unavailable. Set Upstash REST URL/token in the active API service and add edge/WAF limits as a second layer.
+3. **Read authorization / BOLA boundary (High where multiple principals are untrusted): PATCHED for run ownership.** New runs persist an `owner_id`; non-admin list/detail, pending approval and approval mutation routes enforce it. A validated Gateway owner scope takes precedence over the operator API key. Existing rows migrate as `legacy` and remain visible only to admin until deliberately reassigned. The shared non-BYOK UI API key is one owner identity; multi-customer SaaS still requires individual authenticated identities and fine-grained tenant ACLs.
+4. **Gateway URL validation (High): PATCHED.** Gateway verification now accepts only HTTPS hostnames from `LLM_GATEWAY_ALLOWED_HOSTS`, rejects userinfo/query/fragment/nonstandard ports, and disables redirects/proxy trust. The host is deployment config and never accepted from workflow payloads.
 5. **Production readiness leakage (Low/Medium):** readiness catches exceptions and logs stack traces; response is generic, which is appropriate. Restrict diagnostic logs to operators and ensure secrets are redacted.
 6. **MFA, database grants and secret rotation are external controls.** The repository cannot turn on provider/GitHub/hosting MFA or validate actual secret values.
 
@@ -28,8 +28,8 @@ This is a source/config review, not a penetration test or production certificati
 |03|CSRF|PARTIAL — API uses header API keys, not browser cookies; verify Streamlit/proxy origins and cookie behavior|
 |04|File upload|N/A for the observed FastAPI API route set; validate any future document/upload workflow inputs before parsing|
 |05|SSRF|PASS for intelligence feeds — DNS/private-address checks, redirects disabled, trust_env false and response size cap have regression tests; Gateway URL is a separate configured endpoint|
-|06|BOLA/IDOR|PARTIAL — run IDs are globally readable by authorized roles; safe only for the single-owner private control-plane model|
-|07|Rate limiting|PARTIAL — IP + API-key-fingerprint quotas cover mutating routes; current inline demo uses process-local counters, while queued production topology uses Redis-shared counters. Edge/WAF limits remain recommended|
+|06|BOLA/IDOR|IMPROVED/PARTIAL — owner-scoped run/approval reads and mutations; admin can intentionally access all owners. Fine-grained tenant IAM remains required before multi-customer sharing|
+|07|Rate limiting|PARTIAL — active inline deployment uses atomic shared Upstash counters and queued topology uses Redis; edge/WAF limits remain recommended|
 |08|Password hashing|N/A — no local username/password login|
 |09|MFA|EXTERNAL — enable for GitHub, Render, database, Redis and provider administrator accounts|
 |10|Server-side permissions|PASS — route permission dependencies and role allowlists are enforced in the API|
@@ -45,7 +45,7 @@ This is a source/config review, not a penetration test or production certificati
 |20|Dependency patching|UNVERIFIED — run resolver-aware Python audit and container image scan against the deployment image|
 
 ## Active deployment topology
-- The connected free-tier API service is deployed from `render.yaml`, which selects inline execution and ephemeral in-memory run state. In this mode, quotas are process-local and reset on instance restart; the current service is one instance.
+- The connected free-tier API service is deployed from `render.yaml`, which selects inline execution. Run records remain ephemeral unless `DATABASE_URL` is configured; production write quotas use shared Upstash REST counters when their environment values are set.
 - The separate `render.production.yaml` describes a PostgreSQL + Redis + worker topology. Its Redis-backed quota path applies when queued execution is enabled; do not assume those resources exist in the free-tier service.
 
 ## External deployment actions
