@@ -1,6 +1,7 @@
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import time
 import uuid
@@ -132,6 +133,15 @@ def verify_flowpilot_gateway_session(gateway_token: str) -> GatewaySessionLifeti
         for item in str(settings.llm_gateway_allowed_hosts or "").split(",")
         if item.strip()
     }
+    try:
+        gateway_ip = ipaddress.ip_address(gateway_host)
+    except ValueError:
+        gateway_ip = None
+    if gateway_ip is not None and not gateway_ip.is_global:
+        raise HTTPException(
+            status_code=503,
+            detail="The configured Gateway destination is not public.",
+        )
     is_production = str(settings.app_env).strip().lower() in {"prod", "production"}
     local_development_host = gateway_host in {"localhost", "127.0.0.1", "::1"}
     valid_scheme = parsed_gateway.scheme == "https" or (
