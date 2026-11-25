@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     request_timeout_seconds: int = 30
     max_retries: int = 2
     inline_execution: bool = False
+    # Maximum time RQ may spend executing one workflow job.
+    workflow_job_timeout_seconds: int = Field(default=600, ge=60, le=1800)
     # Queue BYOK tokens only as encrypted PostgreSQL records; RQ stores UUID references.
     gateway_job_credential_encryption_key: str = Field(
         default="",
