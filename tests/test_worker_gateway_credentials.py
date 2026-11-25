@@ -24,8 +24,8 @@ if "langgraph" not in sys.modules and importlib.util.find_spec("langgraph") is N
     sys.modules.setdefault("langgraph", langgraph_stub)
     sys.modules.setdefault("langgraph.graph", langgraph_graph_stub)
 
-import app.workers.jobs as jobs_module
 from app.core.llm_gateway_context import get_llm_gateway_token
+from app.workers import jobs as jobs_module
 
 
 
