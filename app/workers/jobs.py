@@ -21,13 +21,25 @@ def execute_run(
     *,
     use_request_context: bool = False,
     gateway_credential_id: str | None = None,
+    encrypted_gateway_token: bytes | None = None,
+    gateway_token_ttl_seconds: int | None = None,
+    persist_success: bool = True,
+    persist_failure: bool = True,
 ) -> dict:
     settings = get_settings()
     repo = Repository(settings)
     context_token = None
 
     try:
-        if gateway_credential_id:
+        if gateway_credential_id and encrypted_gateway_token is not None:
+            raise ValueError("Provide either a Gateway credential reference or encrypted token, not both.")
+        if encrypted_gateway_token is not None:
+            vault = GatewayCredentialVault(
+                settings.gateway_job_credential_encryption_key,
+                gateway_token_ttl_seconds or settings.gateway_job_credential_ttl_seconds,
+            )
+            context_token = set_llm_gateway_token(vault.decrypt(encrypted_gateway_token))
+        elif gateway_credential_id:
             encrypted_token = repo.consume_gateway_job_credential(
                 run_id,
                 gateway_credential_id,
@@ -60,7 +72,8 @@ def execute_run(
             run_id=run_id,
         )
         result["run_id"] = run_id
-        repo.save_result(result)
+        if persist_success:
+            repo.save_result(result)
         return result
 
     except Exception:
@@ -79,7 +92,8 @@ def execute_run(
             "usage": None,
             "warnings": ["Worker failed before workflow completion."],
         }
-        repo.save_result(result)
+        if persist_failure:
+            repo.save_result(result)
         raise
     finally:
         if context_token is not None:

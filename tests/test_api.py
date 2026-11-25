@@ -29,6 +29,36 @@ class FakeRepo:
         }
         return self.run["run_id"]
 
+    def ensure_pending_run(self, run_id, workflow, owner_id):
+        if self.run and self.run["run_id"] == run_id:
+            if self.run["workflow"] != workflow or self.run["owner_id"] != owner_id:
+                raise ValueError("Workflow run scope does not match the existing run.")
+            return
+        self.run = {
+            "run_id": run_id,
+            "owner_id": owner_id,
+            "workflow": workflow,
+            "status": "queued",
+            "output": {},
+            "evidence": [],
+            "duration_ms": 0,
+            "created_at": datetime.now(UTC),
+            "usage": None,
+            "warnings": [],
+        }
+
+    def save_result(self, result):
+        if not self.run or self.run["run_id"] != result["run_id"]:
+            raise KeyError("Run not found")
+        self.run.update({
+            "status": result["status"],
+            "output": result.get("output", {}),
+            "evidence": result.get("evidence", []),
+            "duration_ms": result.get("duration_ms", 0),
+            "usage": result.get("usage"),
+            "warnings": result.get("warnings", []),
+        })
+
     def get_run(self, run_id, *, owner_id=None, include_all=False):
         if not self.run or self.run["run_id"] != run_id:
             return None
@@ -91,6 +121,88 @@ def test_queue_workflow():
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
     assert FakeQueue.last_enqueue["kwargs"]["job_timeout"] == api_module.settings.workflow_job_timeout_seconds
+
+
+
+def test_upstash_workflow_dispatch_encrypts_byok_before_queueing(monkeypatch):
+    captured = {}
+
+    async def fake_trigger(envelope, run_id):
+        captured["envelope"] = envelope
+        captured["run_id"] = run_id
+        return "wfr_flowpilot-test"
+
+    class FakeVault:
+        def __init__(self, key, ttl_seconds):
+            captured["vault_ttl"] = ttl_seconds
+
+        def encrypt(self, token):
+            captured["raw_token_seen_by_vault"] = token
+            return b"encrypted-ciphertext"
+
+    monkeypatch.setattr(api_module, "_trigger_upstash_workflow", fake_trigger)
+    monkeypatch.setattr(api_module, "GatewayCredentialVault", FakeVault)
+    monkeypatch.setattr(
+        api_module,
+        "verify_flowpilot_gateway_session",
+        lambda token: api_module.GatewaySessionLifetime(720, "a" * 64),
+    )
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
+    monkeypatch.setattr(api_module.settings, "gateway_job_credential_encryption_key", "test-fernet-key")
+    monkeypatch.setattr(api_module, "repo", FakeRepo())
+
+    raw_token = "raw-bearer-secret"
+    response = client.post(
+        "/api/v1/runs",
+        headers={"X-LLM-Gateway-Token": raw_token},
+        json={"workflow": "competitor", "payload": {"competitors": ["AI"]}},
+    )
+
+    assert response.status_code == 202
+    assert captured["raw_token_seen_by_vault"] == raw_token
+    assert captured["vault_ttl"] == 720
+    assert captured["envelope"]["gateway_token_ciphertext"] == "ZW5jcnlwdGVkLWNpcGhlcnRleHQ="
+    assert raw_token not in repr(captured["envelope"])
+    assert response.json()["status"] == "queued"
+
+
+def test_upstash_workflow_dispatch_failure_marks_run_failed(monkeypatch):
+    async def fail_trigger(envelope, run_id):
+        raise RuntimeError("private provider or QStash response must not be surfaced")
+
+    monkeypatch.setattr(api_module, "_trigger_upstash_workflow", fail_trigger)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+
+    response = client.post(
+        "/api/v1/runs",
+        json={"workflow": "competitor", "payload": {"competitors": ["AI"]}},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Workflow could not be queued. Retry after checking the background execution connection."
+    )
+    assert fake_repo.run["status"] == "failed"
+
+
+def test_upstash_workflow_envelope_rejects_malformed_owner_and_ciphertext():
+    import uuid
+    import pytest
+
+    valid = {
+        "run_id": str(uuid.uuid4()),
+        "workflow": "competitor",
+        "payload": {},
+        "owner_id": "owner-1",
+    }
+    assert api_module._validate_upstash_workflow_payload(valid)["encrypted_gateway_token"] is None
+
+    with pytest.raises(ValueError, match="owner scope"):
+        api_module._validate_upstash_workflow_payload({**valid, "owner_id": ""})
+    with pytest.raises(ValueError, match="Encrypted Gateway credential"):
+        api_module._validate_upstash_workflow_payload({**valid, "gateway_token_ciphertext": "not-base64"})
 
 
 def test_clear_run_history():

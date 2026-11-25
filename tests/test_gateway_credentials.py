@@ -36,6 +36,76 @@ def test_gateway_credential_ttl_is_bounded():
         GatewayCredentialVault(Fernet.generate_key().decode(), ttl_seconds=3600)
 
 
+
+def test_qstash_workflow_requires_token_signing_keys_and_public_url():
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValidationError, match="QSTASH_WORKFLOW_ENABLED requires"):
+        Settings(_env_file=None, app_env="development", qstash_workflow_enabled=True)
+
+
+def test_qstash_workflow_accepts_a_complete_verified_configuration():
+    from app.core.config import Settings
+
+    configured = Settings(
+        _env_file=None,
+        app_env="production",
+        api_auth_enabled=True,
+        api_operator_keys="operator-secret",
+        qstash_workflow_enabled=True,
+        qstash_token="qstash-secret",
+        qstash_current_signing_key="sig_current",
+        qstash_next_signing_key="sig_next",
+        qstash_url="https://qstash-eu-central-1.upstash.io",
+        upstash_workflow_url="https://flowpilot.example.com",
+    )
+
+    assert configured.qstash_workflow_enabled is True
+    assert configured.qstash_workflow_retries == 2
+
+
+def test_qstash_workflow_rejects_untrusted_trigger_hosts():
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValidationError, match="QSTASH_URL must be an approved HTTPS"):
+        Settings(
+            _env_file=None,
+            app_env="development",
+            qstash_workflow_enabled=True,
+            qstash_token="qstash-secret",
+            qstash_current_signing_key="sig_current",
+            qstash_next_signing_key="sig_next",
+            qstash_url="https://attacker.example.com",
+            upstash_workflow_url="https://flowpilot.example.com",
+        )
+
+
+def test_repository_workflow_run_restoration_is_idempotent_and_owner_scoped():
+    import uuid
+
+    from app.core.config import Settings
+    from app.storage.repository import Repository
+
+    repository = Repository(Settings(_env_file=None, database_url=""))
+    run_id = str(uuid.uuid4())
+    repository.ensure_pending_run(run_id, "competitor", "owner-a")
+    repository.mark_running(run_id)
+    repository.ensure_pending_run(run_id, "competitor", "owner-a")
+
+    run = repository.get_run(run_id, owner_id="owner-a")
+    assert run["status"] == "running"
+
+    with pytest.raises(ValueError, match="scope does not match"):
+        repository.ensure_pending_run(run_id, "competitor", "owner-b")
+
+    with Repository._memory_lock:
+        Repository._memory_runs.pop(run_id, None)
+
+
 def test_repository_consumes_gateway_ciphertext_by_run_and_reference(monkeypatch):
     import sys
     import types

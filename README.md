@@ -50,6 +50,26 @@ This is intentionally a lightweight demo topology, not the durable PostgreSQL + 
 
 Required or externally supplied Render configuration includes the LLM provider credential, Gateway URL, allowed CORS origins, and the Gateway handoff root URL. Generated API role keys are provisioned by the manifest. Never commit real values.
 
+### Optional background execution with Upstash Workflow
+
+The current free Render deployment can dispatch runs to the existing Upstash QStash account and receive signed callbacks on the same API service. This avoids a separate always-on worker process, which is not dependable on a free Render web service that can spin down. The existing in-process mode and RQ worker mode remain supported.
+
+To enable Workflow mode, configure these variables on **ai-automation-api** in Render:
+
+- `QSTASH_WORKFLOW_ENABLED=true`
+- `QSTASH_TOKEN` — token for the selected QStash region
+- `QSTASH_CURRENT_SIGNING_KEY` and `QSTASH_NEXT_SIGNING_KEY` — both signing keys for that same region
+- `QSTASH_URL` — e.g. `https://qstash-eu-central-1.upstash.io`
+- `UPSTASH_WORKFLOW_URL` — public API origin, e.g. `https://ai-automation-api.onrender.com`
+- `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` — Fernet key used to encrypt short-lived BYOK session tokens before dispatch
+
+The application rejects Workflow mode unless the QStash credentials, both signing keys, and HTTPS endpoints are configured. QStash verifies every callback signature before the route runs. The Workflow payload contains only encrypted BYOK ciphertext (never the raw session bearer), an opaque run ID, and owner-scoped input. Failed steps are retried; only the final failure callback marks a run failed after retries are exhausted.
+
+**Persistence boundary:** Upstash Workflow persists its execution/step state, but the current free portfolio manifest still uses the in-memory FlowPilot run repository unless `DATABASE_URL` is configured. A Render restart can therefore clear the UI's run history after a completed run. The callback can rehydrate a run record while the Workflow is being delivered/replayed, but this does not replace a durable database. The paid RQ + PostgreSQL topology remains a future option only if you choose to fund always-on worker infrastructure.
+
+Keep Workflow inputs below the configured 900 KB dispatch cap. Retries and Workflow steps consume the QStash/Workflow free-tier quota; this is a portfolio/demo execution path, not an SLA-backed production queue.
+
+
 ## Local development
 
 Copy the example environment file, set local-only credentials, and start the Compose stack:

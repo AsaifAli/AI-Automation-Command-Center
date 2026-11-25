@@ -189,6 +189,67 @@ class Repository:
         return run_id
 
 
+    def ensure_pending_run(
+        self,
+        run_id: str,
+        workflow: str,
+        owner_id: str,
+    ) -> None:
+        """Idempotently restore a queued run for a verified Workflow callback."""
+        try:
+            normalized_run_id = str(uuid.UUID(str(run_id)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("Workflow run identifier is invalid.") from exc
+        if normalized_run_id != str(run_id):
+            raise ValueError("Workflow run identifier must be a canonical UUID.")
+        if not isinstance(workflow, str) or not workflow.strip():
+            raise ValueError("Workflow name is required.")
+        if not isinstance(owner_id, str) or not owner_id.strip() or len(owner_id) > 256:
+            raise ValueError("Workflow owner scope is invalid.")
+        now = datetime.now(UTC)
+        if self._use_memory:
+            with self._memory_lock:
+                existing = self._memory_runs.get(normalized_run_id)
+                if existing:
+                    if existing.get("workflow") != workflow or existing.get("owner_id") != owner_id:
+                        raise ValueError("Workflow run scope does not match the existing run.")
+                    return
+                self._memory_runs[normalized_run_id] = {
+                    "run_id": normalized_run_id,
+                    "owner_id": owner_id,
+                    "workflow": workflow,
+                    "status": "queued",
+                    "output": {},
+                    "evidence": [],
+                    "duration_ms": 0,
+                    "created_at": now,
+                    "usage": None,
+                    "warnings": [],
+                }
+            return
+        with self._connect() as conn:
+            inserted = conn.execute(
+                """INSERT INTO workflow_runs(run_id,owner_id,workflow,status,created_at)
+                   VALUES (%s,%s,%s,%s,%s)
+                   ON CONFLICT (run_id) DO NOTHING
+                   RETURNING run_id""",
+                (normalized_run_id, owner_id, workflow, "queued", now),
+            ).fetchone()
+            existing = conn.execute(
+                "SELECT workflow, owner_id FROM workflow_runs WHERE run_id=%s",
+                (normalized_run_id,),
+            ).fetchone()
+            if not existing:
+                raise RuntimeError("Workflow run could not be restored.")
+            if existing["workflow"] != workflow or existing["owner_id"] != owner_id:
+                raise ValueError("Workflow run scope does not match the existing run.")
+            if inserted:
+                conn.execute(
+                    """INSERT INTO audit_events(run_id,event,detail_json,created_at)
+                       VALUES (%s,%s,%s,%s)""",
+                    (normalized_run_id, "queued", json.dumps({"workflow": workflow}), now),
+                )
+
     def store_gateway_job_credential(
         self,
         run_id: str,
