@@ -28,7 +28,7 @@ The current workspace exposes four workflow types:
 
 - **Frontend:** Streamlit operator workspace (`ui/app.py`).
 - **API:** FastAPI control plane (`app/api/main.py`).
-- **Execution:** in-process background execution in the portfolio Render topology; the repository also contains a Redis/RQ worker topology for deployments that enable it.
+- **Execution:** the lightweight portfolio Render topology uses in-process background execution; the durable topology uses the existing Redis Queue (RQ) worker, with PostgreSQL-backed run state.
 - **State:** persistent PostgreSQL/Redis support in the durable topology; the lightweight portfolio manifest documents ephemeral run state for the inline demo configuration.
 - **LLM access:** portfolio BYOK uses a short-lived, project-scoped Gateway session; raw provider credentials are not forwarded to the application.
 - **Observability:** health, run metrics, structured logs, and optional OpenTelemetry instrumentation.

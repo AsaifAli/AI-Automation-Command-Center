@@ -67,7 +67,10 @@ class FakeRepo:
 
 
 class FakeQueue:
+    last_enqueue = None
+
     def enqueue(self, *args, **kwargs):
+        type(self).last_enqueue = {"args": args, "kwargs": dict(kwargs)}
         return SimpleNamespace(id=kwargs.get("job_id"))
 
 
@@ -87,6 +90,7 @@ def test_queue_workflow():
     response = client.post("/api/v1/runs", json={"workflow": "competitor", "payload": {"competitors": ["AI"]}})
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
+    assert FakeQueue.last_enqueue["kwargs"]["job_timeout"] == api_module.settings.workflow_job_timeout_seconds
 
 
 def test_clear_run_history():

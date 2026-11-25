@@ -583,7 +583,10 @@ def run_workflow(
                     credential_ttl,
                 )
 
-            enqueue_kwargs = {"job_id": run_id}
+            enqueue_kwargs = {
+                "job_id": run_id,
+                "job_timeout": settings.workflow_job_timeout_seconds,
+            }
             if credential_id is not None:
                 # Redis receives only this opaque reference, never the bearer.
                 enqueue_kwargs["gateway_credential_id"] = credential_id
