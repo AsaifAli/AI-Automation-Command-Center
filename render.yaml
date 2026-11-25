@@ -17,6 +17,9 @@ services:
         sync: false
       - key: UPSTASH_REDIS_REST_TOKEN
         sync: false
+      # Optional Supabase PostgreSQL connection for durable, owner-scoped run history.
+      - key: DATABASE_URL
+        sync: false
       - key: APP_VERSION
         value: 3.5.0
       - key: DEMO_MODE
