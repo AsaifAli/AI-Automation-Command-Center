@@ -396,6 +396,7 @@ def test_gateway_session_verifier_requires_active_flowpilot_audience(monkeypatch
             return self.response
 
     monkeypatch.setattr(api_module.settings, "llm_gateway_url", "https://gateway.example/v1")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_allowed_hosts", "gateway.example")
     valid = FakeResponse({
         "active": True,
         "project": "flowpilot",
@@ -553,7 +554,10 @@ def test_gateway_owner_scope_overrides_shared_ui_api_principal(monkeypatch):
     monkeypatch.setattr(
         api_module,
         "verify_flowpilot_gateway_session",
-        lambda _token: api_module.GatewaySessionLifetime(600, "a" * 64),
+        lambda token: api_module.GatewaySessionLifetime(
+            600,
+            api_module.hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        ),
     )
     fake_repo = FakeRepo()
     monkeypatch.setattr(api_module, "repo", fake_repo)
