@@ -37,6 +37,7 @@ class FakeClient:
 def _install_status_response(monkeypatch, payload: dict):
     observed: dict = {}
     monkeypatch.setattr(api_module.settings, "llm_gateway_url", "https://gateway.example/v1")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_allowed_hosts", "gateway.example")
     monkeypatch.setattr(api_module.settings, "llm_base_url", "")
     monkeypatch.setattr(api_module.time, "time", lambda: 1000)
     monkeypatch.setattr(
