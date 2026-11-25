@@ -107,6 +107,46 @@ def _bucket_result(
     return int(count) <= max(1, int(limit)), retry_after
 
 
+_UPSTASH_RATE_LIMIT_SCRIPT = """
+local results = {}
+for index = 1, #KEYS do
+    local count = redis.call('INCR', KEYS[index])
+    local ttl = redis.call('TTL', KEYS[index])
+    if count == 1 or ttl < 0 then
+        redis.call('EXPIRE', KEYS[index], ARGV[1])
+        ttl = tonumber(ARGV[1])
+    end
+    table.insert(results, count)
+    table.insert(results, ttl)
+end
+return results
+"""
+_upstash_client_instance: Any | None = None
+_upstash_client_lock = threading.Lock()
+
+
+def _upstash_client(settings: Any) -> Any:
+    global _upstash_client_instance
+    url = str(getattr(settings, "upstash_redis_rest_url", "") or "").strip()
+    token = str(getattr(settings, "upstash_redis_rest_token", "") or "").strip()
+    if not url or not token:
+        raise RateLimitBackendUnavailable("Shared Upstash credentials are not configured.")
+    with _upstash_client_lock:
+        if _upstash_client_instance is None:
+            try:
+                from upstash_redis import Redis
+
+                _upstash_client_instance = Redis(
+                    url=url,
+                    token=token,
+                    rest_retries=0,
+                    allow_telemetry=False,
+                )
+            except Exception as exc:
+                raise RateLimitBackendUnavailable from exc
+    return _upstash_client_instance
+
+
 def check_request_limits(
     *,
     client_ip: str,
@@ -131,11 +171,39 @@ def check_request_limits(
             )
         )
 
-    production_shared = (
-        str(settings.app_env).strip().lower() in {"prod", "production"}
-        and not settings.inline_execution
-    )
-    if production_shared:
+    is_production = str(settings.app_env).strip().lower() in {"prod", "production"}
+    upstash_url = str(getattr(settings, "upstash_redis_rest_url", "") or "").strip()
+    upstash_token = str(getattr(settings, "upstash_redis_rest_token", "") or "").strip()
+
+    # Prefer the existing Upstash REST database in both inline and queued
+    # production modes. One Lua EVAL checks IP and principal counters atomically
+    # in a single HTTP request; app-specific prefixes avoid Gateway key overlap.
+    if upstash_url or upstash_token or is_production and settings.inline_execution:
+        try:
+            client = _upstash_client(settings)
+            keys = [key for key, _limit in buckets]
+            args = [window, *[max(1, int(limit)) for _key, limit in buckets]]
+            result = client.eval(
+                _UPSTASH_RATE_LIMIT_SCRIPT,
+                keys=keys,
+                args=args,
+            )
+            if not isinstance(result, (list, tuple)) or len(result) != len(buckets) * 2:
+                raise RateLimitBackendUnavailable("Upstash returned an invalid quota response.")
+            for index, (_key, limit) in enumerate(buckets):
+                count = int(result[index * 2])
+                retry_after = max(1, int(result[index * 2 + 1] or window))
+                if count > max(1, int(limit)):
+                    return False, retry_after
+            return True, 0
+        except RateLimitBackendUnavailable:
+            raise
+        except Exception as exc:
+            raise RateLimitBackendUnavailable from exc
+
+    # Backward-compatible Redis TCP path for the optional queued-worker
+    # topology. It is not used by the current inline free-tier deployment.
+    if is_production and not settings.inline_execution:
         try:
             client = _redis_client(settings.redis_url)
             for key, limit in buckets:
@@ -150,6 +218,9 @@ def check_request_limits(
             return True, 0
         except RedisError as exc:
             raise RateLimitBackendUnavailable from exc
+
+    if is_production:
+        raise RateLimitBackendUnavailable("Shared production rate limiting is not configured.")
 
     for key, limit in buckets:
         allowed, retry_after = memory_limiter.check(

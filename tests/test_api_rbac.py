@@ -15,11 +15,12 @@ class FakeRepo:
         self.runs = {}
         self.approvals = []
 
-    def create_pending_run(self, workflow):
+    def create_pending_run(self, workflow, owner_id="legacy"):
         run_id = f"run-{len(self.runs) + 1}"
 
         self.runs[run_id] = {
             "run_id": run_id,
+            "owner_id": owner_id,
             "workflow": workflow,
             "status": "awaiting_approval" if workflow in {"content", "outreach"} else "queued",
             "output": ({"approval": {"status": "pending", "action": "send_outreach" if workflow == "outreach" else "publish_content", "title": "Review requested", "summary": "Test approval request", "items": []}} if workflow in {"content", "outreach"} else {}),
@@ -32,16 +33,33 @@ class FakeRepo:
 
         return run_id
 
-    def get_run(self, run_id):
-        return self.runs.get(run_id)
+    def get_run(self, run_id, *, owner_id=None, include_all=False):
+        run = self.runs.get(run_id)
+        if (
+            run is not None
+            and not include_all
+            and owner_id is not None
+            and run.get("owner_id", "legacy") != owner_id
+        ):
+            return None
+        return run
 
-    def list_runs(self, limit):
-        return list(self.runs.values())[:limit]
+    def list_runs(self, limit, *, owner_id=None, include_all=False):
+        runs = list(self.runs.values())
+        if not include_all and owner_id is not None:
+            runs = [run for run in runs if run.get("owner_id", "legacy") == owner_id]
+        return runs[:limit]
 
-    def list_pending_approvals(self, limit):
+    def list_pending_approvals(self, limit, *, owner_id=None, include_all=False):
         return [
             {"run_id": run["run_id"], "workflow": run["workflow"], "status": run["status"], "created_at": run["created_at"], "approval": run["output"].get("approval", {}), "output": run["output"]}
-            for run in self.runs.values() if run["status"] == "awaiting_approval"
+            for run in self.runs.values()
+            if run["status"] == "awaiting_approval"
+            and (
+                include_all
+                or owner_id is None
+                or run.get("owner_id", "legacy") == owner_id
+            )
         ][:limit]
 
     def clear_history(self):
@@ -236,6 +254,7 @@ def test_queued_gateway_token_is_encrypted_and_only_reference_enters_rq(monkeypa
     monkeypatch.setattr(api_module.settings, "inline_execution", False)
     monkeypatch.setattr(api_module.settings, "database_url", "postgresql://test/db")
     monkeypatch.setattr(api_module.settings, "llm_gateway_url", "https://gateway.example/v1")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_allowed_hosts", "gateway.example")
     monkeypatch.setattr(api_module.settings, "gateway_job_credential_encryption_key", "test-fernet-key")
     monkeypatch.setattr(api_module.settings, "gateway_job_credential_ttl_seconds", 900)
 
@@ -377,6 +396,7 @@ def test_gateway_session_verifier_requires_active_flowpilot_audience(monkeypatch
             return self.response
 
     monkeypatch.setattr(api_module.settings, "llm_gateway_url", "https://gateway.example/v1")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_allowed_hosts", "gateway.example")
     valid = FakeResponse({
         "active": True,
         "project": "flowpilot",
@@ -466,3 +486,140 @@ def test_inline_background_task_clears_gateway_context_after_failure(monkeypatch
     )
 
     assert get_llm_gateway_token() == ""
+
+
+
+def test_non_byoK_role_keys_share_the_private_control_plane_owner(monkeypatch):
+    settings = Settings(
+        api_auth_enabled=True,
+        api_operator_keys="operator-key,other-operator-key",
+        api_admin_keys="admin-key",
+    )
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module.settings, "inline_execution", True)
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+
+    def finish_inline(run_id, workflow, payload, gateway_token=""):
+        fake_repo.runs[run_id]["status"] = "completed"
+
+    monkeypatch.setattr(api_module, "_execute_inline_background", finish_inline)
+
+    with TestClient(api_module.app) as client:
+        created = client.post(
+            "/api/v1/runs",
+            headers={"X-API-Key": "operator-key"},
+            json={"workflow": "competitor", "payload": {}},
+        )
+        assert created.status_code == 202
+        run_id = created.json()["run_id"]
+
+        owner_detail = client.get(
+            f"/api/v1/runs/{run_id}",
+            headers={"X-API-Key": "operator-key"},
+        )
+        other_detail = client.get(
+            f"/api/v1/runs/{run_id}",
+            headers={"X-API-Key": "other-operator-key"},
+        )
+        assert owner_detail.status_code == 200
+        assert other_detail.status_code == 200
+
+        owner_history = client.get(
+            "/api/v1/runs",
+            headers={"X-API-Key": "operator-key"},
+        )
+        other_history = client.get(
+            "/api/v1/runs",
+            headers={"X-API-Key": "other-operator-key"},
+        )
+        admin_history = client.get(
+            "/api/v1/runs",
+            headers={"X-API-Key": "admin-key"},
+        )
+
+    assert [row["run_id"] for row in owner_history.json()["runs"]] == [run_id]
+    assert [row["run_id"] for row in other_history.json()["runs"]] == [run_id]
+    assert [row["run_id"] for row in admin_history.json()["runs"]] == [run_id]
+
+
+def test_gateway_owner_scope_overrides_shared_ui_api_principal(monkeypatch):
+    settings = Settings(
+        api_auth_enabled=True,
+        api_operator_keys="shared-ui-key",
+        api_admin_keys="admin-key",
+    )
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module.settings, "inline_execution", True)
+    monkeypatch.setattr(
+        api_module,
+        "verify_flowpilot_gateway_session",
+        lambda token: api_module.GatewaySessionLifetime(
+            600,
+            api_module.hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        ),
+    )
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "_execute_inline_background", lambda *args, **kwargs: None)
+
+    with TestClient(api_module.app) as client:
+        created = client.post(
+            "/api/v1/runs",
+            headers={
+                "X-API-Key": "shared-ui-key",
+                "X-LLM-Gateway-Token": "verified-gateway-token",
+            },
+            json={"workflow": "competitor", "payload": {}},
+        )
+        assert created.status_code == 202
+        run_id = created.json()["run_id"]
+
+        same_owner = client.get(
+            f"/api/v1/runs/{run_id}",
+            headers={
+                "X-API-Key": "shared-ui-key",
+                "X-LLM-Gateway-Token": "verified-gateway-token",
+            },
+        )
+        other_owner = client.get(
+            f"/api/v1/runs/{run_id}",
+            headers={
+                "X-API-Key": "shared-ui-key",
+                "X-LLM-Gateway-Token": "another-verified-gateway-token",
+            },
+        )
+
+    assert same_owner.status_code == 200
+    assert other_owner.status_code == 404
+
+
+
+@pytest.mark.parametrize(
+    "gateway_url,allowed_hosts",
+    [
+        ("http://gateway.example/v1", "gateway.example"),
+        ("https://169.254.169.254/latest", "169.254.169.254"),
+        ("https://attacker.example/v1", "portfolio-llm-gateway.onrender.com"),
+        ("https://user:pass@gateway.example/v1", "gateway.example"),
+        ("https://gateway.example/v1?next=https://attacker.example", "gateway.example"),
+    ],
+)
+def test_gateway_verification_rejects_untrusted_urls_before_network(
+    monkeypatch,
+    gateway_url,
+    allowed_hosts,
+):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(api_module.settings, "app_env", "production")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_url", gateway_url)
+    monkeypatch.setattr(api_module.settings, "llm_gateway_allowed_hosts", allowed_hosts)
+
+    def network_must_not_be_called(*args, **kwargs):
+        raise AssertionError("Untrusted Gateway URL reached the network client")
+
+    monkeypatch.setattr(api_module.httpx, "Client", network_must_not_be_called)
+    with pytest.raises(HTTPException) as error:
+        api_module.verify_flowpilot_gateway_session("token")
+    assert error.value.status_code == 503

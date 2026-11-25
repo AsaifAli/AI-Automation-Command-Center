@@ -1,9 +1,12 @@
 
 import asyncio
+import hashlib
+import ipaddress
 import logging
 import time
 import uuid
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
@@ -93,17 +96,75 @@ def queue() -> Queue:
     )
 
 
-def verify_flowpilot_gateway_session(gateway_token: str) -> int:
+class GatewaySessionLifetime(int):
+    """Integer-compatible Gateway TTL carrying its verified opaque owner scope."""
+
+    def __new__(cls, remaining_seconds: int, owner_scope: str):
+        instance = int.__new__(cls, remaining_seconds)
+        instance.owner_scope = owner_scope
+        return instance
+
+
+def verify_flowpilot_gateway_session(gateway_token: str) -> GatewaySessionLifetime:
     """Validate a Gateway bearer and require the FlowPilot project audience.
 
     Returns remaining Gateway-session lifetime in seconds. The token is sent
     only to the Gateway status endpoint and is never logged or persisted here.
     """
     gateway_base = (settings.llm_gateway_url or settings.llm_base_url).strip()
-    if not gateway_base:
+    if not gateway_base or any(char.isspace() for char in gateway_base):
         raise HTTPException(
             status_code=503,
             detail="Gateway BYOK is not configured on the workflow service.",
+        )
+
+    try:
+        parsed_gateway = urlsplit(gateway_base)
+        gateway_host = (parsed_gateway.hostname or "").rstrip(".").lower()
+        gateway_port = parsed_gateway.port
+    except ValueError:
+        raise HTTPException(
+            status_code=503,
+            detail="The configured Gateway URL is invalid.",
+        ) from None
+
+    approved_hosts = {
+        item.strip().rstrip(".").lower()
+        for item in str(settings.llm_gateway_allowed_hosts or "").split(",")
+        if item.strip()
+    }
+    try:
+        gateway_ip = ipaddress.ip_address(gateway_host)
+    except ValueError:
+        gateway_ip = None
+    if gateway_ip is not None and not gateway_ip.is_global:
+        raise HTTPException(
+            status_code=503,
+            detail="The configured Gateway destination is not public.",
+        )
+    is_production = str(settings.app_env).strip().lower() in {"prod", "production"}
+    local_development_host = gateway_host in {"localhost", "127.0.0.1", "::1"}
+    valid_scheme = parsed_gateway.scheme == "https" or (
+        not is_production
+        and local_development_host
+        and parsed_gateway.scheme == "http"
+    )
+    if (
+        not valid_scheme
+        or not gateway_host
+        or (
+            gateway_host not in approved_hosts
+            and not (not is_production and local_development_host)
+        )
+        or (gateway_port not in (None, 443) and parsed_gateway.scheme == "https")
+        or parsed_gateway.username is not None
+        or parsed_gateway.password is not None
+        or parsed_gateway.query
+        or parsed_gateway.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="The configured Gateway host is not approved.",
         )
 
     endpoint = gateway_base.rstrip("/") + "/demo/session/status"
@@ -164,7 +225,17 @@ def verify_flowpilot_gateway_session(gateway_token: str) -> int:
             status_code=401,
             detail="The Gateway session is expiring. Reopen the portfolio demo and retry.",
         )
-    return remaining_seconds
+    owner_scope = session.get("owner_scope")
+    if (
+        not isinstance(owner_scope, str)
+        or len(owner_scope) != 64
+        or any(char not in "0123456789abcdef" for char in owner_scope)
+    ):
+        # Compatibility for Gateway sessions minted before optional Supabase
+        # identity scopes shipped. A session token still receives an isolated
+        # scope; a missing claim never falls back to a shared project scope.
+        owner_scope = hashlib.sha256(gateway_token.encode("utf-8")).hexdigest()
+    return GatewaySessionLifetime(remaining_seconds, owner_scope)
 
 
 @app.on_event("startup")
@@ -440,7 +511,7 @@ def run_workflow(
         default="",
         alias="X-LLM-Gateway-Token",
     ),
-    _: Principal = Depends(
+    principal: Principal = Depends(
         require_permission("runs:execute")
     ),
 ):
@@ -476,7 +547,15 @@ def run_workflow(
                     detail=str(exc),
                 ) from None
 
-    run_id = repo.create_pending_run(request.workflow.value)
+    gateway_owner_scope = (
+        getattr(gateway_session_remaining, "owner_scope", None)
+        if gateway_token and gateway_session_remaining is not None
+        else None
+    )
+    owner_id = gateway_owner_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
+    run_id = repo.create_pending_run(request.workflow.value, owner_id=owner_id)
     payload = dict(request.payload)
     credential_id: str | None = None
 
@@ -563,12 +642,26 @@ def run_workflow(
 )
 def list_pending_approvals(
     limit: int = 50,
-    _: Principal = Depends(require_permission("approvals:decide")),
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("approvals:decide")),
 ):
-    """List pending review requests for authorized reviewers and admins."""
+    """List pending review requests inside the verified owner's scope."""
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
     try:
         safe_limit = min(max(limit, 1), 100)
-        approvals = repo.list_pending_approvals(safe_limit)
+        approvals = repo.list_pending_approvals(
+            safe_limit,
+            owner_id=owner_id,
+            include_all=principal.role == "admin",
+        )
         return {"approvals": approvals, "total": len(approvals)}
     except Exception:
         logger.exception("pending_approvals_lookup_failed")
@@ -585,14 +678,26 @@ def list_pending_approvals(
 )
 def list_runs(
     limit: int = 20,
-    _: Principal = Depends(
-        require_permission("runs:read")
-    ),
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("runs:read")),
 ):
     safe_limit = min(max(limit, 1), 100)
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
 
     try:
-        runs = repo.list_runs(safe_limit)
+        runs = repo.list_runs(
+            safe_limit,
+            owner_id=owner_id,
+            include_all=principal.role == "admin",
+        )
 
         return {
             "runs": runs,
@@ -646,12 +751,24 @@ def clear_run_history(
 )
 def get_run(
     run_id: str,
-    _: Principal = Depends(
-        require_permission("runs:read")
-    ),
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("runs:read")),
 ):
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
     try:
-        result = repo.get_run(run_id)
+        result = repo.get_run(
+            run_id,
+            owner_id=owner_id,
+            include_all=principal.role == "admin",
+        )
 
     except Exception:
         logger.exception(
@@ -681,11 +798,23 @@ def get_run(
 def decide_approval(
     run_id: str,
     request: ApprovalRequest,
-    principal: Principal = Depends(
-        require_permission("approvals:decide")
-    ),
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("approvals:decide")),
 ):
-    result = repo.get_run(run_id)
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
+    result = repo.get_run(
+        run_id,
+        owner_id=owner_id,
+        include_all=principal.role == "admin",
+    )
 
     if not result:
         raise HTTPException(

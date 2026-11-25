@@ -55,6 +55,7 @@ def _normalize_usage(usage: Any) -> dict[str, Any] | None:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_runs (
     run_id UUID PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT 'legacy',
     workflow VARCHAR(50) NOT NULL,
     status VARCHAR(50) NOT NULL,
     output_json JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
 );
 -- Lightweight in-place migration for databases created by earlier portfolio releases.
 -- This keeps `docker compose up` upgrade-safe without requiring users to delete data.
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'legacy';
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS output_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS evidence_json JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS duration_ms INTEGER NOT NULL DEFAULT 0;
@@ -75,6 +77,7 @@ ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS usage_json JSONB;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS warnings_json JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS error TEXT;
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_created_at ON workflow_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_owner_created_at ON workflow_runs(owner_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON workflow_runs(status);
 CREATE TABLE IF NOT EXISTS approvals (
     approval_id UUID PRIMARY KEY,
@@ -133,11 +136,12 @@ class Repository:
                 (datetime.now(UTC),),
             )
 
-    def create_pending_run(self, workflow: str) -> str:
+    def create_pending_run(self, workflow: str, owner_id: str = "legacy") -> str:
         run_id = str(uuid.uuid4())
         now = datetime.now(UTC)
         record = {
             "run_id": run_id,
+            "owner_id": owner_id,
             "workflow": workflow,
             "status": "queued",
             "output": {},
@@ -153,8 +157,8 @@ class Repository:
             return run_id
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO workflow_runs(run_id,workflow,status,created_at) VALUES (%s,%s,%s,%s)",
-                (run_id, workflow, "queued", now),
+                "INSERT INTO workflow_runs(run_id,owner_id,workflow,status,created_at) VALUES (%s,%s,%s,%s,%s)",
+                (run_id, owner_id, workflow, "queued", now),
             )
             conn.execute(
                 "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
@@ -309,22 +313,55 @@ class Repository:
                 (result["run_id"], result["status"], json.dumps({"duration_ms": result.get("duration_ms", 0)}), now),
             )
 
-    def get_run(self, run_id: str) -> dict[str, Any] | None:
+    def get_run(
+        self,
+        run_id: str,
+        *,
+        owner_id: str | None = None,
+        include_all: bool = False,
+    ) -> dict[str, Any] | None:
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
-                return copy.deepcopy(run) if run else None
+                if run is None:
+                    return None
+                if not include_all and owner_id is not None and run.get("owner_id", "legacy") != owner_id:
+                    return None
+                return copy.deepcopy(run)
+        query = "SELECT * FROM workflow_runs WHERE run_id=%s"
+        params: tuple[Any, ...] = (run_id,)
+        if not include_all and owner_id is not None:
+            query += " AND owner_id=%s"
+            params = (run_id, owner_id)
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM workflow_runs WHERE run_id=%s", (run_id,)).fetchone()
+            row = conn.execute(query, params).fetchone()
         return self._row_to_run(row) if row else None
 
-    def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_runs(
+        self,
+        limit: int = 20,
+        *,
+        owner_id: str | None = None,
+        include_all: bool = False,
+    ) -> list[dict[str, Any]]:
+        safe_limit = min(max(int(limit), 1), 100)
         if self._use_memory:
             with self._memory_lock:
-                runs = sorted(self._memory_runs.values(), key=lambda item: item["created_at"], reverse=True)[:limit]
+                records = list(self._memory_runs.values())
+                if not include_all and owner_id is not None:
+                    records = [run for run in records if run.get("owner_id", "legacy") == owner_id]
+                runs = sorted(records, key=lambda item: item["created_at"], reverse=True)[:safe_limit]
                 return copy.deepcopy(runs)
+        query = "SELECT * FROM workflow_runs"
+        params: tuple[Any, ...]
+        if not include_all and owner_id is not None:
+            query += " WHERE owner_id=%s ORDER BY created_at DESC LIMIT %s"
+            params = (owner_id, safe_limit)
+        else:
+            query += " ORDER BY created_at DESC LIMIT %s"
+            params = (safe_limit,)
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM workflow_runs ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [self._row_to_run(row) for row in rows]
 
     def clear_history(self) -> int:
@@ -347,8 +384,14 @@ class Repository:
             result = conn.execute("DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running', 'awaiting_approval') RETURNING run_id")
             return sum(1 for _ in result)
 
-    def list_pending_approvals(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Return runs paused at an approval gate, newest first."""
+    def list_pending_approvals(
+        self,
+        limit: int = 50,
+        *,
+        owner_id: str | None = None,
+        include_all: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return only this owner's pending approvals unless explicitly privileged."""
         safe_limit = min(max(int(limit), 1), 100)
         if self._use_memory:
             with self._memory_lock:
@@ -357,17 +400,26 @@ class Repository:
                     for run in self._memory_runs.values()
                     if run.get("status") == "awaiting_approval"
                     and isinstance(run.get("output", {}).get("approval"), dict)
+                    and (
+                        include_all
+                        or owner_id is None
+                        or run.get("owner_id", "legacy") == owner_id
+                    )
                 ]
             runs.sort(key=lambda item: item["created_at"], reverse=True)
         else:
-            with self._connect() as conn:
-                rows = conn.execute(
-                    """SELECT * FROM workflow_runs
+            query = """SELECT * FROM workflow_runs
                        WHERE status='awaiting_approval'
-                         AND output_json ? 'approval'
-                       ORDER BY created_at DESC LIMIT %s""",
-                    (safe_limit,),
-                ).fetchall()
+                         AND output_json ? 'approval'"""
+            params: tuple[Any, ...]
+            if not include_all and owner_id is not None:
+                query += " AND owner_id=%s"
+                params = (owner_id, safe_limit)
+            else:
+                params = (safe_limit,)
+            query += " ORDER BY created_at DESC LIMIT %s"
+            with self._connect() as conn:
+                rows = conn.execute(query, params).fetchall()
             runs = [self._row_to_run(row) for row in rows]
         return [
             {

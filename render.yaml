@@ -13,6 +13,13 @@ services:
     envVars:
       - key: APP_ENV
         value: production
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      # Optional Supabase PostgreSQL connection for durable, owner-scoped run history.
+      - key: DATABASE_URL
+        sync: false
       - key: APP_VERSION
         value: 3.5.0
       - key: DEMO_MODE
@@ -41,6 +48,8 @@ services:
         sync: false
       - key: LLM_GATEWAY_URL
         sync: false
+      - key: LLM_GATEWAY_ALLOWED_HOSTS
+        value: portfolio-llm-gateway.onrender.com
       - key: REQUEST_TIMEOUT_SECONDS
         value: "60"
       - key: MAX_RETRIES
