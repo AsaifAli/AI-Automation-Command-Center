@@ -13,10 +13,11 @@ class FakeRepo:
     def init_db(self):
         return None
 
-    def create_pending_run(self, workflow):
+    def create_pending_run(self, workflow, owner_id="legacy"):
         requires_approval = workflow in {"content", "outreach"}
         self.run = {
             "run_id": "11111111-1111-1111-1111-111111111111",
+            "owner_id": owner_id,
             "workflow": workflow,
             "status": "awaiting_approval" if requires_approval else "queued",
             "output": ({"approval": {"status": "pending", "action": "send_outreach" if workflow == "outreach" else "publish_content", "title": "Review requested", "summary": "Test approval request", "items": []}} if requires_approval else {}),
@@ -28,11 +29,27 @@ class FakeRepo:
         }
         return self.run["run_id"]
 
-    def get_run(self, run_id):
-        return self.run if self.run and self.run["run_id"] == run_id else None
+    def get_run(self, run_id, *, owner_id=None, include_all=False):
+        if not self.run or self.run["run_id"] != run_id:
+            return None
+        if (
+            not include_all
+            and owner_id is not None
+            and self.run.get("owner_id", "legacy") != owner_id
+        ):
+            return None
+        return self.run
 
-    def list_runs(self, limit):
-        return [self.run] if self.run else []
+    def list_runs(self, limit, *, owner_id=None, include_all=False):
+        if not self.run:
+            return []
+        if (
+            not include_all
+            and owner_id is not None
+            and self.run.get("owner_id", "legacy") != owner_id
+        ):
+            return []
+        return [self.run][:limit]
 
     def clear_history(self):
         self.run = None
