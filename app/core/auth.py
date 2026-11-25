@@ -1,5 +1,4 @@
 
-import hashlib
 import hmac
 from collections.abc import Callable
 from dataclasses import dataclass
