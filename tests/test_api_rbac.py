@@ -623,3 +623,15 @@ def test_gateway_verification_rejects_untrusted_urls_before_network(
     with pytest.raises(HTTPException) as error:
         api_module.verify_flowpilot_gateway_session("token")
     assert error.value.status_code == 503
+
+
+
+def test_schema_backfills_pre_owner_runs_to_the_existing_control_plane():
+    from app.storage.repository import SCHEMA
+
+    assert "owner_id TEXT NOT NULL DEFAULT 'legacy'" in SCHEMA
+    assert (
+        "UPDATE workflow_runs\n"
+        "SET owner_id = 'flowpilot-control-plane'\n"
+        "WHERE owner_id = 'legacy';"
+    ) in SCHEMA

@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
 -- Lightweight in-place migration for databases created by earlier portfolio releases.
 -- This keeps `docker compose up` upgrade-safe without requiring users to delete data.
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'legacy';
+-- Before owner scopes existed, all authorized API roles shared one private control plane.
+-- Backfill those pre-migration rows to that same owner so existing history remains visible.
+UPDATE workflow_runs
+SET owner_id = 'flowpilot-control-plane'
+WHERE owner_id = 'legacy';
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS output_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS evidence_json JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS duration_ms INTEGER NOT NULL DEFAULT 0;
