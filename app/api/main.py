@@ -514,7 +514,7 @@ def _execute_inline_background(
 def _validate_upstash_workflow_payload(raw_payload: object) -> dict:
     """Validate the signed QStash envelope before restoring or executing a run."""
     if not isinstance(raw_payload, dict):
-        raise ValueError("Workflow payload must be an object.")
+        raise TypeError("Workflow payload must be an object.")
     run_id = raw_payload.get("run_id")
     try:
         normalized_run_id = str(uuid.UUID(str(run_id)))
@@ -527,7 +527,7 @@ def _validate_upstash_workflow_payload(raw_payload: object) -> dict:
         raise ValueError("Workflow name is invalid.")
     payload = raw_payload.get("payload")
     if not isinstance(payload, dict):
-        raise ValueError("Workflow input must be an object.")
+        raise TypeError("Workflow input must be an object.")
     owner_id = raw_payload.get("owner_id")
     if not isinstance(owner_id, str) or not owner_id.strip() or len(owner_id) > 256:
         raise ValueError("Workflow owner scope is invalid.")
