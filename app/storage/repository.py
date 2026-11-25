@@ -119,7 +119,7 @@ ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE gateway_job_credentials ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE workflow_runs, approvals, audit_events, gateway_job_credentials FROM PUBLIC;
-DO $
+DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
         EXECUTE 'REVOKE ALL ON TABLE workflow_runs, approvals, audit_events, gateway_job_credentials FROM anon';
@@ -128,7 +128,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON TABLE workflow_runs, approvals, audit_events, gateway_job_credentials FROM authenticated';
     END IF;
 END
-$;
+$$;
 """
 
 
