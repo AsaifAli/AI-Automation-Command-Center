@@ -29,7 +29,7 @@ This is a source/config review, not a penetration test or production certificati
 |04|File upload|N/A for the observed FastAPI API route set; validate any future document/upload workflow inputs before parsing|
 |05|SSRF|PASS for intelligence feeds — DNS/private-address checks, redirects disabled, trust_env false and response size cap have regression tests; Gateway URL is a separate configured endpoint|
 |06|BOLA/IDOR|PARTIAL — run IDs are globally readable by authorized roles; safe only for the single-owner private control-plane model|
-|07|Rate limiting|PARTIAL/FAIL — API key RBAC exists, but distributed per-IP/principal quotas are not confirmed|
+|07|Rate limiting|PARTIAL — IP + API-key-fingerprint quotas cover mutating API routes; production counters are Redis-shared, and edge/WAF limits remain recommended|
 |08|Password hashing|N/A — no local username/password login|
 |09|MFA|EXTERNAL — enable for GitHub, Render, database, Redis and provider administrator accounts|
 |10|Server-side permissions|PASS — route permission dependencies and role allowlists are enforced in the API|
