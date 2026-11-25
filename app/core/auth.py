@@ -1,4 +1,5 @@
 
+import hashlib
 import hmac
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ class Principal:
     subject: str
     role: str
     permissions: frozenset[str]
+    owner_id: str = ""
 
     def can(self, permission: str) -> bool:
         return (
@@ -70,6 +72,7 @@ def authenticate_api_key(
             subject="Local development",
             role="admin",
             permissions=ROLE_PERMISSIONS["admin"],
+            owner_id="local-development",
         )
 
     if not api_key:
@@ -116,6 +119,8 @@ def authenticate_api_key(
                     subject=subject,
                     role=role,
                     permissions=ROLE_PERMISSIONS[role],
+                    # Never store or expose the supplied credential itself.
+                    owner_id=hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
                 )
 
     raise HTTPException(
