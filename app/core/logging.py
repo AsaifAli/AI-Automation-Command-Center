@@ -1,3 +1,4 @@
+# ruff: noqa: I001
 import json
 import logging
 import re
@@ -27,7 +28,7 @@ class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             message = record.getMessage()
-        except Exception:
+        except (TypeError, ValueError, KeyError, IndexError, AttributeError):
             message = "[unformattable log message]"
         record.msg = redact_sensitive_text(message)
         record.args = ()
