@@ -22,6 +22,8 @@ def test_production_rate_limits_use_shared_redis_keys(monkeypatch):
     monkeypatch.setattr(rate_limit, "_redis_client", lambda _url: client)
     settings = Settings(
         app_env="production",
+        api_auth_enabled=True,
+        api_admin_keys="test-admin-key",
         inline_execution=False,
         redis_url="redis://redis.example:6379/0",
         api_write_ip_rate_limit_per_minute=5,
