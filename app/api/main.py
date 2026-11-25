@@ -5,6 +5,7 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
@@ -110,10 +111,50 @@ def verify_flowpilot_gateway_session(gateway_token: str) -> GatewaySessionLifeti
     only to the Gateway status endpoint and is never logged or persisted here.
     """
     gateway_base = (settings.llm_gateway_url or settings.llm_base_url).strip()
-    if not gateway_base:
+    if not gateway_base or any(char.isspace() for char in gateway_base):
         raise HTTPException(
             status_code=503,
             detail="Gateway BYOK is not configured on the workflow service.",
+        )
+
+    try:
+        parsed_gateway = urlsplit(gateway_base)
+        gateway_host = (parsed_gateway.hostname or "").rstrip(".").lower()
+        gateway_port = parsed_gateway.port
+    except ValueError:
+        raise HTTPException(
+            status_code=503,
+            detail="The configured Gateway URL is invalid.",
+        ) from None
+
+    approved_hosts = {
+        item.strip().rstrip(".").lower()
+        for item in str(settings.llm_gateway_allowed_hosts or "").split(",")
+        if item.strip()
+    }
+    is_production = str(settings.app_env).strip().lower() in {"prod", "production"}
+    local_development_host = gateway_host in {"localhost", "127.0.0.1", "::1"}
+    valid_scheme = parsed_gateway.scheme == "https" or (
+        not is_production
+        and local_development_host
+        and parsed_gateway.scheme == "http"
+    )
+    if (
+        not valid_scheme
+        or not gateway_host
+        or (
+            gateway_host not in approved_hosts
+            and not (not is_production and local_development_host)
+        )
+        or (gateway_port not in (None, 443) and parsed_gateway.scheme == "https")
+        or parsed_gateway.username is not None
+        or parsed_gateway.password is not None
+        or parsed_gateway.query
+        or parsed_gateway.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="The configured Gateway host is not approved.",
         )
 
     endpoint = gateway_base.rstrip("/") + "/demo/session/status"
