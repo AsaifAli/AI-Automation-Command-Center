@@ -384,8 +384,14 @@ class Repository:
             result = conn.execute("DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running', 'awaiting_approval') RETURNING run_id")
             return sum(1 for _ in result)
 
-    def list_pending_approvals(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Return runs paused at an approval gate, newest first."""
+    def list_pending_approvals(
+        self,
+        limit: int = 50,
+        *,
+        owner_id: str | None = None,
+        include_all: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return only this owner's pending approvals unless explicitly privileged."""
         safe_limit = min(max(int(limit), 1), 100)
         if self._use_memory:
             with self._memory_lock:
@@ -394,17 +400,26 @@ class Repository:
                     for run in self._memory_runs.values()
                     if run.get("status") == "awaiting_approval"
                     and isinstance(run.get("output", {}).get("approval"), dict)
+                    and (
+                        include_all
+                        or owner_id is None
+                        or run.get("owner_id", "legacy") == owner_id
+                    )
                 ]
             runs.sort(key=lambda item: item["created_at"], reverse=True)
         else:
-            with self._connect() as conn:
-                rows = conn.execute(
-                    """SELECT * FROM workflow_runs
+            query = """SELECT * FROM workflow_runs
                        WHERE status='awaiting_approval'
-                         AND output_json ? 'approval'
-                       ORDER BY created_at DESC LIMIT %s""",
-                    (safe_limit,),
-                ).fetchall()
+                         AND output_json ? 'approval'"""
+            params: tuple[Any, ...]
+            if not include_all and owner_id is not None:
+                query += " AND owner_id=%s"
+                params = (owner_id, safe_limit)
+            else:
+                params = (safe_limit,)
+            query += " ORDER BY created_at DESC LIMIT %s"
+            with self._connect() as conn:
+                rows = conn.execute(query, params).fetchall()
             runs = [self._row_to_run(row) for row in rows]
         return [
             {
