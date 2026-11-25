@@ -69,9 +69,11 @@ services:
       - key: LLM_GATEWAY_URL
         sync: false
       - key: REQUEST_TIMEOUT_SECONDS
-        value: "60"
+        value: "90"
       - key: MAX_RETRIES
-        value: "1"
+        value: "2"
+      - key: WORKFLOW_JOB_TIMEOUT_SECONDS
+        value: "600"
       - key: CORS_ORIGINS
         sync: false
       - key: API_REVIEWER_NAME
@@ -118,7 +120,7 @@ services:
     plan: starter
     region: singapore
     autoDeployTrigger: checksPass
-    maxShutdownDelaySeconds: 120
+    maxShutdownDelaySeconds: 300
     dockerCommand: python -m app.worker
     envVars:
       - key: APP_NAME
@@ -169,9 +171,9 @@ services:
       - key: LLM_GATEWAY_URL
         sync: false
       - key: REQUEST_TIMEOUT_SECONDS
-        value: "60"
+        value: "90"
       - key: MAX_RETRIES
-        value: "1"
+        value: "2"
       - key: DEMO_CONFIG_PATH
         value: /app/config.json
       - key: INTELLIGENCE_TIMEOUT_SECONDS
