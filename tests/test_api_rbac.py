@@ -50,10 +50,16 @@ class FakeRepo:
             runs = [run for run in runs if run.get("owner_id", "legacy") == owner_id]
         return runs[:limit]
 
-    def list_pending_approvals(self, limit):
+    def list_pending_approvals(self, limit, *, owner_id=None, include_all=False):
         return [
             {"run_id": run["run_id"], "workflow": run["workflow"], "status": run["status"], "created_at": run["created_at"], "approval": run["output"].get("approval", {}), "output": run["output"]}
-            for run in self.runs.values() if run["status"] == "awaiting_approval"
+            for run in self.runs.values()
+            if run["status"] == "awaiting_approval"
+            and (
+                include_all
+                or owner_id is None
+                or run.get("owner_id", "legacy") == owner_id
+            )
         ][:limit]
 
     def clear_history(self):
