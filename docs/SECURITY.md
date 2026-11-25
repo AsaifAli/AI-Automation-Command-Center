@@ -14,7 +14,7 @@ This is a source/config review, not a penetration test or production certificati
 
 ## Findings requiring attention
 1. **Log redaction (Medium/High): PARTIALLY PATCHED in this branch.** `app/core/logging.py` redacts common bearer tokens, API/access/refresh keys, passwords and OpenAI-style keys before JSON serialization. `tests/test_logging_security.py` covers representative log messages. This pattern-based filter is defense in depth, not a substitute for never logging request bodies, prompts or credentials; broader call-site review remains required.
-2. **Rate limiting (High): PARTIALLY PATCHED in this branch.** Mutating `/api/v1/*` routes now have per-IP and API-key-fingerprint quotas (`app/core/rate_limit.py`). Production uses Redis-backed atomic fixed-window counters and fails closed if Redis is unavailable; development/inline mode uses an in-process sliding window. Add edge/WAF limits as an additional perimeter control.
+2. **Rate limiting (High): PATCHED with deployment-mode caveat.** Mutating `/api/v1/*` routes have per-IP and API-key-fingerprint quotas (`app/core/rate_limit.py`). The active free-tier `render.yaml` defines inline execution, so that deployment uses bounded in-process counters on its single API instance. The queued-worker topology in `render.production.yaml` uses Redis-backed atomic fixed-window counters and fails closed if Redis is unavailable. Add edge/WAF limits as an additional perimeter control.
 3. **Read authorization / BOLA boundary (High where multiple principals are untrusted):** `runs:read` grants access to the global run list and `get_run(run_id)`; there is no per-user or tenant ownership field in the observed API path. This may be intentional for a single-owner private agency OS, but must not be presented as multi-tenant isolation. Keep the API private and add owner/tenant scoping before sharing across customers.
 4. **Gateway URL validation (High):** Gateway verification uses an environment-configured URL and disables redirects/proxy trust, but validate that production URL is HTTPS and matches the approved Gateway host. Never accept it from workflow payloads.
 5. **Production readiness leakage (Low/Medium):** readiness catches exceptions and logs stack traces; response is generic, which is appropriate. Restrict diagnostic logs to operators and ensure secrets are redacted.
@@ -29,7 +29,7 @@ This is a source/config review, not a penetration test or production certificati
 |04|File upload|N/A for the observed FastAPI API route set; validate any future document/upload workflow inputs before parsing|
 |05|SSRF|PASS for intelligence feeds — DNS/private-address checks, redirects disabled, trust_env false and response size cap have regression tests; Gateway URL is a separate configured endpoint|
 |06|BOLA/IDOR|PARTIAL — run IDs are globally readable by authorized roles; safe only for the single-owner private control-plane model|
-|07|Rate limiting|PARTIAL — IP + API-key-fingerprint quotas cover mutating API routes; production counters are Redis-shared, and edge/WAF limits remain recommended|
+|07|Rate limiting|PARTIAL — IP + API-key-fingerprint quotas cover mutating routes; current inline demo uses process-local counters, while queued production topology uses Redis-shared counters. Edge/WAF limits remain recommended|
 |08|Password hashing|N/A — no local username/password login|
 |09|MFA|EXTERNAL — enable for GitHub, Render, database, Redis and provider administrator accounts|
 |10|Server-side permissions|PASS — route permission dependencies and role allowlists are enforced in the API|
@@ -43,6 +43,10 @@ This is a source/config review, not a penetration test or production certificati
 |18|Source maps|N/A — Streamlit app, no client JS source-map build|
 |19|Clean production logs|PARTIAL — common credential patterns are redacted in JSON logging and tested; prohibit raw payload logging and extend PII review|
 |20|Dependency patching|UNVERIFIED — run resolver-aware Python audit and container image scan against the deployment image|
+
+## Active deployment topology
+- The connected free-tier API service is deployed from `render.yaml`, which selects inline execution and ephemeral in-memory run state. In this mode, quotas are process-local and reset on instance restart; the current service is one instance.
+- The separate `render.production.yaml` describes a PostgreSQL + Redis + worker topology. Its Redis-backed quota path applies when queued execution is enabled; do not assume those resources exist in the free-tier service.
 
 ## External deployment actions
 - Confirm Render production `CORS_ORIGINS` contains only the actual UI origin(s).
