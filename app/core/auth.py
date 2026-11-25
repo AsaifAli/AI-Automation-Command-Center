@@ -118,8 +118,9 @@ def authenticate_api_key(
                     subject=subject,
                     role=role,
                     permissions=ROLE_PERMISSIONS[role],
-                    # Never store or expose the supplied credential itself.
-                    owner_id=hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+                    # API role keys belong to the same private control plane.
+                    # BYOK sessions override this with the verified Gateway owner scope.
+                    owner_id="flowpilot-control-plane",
                 )
 
     raise HTTPException(
