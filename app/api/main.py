@@ -1,12 +1,14 @@
 
 import asyncio
+import base64
 import hashlib
 import ipaddress
+import json
 import logging
 import time
 import uuid
 from datetime import UTC, datetime
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
@@ -37,7 +39,7 @@ from app.models.schemas import (
     RunRequest,
     WorkflowResult,
 )
-from app.storage.repository import Repository
+from app.storage.repository import Repository, _json_dumps
 from app.workers.jobs import execute_run
 
 settings = get_settings()
@@ -341,13 +343,19 @@ def root():
         else "postgresql"
     )
 
-    architecture = (
-        "api -> in-process background execution -> ephemeral in-memory state"
-        if settings.inline_execution and not settings.database_url.strip()
-        else "api -> execution -> persistent postgres state"
-        if settings.database_url.strip()
-        else "api -> execution -> ephemeral in-memory state"
-    )
+    if settings.qstash_workflow_enabled:
+        architecture = (
+            "api -> QStash Workflow -> signed execution callback -> "
+            + ("PostgreSQL-backed run state" if settings.database_url.strip() else "ephemeral in-memory run state")
+        )
+    else:
+        architecture = (
+            "api -> in-process background execution -> ephemeral in-memory state"
+            if settings.inline_execution and not settings.database_url.strip()
+            else "api -> execution -> persistent postgres state"
+            if settings.database_url.strip()
+            else "api -> execution -> ephemeral in-memory state"
+        )
 
     return {
         "service": settings.app_name,
@@ -370,7 +378,9 @@ def health():
         version=settings.app_version,
         demo_mode=settings.demo_mode,
         execution_mode=(
-            "inline_background" if settings.inline_execution else "redis_worker"
+            "upstash_workflow"
+            if settings.qstash_workflow_enabled
+            else "inline_background" if settings.inline_execution else "redis_worker"
         ),
     )
 
@@ -382,10 +392,12 @@ def ready():
         repo.metrics()
 
         redis_status = (
-            "inline" if settings.inline_execution else "available"
+            "upstash_workflow"
+            if settings.qstash_workflow_enabled
+            else "inline" if settings.inline_execution else "available"
         )
 
-        if not settings.inline_execution:
+        if not settings.inline_execution and not settings.qstash_workflow_enabled:
             Redis.from_url(settings.redis_url).ping()
 
         return {
@@ -498,13 +510,157 @@ def _execute_inline_background(
         reset_llm_gateway_token(context_token)
 
 
+
+def _validate_upstash_workflow_payload(raw_payload: object) -> dict:
+    """Validate the signed QStash envelope before restoring or executing a run."""
+    if not isinstance(raw_payload, dict):
+        raise TypeError("Workflow payload must be an object.")
+    run_id = raw_payload.get("run_id")
+    try:
+        normalized_run_id = str(uuid.UUID(str(run_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("Workflow run identifier is invalid.") from exc
+    if normalized_run_id != run_id:
+        raise ValueError("Workflow run identifier must be a canonical UUID.")
+    workflow = raw_payload.get("workflow")
+    if workflow not in {"content", "competitor", "outreach", "kpi"}:
+        raise ValueError("Workflow name is invalid.")
+    payload = raw_payload.get("payload")
+    if not isinstance(payload, dict):
+        raise TypeError("Workflow input must be an object.")
+    owner_id = raw_payload.get("owner_id")
+    if not isinstance(owner_id, str) or not owner_id.strip() or len(owner_id) > 256:
+        raise ValueError("Workflow owner scope is invalid.")
+    encrypted_value = raw_payload.get("gateway_token_ciphertext")
+    encrypted_token = None
+    ttl_seconds = None
+    if encrypted_value is not None:
+        if not isinstance(encrypted_value, str) or len(encrypted_value) > 16_384:
+            raise ValueError("Encrypted Gateway credential is invalid.")
+        try:
+            encrypted_token = base64.b64decode(
+                encrypted_value.encode("ascii"), altchars=b"-_", validate=True
+            )
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise ValueError("Encrypted Gateway credential is invalid.") from exc
+        ttl_seconds = raw_payload.get("gateway_token_ttl_seconds")
+        if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or not 60 <= ttl_seconds <= 1800:
+            raise ValueError("Gateway credential lifetime is invalid.")
+    return {
+        "run_id": normalized_run_id,
+        "workflow": workflow,
+        "payload": payload,
+        "owner_id": owner_id,
+        "encrypted_gateway_token": encrypted_token,
+        "gateway_token_ttl_seconds": ttl_seconds,
+    }
+
+
+async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
+    """Trigger the signed Workflow route through the documented QStash REST API."""
+    workflow_url = settings.upstash_workflow_url.rstrip("/") + "/internal/qstash/workflow"
+    trigger_url = settings.qstash_url.rstrip("/") + "/v2/trigger/" + quote(workflow_url, safe="")
+    headers = {
+        "Authorization": f"Bearer {settings.qstash_token}",
+        "Content-Type": "application/json",
+        "Upstash-Workflow-RunId": f"flowpilot-{run_id}",
+        "Upstash-Retries": str(settings.qstash_workflow_retries),
+        "Upstash-Flow-Control-Key": "flowpilot-global",
+        "Upstash-Flow-Control-Value": f"parallelism={settings.qstash_workflow_parallelism}",
+        "Upstash-Label": "flowpilot",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False, trust_env=False) as client:
+            response = await client.post(trigger_url, headers=headers, json=envelope)
+    except httpx.HTTPError as exc:
+        raise RuntimeError("QStash could not accept the workflow request.") from exc
+    if not 200 <= response.status_code < 300:
+        raise RuntimeError("QStash rejected the workflow request.")
+    try:
+        workflow_run_id = response.json().get("workflowRunId")
+    except (ValueError, AttributeError):
+        workflow_run_id = None
+    if not isinstance(workflow_run_id, str) or not workflow_run_id:
+        raise RuntimeError("QStash returned an invalid workflow acknowledgement.")
+    return workflow_run_id
+
+
+if settings.qstash_workflow_enabled:
+    from upstash_workflow import AsyncWorkflowContext
+    from upstash_workflow.fastapi import Serve
+
+    _workflow_serve = Serve(app)
+    _workflow_environment = {
+        "QSTASH_TOKEN": settings.qstash_token,
+        "QSTASH_CURRENT_SIGNING_KEY": settings.qstash_current_signing_key,
+        "QSTASH_NEXT_SIGNING_KEY": settings.qstash_next_signing_key,
+        "QSTASH_URL": settings.qstash_url,
+    }
+
+    async def _upstash_workflow_failure(
+        context: AsyncWorkflowContext[dict],
+        fail_status: int,
+        fail_response: str,
+        fail_headers: dict,
+    ) -> None:
+        # Do not log or persist upstream response bodies, which may expose provider details.
+        try:
+            data = _validate_upstash_workflow_payload(context.request_payload)
+            await asyncio.to_thread(repo.ensure_pending_run, data["run_id"], data["workflow"], data["owner_id"])
+            await asyncio.to_thread(repo.save_result, {
+                "run_id": data["run_id"],
+                "workflow": data["workflow"],
+                "status": "failed",
+                "output": {
+                    "error": "Workflow execution failed after automatic retries.",
+                    "recovery": "Check the workflow input or provider session, then submit a new run.",
+                },
+                "evidence": [],
+                "duration_ms": 0,
+                "created_at": datetime.now(UTC),
+                "usage": None,
+                "warnings": ["Upstash Workflow exhausted its configured execution retries."],
+            })
+            logger.warning("upstash_workflow_exhausted_retries run_id=%s status=%s", data["run_id"], int(fail_status))
+        except Exception:
+            logger.exception("upstash_workflow_failure_callback_failed")
+
+    @_workflow_serve.post(
+        "/internal/qstash/workflow",
+        base_url=settings.upstash_workflow_url,
+        retries=settings.qstash_workflow_retries,
+        env=_workflow_environment,
+        failure_function=_upstash_workflow_failure,
+    )
+    async def _execute_upstash_workflow(context: AsyncWorkflowContext[dict]) -> None:
+        data = _validate_upstash_workflow_payload(context.request_payload)
+        await asyncio.to_thread(repo.ensure_pending_run, data["run_id"], data["workflow"], data["owner_id"])
+
+        async def _execute_step() -> dict:
+            result = await asyncio.to_thread(
+                execute_run,
+                data["run_id"],
+                data["workflow"],
+                data["payload"],
+                encrypted_gateway_token=data["encrypted_gateway_token"],
+                gateway_token_ttl_seconds=data["gateway_token_ttl_seconds"],
+                persist_success=False,
+                persist_failure=False,
+            )
+            return json.loads(_json_dumps(result))
+
+        result = await context.run("execute-flowpilot-run", _execute_step)
+        # Persist outside context.run so a replay can restore local UI state after a Render wake.
+        await asyncio.to_thread(repo.save_result, result)
+
+
 @app.post(
     "/api/v1/runs",
     response_model=WorkflowResult,
     status_code=202,
     tags=["workflows"],
 )
-def run_workflow(
+async def run_workflow(
     request: RunRequest,
     background_tasks: BackgroundTasks,
     llm_gateway_token: str = Header(
@@ -526,7 +682,15 @@ def run_workflow(
                 detail="The Gateway session token is invalid.",
             )
         gateway_session_remaining = verify_flowpilot_gateway_session(gateway_token)
-        if not settings.inline_execution:
+        if settings.qstash_workflow_enabled:
+            credential_ttl = min(settings.gateway_job_credential_ttl_seconds, int(gateway_session_remaining))
+            try:
+                encrypted_gateway_token = GatewayCredentialVault(
+                    settings.gateway_job_credential_encryption_key, credential_ttl
+                ).encrypt(gateway_token)
+            except GatewayCredentialError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from None
+        elif not settings.inline_execution:
             if not settings.database_url.strip():
                 raise HTTPException(
                     status_code=503,
@@ -555,11 +719,59 @@ def run_workflow(
     owner_id = gateway_owner_scope or principal.owner_id or hashlib.sha256(
         principal.subject.encode("utf-8")
     ).hexdigest()
+    if settings.qstash_workflow_enabled:
+        submitted_payload_size = len(
+            json.dumps(request.payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        )
+        if submitted_payload_size > settings.qstash_workflow_max_payload_bytes - 20_000:
+            raise HTTPException(status_code=413, detail="Workflow payload is too large for background delivery.")
+
     run_id = repo.create_pending_run(request.workflow.value, owner_id=owner_id)
     payload = dict(request.payload)
     credential_id: str | None = None
 
-    if settings.inline_execution:
+    if settings.qstash_workflow_enabled:
+        credential_ttl = (
+            min(settings.gateway_job_credential_ttl_seconds, int(gateway_session_remaining))
+            if gateway_session_remaining is not None else None
+        )
+        envelope = {
+            "run_id": run_id,
+            "workflow": request.workflow.value,
+            "payload": payload,
+            "owner_id": owner_id,
+            "gateway_token_ciphertext": (
+                base64.urlsafe_b64encode(encrypted_gateway_token).decode("ascii")
+                if encrypted_gateway_token is not None else None
+            ),
+            "gateway_token_ttl_seconds": credential_ttl,
+        }
+        try:
+            await _trigger_upstash_workflow(envelope, run_id)
+        except Exception:
+            logger.exception("upstash_workflow_dispatch_failed run_id=%s", run_id)
+            try:
+                repo.save_result({
+                    "run_id": run_id,
+                    "workflow": request.workflow.value,
+                    "status": "failed",
+                    "output": {
+                        "error": "Workflow could not be queued.",
+                        "recovery": "QStash did not accept the request. Retry after checking the workflow connection.",
+                    },
+                    "evidence": [],
+                    "duration_ms": 0,
+                    "created_at": datetime.now(UTC),
+                    "usage": None,
+                    "warnings": ["Background dispatch failed before execution."],
+                })
+            except Exception:
+                logger.exception("upstash_workflow_dispatch_failure_persist_failed run_id=%s", run_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Workflow could not be queued. Retry after checking the background execution connection.",
+            ) from None
+    elif settings.inline_execution:
         # Do not hold the HTTP request open for a potentially slow model call.
         # This in-process task is appropriate for the Free demo topology, which
         # already uses ephemeral in-memory run storage and does not provision RQ.
@@ -570,7 +782,7 @@ def run_workflow(
             payload,
             gateway_token,
         )
-    else:
+    elif not settings.qstash_workflow_enabled:
         try:
             if encrypted_gateway_token is not None:
                 credential_ttl = min(

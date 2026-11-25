@@ -1,5 +1,6 @@
 
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
 from pydantic import Field, model_validator
@@ -20,6 +21,18 @@ class Settings(BaseSettings):
     queue_name: str = "automation"
     upstash_redis_rest_url: str = ""
     upstash_redis_rest_token: str = Field(default="", repr=False)
+
+    # Optional durable background orchestration via the existing QStash account.
+    qstash_workflow_enabled: bool = False
+    qstash_token: str = Field(default="", repr=False)
+    qstash_current_signing_key: str = Field(default="", repr=False)
+    qstash_next_signing_key: str = Field(default="", repr=False)
+    qstash_url: str = "https://qstash-eu-central-1.upstash.io"
+    upstash_workflow_url: str = ""
+    qstash_workflow_retries: int = Field(default=2, ge=0, le=5)
+    # Cap concurrent Workflow callbacks to avoid saturating the free Render API.
+    qstash_workflow_parallelism: int = Field(default=2, ge=1, le=2)
+    qstash_workflow_max_payload_bytes: int = Field(default=900_000, ge=10_000, le=950_000)
 
     # Demo / LLM
     demo_mode: bool = False
@@ -92,6 +105,51 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_api_credentials(self):
+        if self.qstash_workflow_enabled:
+            if not all((
+                self.qstash_token.strip(),
+                self.qstash_current_signing_key.strip(),
+                self.qstash_next_signing_key.strip(),
+                self.upstash_workflow_url.strip(),
+            )):
+                raise ValueError(
+                    "QSTASH_WORKFLOW_ENABLED requires QSTASH_TOKEN, both QSTASH signing keys, "
+                    "and UPSTASH_WORKFLOW_URL."
+                )
+            qstash_url = urlsplit(self.qstash_url)
+            qstash_host = (qstash_url.hostname or "").lower()
+            if (
+                qstash_url.scheme != "https"
+                or not qstash_host.startswith("qstash-")
+                or not qstash_host.endswith(".upstash.io")
+                or qstash_url.path not in ("", "/")
+                or qstash_url.query
+                or qstash_url.fragment
+                or qstash_url.username is not None
+                or qstash_url.password is not None
+                or qstash_url.port not in (None, 443)
+            ):
+                raise ValueError("QSTASH_URL must be an approved HTTPS Upstash QStash endpoint.")
+            workflow_url = urlsplit(self.upstash_workflow_url)
+            workflow_host = (workflow_url.hostname or "").lower()
+            local_workflow = (
+                self.app_env.strip().lower() not in {"prod", "production"}
+                and workflow_host in {"localhost", "127.0.0.1"}
+                and workflow_url.scheme == "http"
+            )
+            allowed_workflow_ports = (None, 8000) if local_workflow else (None, 443)
+            if (
+                (workflow_url.scheme != "https" and not local_workflow)
+                or not workflow_host
+                or workflow_url.path not in ("", "/")
+                or workflow_url.query
+                or workflow_url.fragment
+                or workflow_url.username is not None
+                or workflow_url.password is not None
+                or workflow_url.port not in allowed_workflow_ports
+            ):
+                raise ValueError("UPSTASH_WORKFLOW_URL must be a public HTTPS service base URL.")
+
         if not 60 <= self.gateway_job_credential_ttl_seconds <= 1800:
             raise ValueError(
                 "GATEWAY_JOB_CREDENTIAL_TTL_SECONDS must be between 60 and 1800"

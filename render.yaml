@@ -17,6 +17,22 @@ services:
         sync: false
       - key: UPSTASH_REDIS_REST_TOKEN
         sync: false
+      # Optional QStash Workflow background execution; credentials are added
+      # privately to the existing ai-automation-api Render service.
+      - key: QSTASH_WORKFLOW_ENABLED
+        sync: false
+      - key: QSTASH_TOKEN
+        sync: false
+      - key: QSTASH_CURRENT_SIGNING_KEY
+        sync: false
+      - key: QSTASH_NEXT_SIGNING_KEY
+        sync: false
+      - key: QSTASH_URL
+        sync: false
+      - key: UPSTASH_WORKFLOW_URL
+        sync: false
+      - key: FLOWPILOT_GATEWAY_CREDENTIAL_KEY
+        sync: false
       # Optional Supabase PostgreSQL connection for durable, owner-scoped run history.
       - key: DATABASE_URL
         sync: false
