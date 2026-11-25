@@ -7,9 +7,9 @@ from typing import Any
 
 
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\\s*[:=]\\s*bearer\\s+)[^\\s,;]+"),
-    re.compile(r"(?i)(\\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\\b\\s*[:=]\\s*)[^\\s,;]+"),
-    re.compile(r"(?i)\\bsk-[A-Za-z0-9_-]{16,}\\b"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\b\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)\bsk-[A-Za-z0-9_-]{16,}\b"),
 )
 
 
@@ -17,7 +17,7 @@ def redact_sensitive_text(value: str) -> str:
     """Redact common credential formats before they reach stdout/APM logs."""
     redacted = value
     for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub(r"\\1[REDACTED]" if pattern.groups else "[REDACTED]", redacted)
+        redacted = pattern.sub(r"\1[REDACTED]" if pattern.groups else "[REDACTED]", redacted)
     return redacted
 
 
