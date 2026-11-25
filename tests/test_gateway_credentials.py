@@ -84,28 +84,6 @@ def test_qstash_workflow_rejects_untrusted_trigger_hosts():
         )
 
 
-def test_repository_workflow_run_restoration_is_idempotent_and_owner_scoped():
-    import uuid
-
-    from app.core.config import Settings
-    from app.storage.repository import Repository
-
-    repository = Repository(Settings(_env_file=None, database_url=""))
-    run_id = str(uuid.uuid4())
-    repository.ensure_pending_run(run_id, "competitor", "owner-a")
-    repository.mark_running(run_id)
-    repository.ensure_pending_run(run_id, "competitor", "owner-a")
-
-    run = repository.get_run(run_id, owner_id="owner-a")
-    assert run["status"] == "running"
-
-    with pytest.raises(ValueError, match="scope does not match"):
-        repository.ensure_pending_run(run_id, "competitor", "owner-b")
-
-    with Repository._memory_lock:
-        Repository._memory_runs.pop(run_id, None)
-
-
 def test_repository_consumes_gateway_ciphertext_by_run_and_reference(monkeypatch):
     import sys
     import types
@@ -161,6 +139,28 @@ def test_repository_consumes_gateway_ciphertext_by_run_and_reference(monkeypatch
     consume = next(item for item in executions if "RETURNING encrypted_token" in item[0])
     assert "DELETE FROM gateway_job_credentials" in consume[0]
     assert "credential_id=%s AND run_id=%s AND expires_at > %s" in consume[0]
+
+
+def test_repository_workflow_run_restoration_is_idempotent_and_owner_scoped():
+    import uuid
+
+    from app.core.config import Settings
+    from app.storage.repository import Repository
+
+    repository = Repository(Settings(_env_file=None, database_url=""))
+    run_id = str(uuid.uuid4())
+    repository.ensure_pending_run(run_id, "competitor", "owner-a")
+    repository.mark_running(run_id)
+    repository.ensure_pending_run(run_id, "competitor", "owner-a")
+
+    run = repository.get_run(run_id, owner_id="owner-a")
+    assert run["status"] == "running"
+
+    with pytest.raises(ValueError, match="scope does not match"):
+        repository.ensure_pending_run(run_id, "competitor", "owner-b")
+
+    with Repository._memory_lock:
+        Repository._memory_runs.pop(run_id, None)
 
 
 def test_settings_loads_compose_gateway_key_alias(monkeypatch):
