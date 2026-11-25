@@ -2,6 +2,8 @@ import importlib.util
 import sys
 from types import ModuleType, SimpleNamespace
 
+from app.core.llm_gateway_context import get_llm_gateway_token
+
 # Keep this unit test runnable in lightweight tooling environments. Real
 # project environments use the installed psycopg and LangGraph packages.
 if "psycopg" not in sys.modules and importlib.util.find_spec("psycopg") is None:
@@ -24,8 +26,7 @@ if "langgraph" not in sys.modules and importlib.util.find_spec("langgraph") is N
     sys.modules.setdefault("langgraph", langgraph_stub)
     sys.modules.setdefault("langgraph.graph", langgraph_graph_stub)
 
-from app.core.llm_gateway_context import get_llm_gateway_token
-from app.workers import jobs as jobs_module
+jobs_module = importlib.import_module("app.workers.jobs")
 
 
 
