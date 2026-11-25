@@ -1,5 +1,6 @@
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
@@ -93,7 +94,16 @@ def queue() -> Queue:
     )
 
 
-def verify_flowpilot_gateway_session(gateway_token: str) -> int:
+class GatewaySessionLifetime(int):
+    """Integer-compatible Gateway TTL carrying its verified opaque owner scope."""
+
+    def __new__(cls, remaining_seconds: int, owner_scope: str):
+        instance = int.__new__(cls, remaining_seconds)
+        instance.owner_scope = owner_scope
+        return instance
+
+
+def verify_flowpilot_gateway_session(gateway_token: str) -> GatewaySessionLifetime:
     """Validate a Gateway bearer and require the FlowPilot project audience.
 
     Returns remaining Gateway-session lifetime in seconds. The token is sent
@@ -164,7 +174,17 @@ def verify_flowpilot_gateway_session(gateway_token: str) -> int:
             status_code=401,
             detail="The Gateway session is expiring. Reopen the portfolio demo and retry.",
         )
-    return remaining_seconds
+    owner_scope = session.get("owner_scope")
+    if (
+        not isinstance(owner_scope, str)
+        or len(owner_scope) != 64
+        or any(char not in "0123456789abcdef" for char in owner_scope)
+    ):
+        # Compatibility for Gateway sessions minted before optional Supabase
+        # identity scopes shipped. A session token still receives an isolated
+        # scope; a missing claim never falls back to a shared project scope.
+        owner_scope = hashlib.sha256(gateway_token.encode("utf-8")).hexdigest()
+    return GatewaySessionLifetime(remaining_seconds, owner_scope)
 
 
 @app.on_event("startup")
