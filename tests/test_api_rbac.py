@@ -254,6 +254,7 @@ def test_queued_gateway_token_is_encrypted_and_only_reference_enters_rq(monkeypa
     monkeypatch.setattr(api_module.settings, "inline_execution", False)
     monkeypatch.setattr(api_module.settings, "database_url", "postgresql://test/db")
     monkeypatch.setattr(api_module.settings, "llm_gateway_url", "https://gateway.example/v1")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_allowed_hosts", "gateway.example")
     monkeypatch.setattr(api_module.settings, "gateway_job_credential_encryption_key", "test-fernet-key")
     monkeypatch.setattr(api_module.settings, "gateway_job_credential_ttl_seconds", 900)
 
@@ -587,3 +588,34 @@ def test_gateway_owner_scope_overrides_shared_ui_api_principal(monkeypatch):
 
     assert same_owner.status_code == 200
     assert other_owner.status_code == 404
+
+
+
+@pytest.mark.parametrize(
+    "gateway_url,allowed_hosts",
+    [
+        ("http://gateway.example/v1", "gateway.example"),
+        ("https://169.254.169.254/latest", "169.254.169.254"),
+        ("https://attacker.example/v1", "portfolio-llm-gateway.onrender.com"),
+        ("https://user:pass@gateway.example/v1", "gateway.example"),
+        ("https://gateway.example/v1?next=https://attacker.example", "gateway.example"),
+    ],
+)
+def test_gateway_verification_rejects_untrusted_urls_before_network(
+    monkeypatch,
+    gateway_url,
+    allowed_hosts,
+):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(api_module.settings, "app_env", "production")
+    monkeypatch.setattr(api_module.settings, "llm_gateway_url", gateway_url)
+    monkeypatch.setattr(api_module.settings, "llm_gateway_allowed_hosts", allowed_hosts)
+
+    def network_must_not_be_called(*args, **kwargs):
+        raise AssertionError("Untrusted Gateway URL reached the network client")
+
+    monkeypatch.setattr(api_module.httpx, "Client", network_must_not_be_called)
+    with pytest.raises(HTTPException) as error:
+        api_module.verify_flowpilot_gateway_session("token")
+    assert error.value.status_code == 503
