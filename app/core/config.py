@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     database_url: str = ""
     redis_url: str = "redis://redis:6379/0"
     queue_name: str = "automation"
+    upstash_redis_rest_url: str = ""
+    upstash_redis_rest_token: str = Field(default="", repr=False)
 
     # Demo / LLM
     demo_mode: bool = False
