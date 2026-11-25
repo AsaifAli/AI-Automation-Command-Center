@@ -67,7 +67,7 @@ The application rejects Workflow mode unless the QStash credentials, both signin
 
 **Persistence boundary:** Upstash Workflow persists its execution/step state, but the current free portfolio manifest still uses the in-memory FlowPilot run repository unless `DATABASE_URL` is configured. A Render restart can therefore clear the UI's run history after a completed run. The callback can rehydrate a run record while the Workflow is being delivered/replayed, but this does not replace a durable database. The paid RQ + PostgreSQL topology remains a future option only if you choose to fund always-on worker infrastructure.
 
-Keep Workflow inputs below the configured 900 KB dispatch cap. Retries and Workflow steps consume the QStash/Workflow free-tier quota; this is a portfolio/demo execution path, not an SLA-backed production queue.
+Keep Workflow inputs below the configured 900 KB dispatch cap. A shared QStash flow-control key limits FlowPilot to two concurrent callbacks, protecting the small free Render API instance during traffic spikes. Retries and Workflow steps consume the QStash/Workflow free-tier quota; this is a portfolio/demo execution path, not an SLA-backed production queue.
 
 
 ## Local development

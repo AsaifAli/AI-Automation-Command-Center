@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     qstash_url: str = "https://qstash-eu-central-1.upstash.io"
     upstash_workflow_url: str = ""
     qstash_workflow_retries: int = Field(default=2, ge=0, le=5)
+    # Cap concurrent Workflow callbacks to avoid saturating the free Render API.
+    qstash_workflow_parallelism: int = Field(default=2, ge=1, le=2)
     qstash_workflow_max_payload_bytes: int = Field(default=900_000, ge=10_000, le=950_000)
 
     # Demo / LLM

@@ -124,6 +124,49 @@ def test_queue_workflow():
 
 
 
+
+def test_upstash_trigger_encodes_route_and_limits_parallel_callbacks(monkeypatch):
+    import asyncio
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"workflowRunId": "wfr_flowpilot-test"}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            captured["client_options"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured.update({"url": url, "headers": headers, "body": json})
+            return FakeResponse()
+
+    monkeypatch.setattr(api_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(api_module.settings, "qstash_url", "https://qstash-eu-central-1.upstash.io")
+    monkeypatch.setattr(api_module.settings, "qstash_token", "private-qstash-token")
+    monkeypatch.setattr(api_module.settings, "upstash_workflow_url", "https://flowpilot.example.com")
+
+    result = asyncio.run(api_module._trigger_upstash_workflow({"run_id": "id"}, "id"))
+
+    assert result == "wfr_flowpilot-test"
+    assert "%3A%2F%2Fflowpilot.example.com%2Finternal%2Fqstash%2Fworkflow" in captured["url"]
+    assert captured["headers"]["Authorization"] == "Bearer private-qstash-token"
+    assert captured["headers"]["Upstash-Flow-Control-Key"] == "flowpilot-global"
+    assert captured["headers"]["Upstash-Flow-Control-Value"] == "parallelism=2"
+    assert captured["body"] == {"run_id": "id"}
+    assert captured["client_options"]["trust_env"] is False
+
+
 def test_upstash_workflow_dispatch_encrypts_byok_before_queueing(monkeypatch):
     captured = {}
 

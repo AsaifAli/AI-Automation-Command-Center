@@ -565,6 +565,8 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
         "Content-Type": "application/json",
         "Upstash-Workflow-RunId": f"flowpilot-{run_id}",
         "Upstash-Retries": str(settings.qstash_workflow_retries),
+        "Upstash-Flow-Control-Key": "flowpilot-global",
+        "Upstash-Flow-Control-Value": f"parallelism={settings.qstash_workflow_parallelism}",
         "Upstash-Label": "flowpilot",
     }
     try:
