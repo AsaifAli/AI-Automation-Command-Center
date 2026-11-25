@@ -15,11 +15,12 @@ class FakeRepo:
         self.runs = {}
         self.approvals = []
 
-    def create_pending_run(self, workflow):
+    def create_pending_run(self, workflow, owner_id="legacy"):
         run_id = f"run-{len(self.runs) + 1}"
 
         self.runs[run_id] = {
             "run_id": run_id,
+            "owner_id": owner_id,
             "workflow": workflow,
             "status": "awaiting_approval" if workflow in {"content", "outreach"} else "queued",
             "output": ({"approval": {"status": "pending", "action": "send_outreach" if workflow == "outreach" else "publish_content", "title": "Review requested", "summary": "Test approval request", "items": []}} if workflow in {"content", "outreach"} else {}),
