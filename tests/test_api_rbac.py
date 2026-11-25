@@ -652,3 +652,10 @@ def test_flowpilot_supabase_schema_enables_rls_and_revokes_browser_roles():
     assert "REVOKE ALL ON TABLE workflow_runs, approvals, audit_events, gateway_job_credentials FROM PUBLIC;" in SCHEMA
     assert "rolname = 'anon'" in SCHEMA
     assert "rolname = 'authenticated'" in SCHEMA
+
+
+def test_flowpilot_supabase_schema_uses_valid_dollar_quoted_role_block():
+    from app.storage.repository import SCHEMA
+
+    assert "DO $$\nBEGIN" in SCHEMA
+    assert "\nEND\n$$;" in SCHEMA
