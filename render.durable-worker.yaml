@@ -1,0 +1,135 @@
+# Adds durable RQ execution to the existing FlowPilot API without replacing
+# the existing Streamlit UI or provisioning a second PostgreSQL database.
+# The API's existing DATABASE_URL (Supabase) is reused by the worker.
+# This Blueprint adopts the existing API service and creates only:
+# - flowpilot-redis (persistent Render Key Value)
+# - ai-automation-worker (dedicated RQ background worker)
+services:
+  - type: keyvalue
+    name: flowpilot-redis
+    plan: starter
+    region: singapore
+    maxmemoryPolicy: noeviction
+    persistenceMode: journal_snapshot
+    ipAllowList: []
+
+  - type: web
+    name: ai-automation-api
+    runtime: docker
+    repo: https://github.com/AsaifAli/AI-Automation-Command-Center
+    branch: main
+    plan: free
+    region: singapore
+    autoDeployTrigger: checksPass
+    dockerfilePath: ./Dockerfile
+    dockerCommand: 'uvicorn app.api.main:app --host 0.0.0.0 --port $PORT'
+    healthCheckPath: /ready
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: INLINE_EXECUTION
+        value: "false"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: flowpilot-redis
+          property: connectionString
+      - key: QUEUE_NAME
+        value: automation
+      - key: WORKFLOW_JOB_TIMEOUT_SECONDS
+        value: "600"
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "90"
+      - key: MAX_RETRIES
+        value: "2"
+      - key: DATABASE_URL
+        sync: false
+      - key: LLM_GATEWAY_URL
+        sync: false
+      - key: FLOWPILOT_GATEWAY_CREDENTIAL_KEY
+        generateValue: true
+      - key: GATEWAY_JOB_CREDENTIAL_TTL_SECONDS
+        value: "900"
+      - key: LLM_GATEWAY_ALLOWED_HOSTS
+        value: portfolio-llm-gateway.onrender.com
+
+  - type: worker
+    name: ai-automation-worker
+    runtime: docker
+    repo: https://github.com/AsaifAli/AI-Automation-Command-Center
+    branch: main
+    plan: starter
+    region: singapore
+    autoDeployTrigger: checksPass
+    maxShutdownDelaySeconds: 300
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python -m app.worker
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: INLINE_EXECUTION
+        value: "false"
+      - key: DATABASE_URL
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: DATABASE_URL
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: flowpilot-redis
+          property: connectionString
+      - key: QUEUE_NAME
+        value: automation
+      - key: API_AUTH_ENABLED
+        value: "true"
+      - key: API_AUTH_REQUIRE_KEYS
+        value: "false"
+      - key: FLOWPILOT_GATEWAY_CREDENTIAL_KEY
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: FLOWPILOT_GATEWAY_CREDENTIAL_KEY
+      - key: GATEWAY_JOB_CREDENTIAL_TTL_SECONDS
+        value: "900"
+      - key: LLM_GATEWAY_URL
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: LLM_GATEWAY_URL
+      - key: LLM_GATEWAY_ALLOWED_HOSTS
+        value: portfolio-llm-gateway.onrender.com
+      - key: OPENAI_API_KEY
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: OPENAI_API_KEY
+      - key: OPENAI_BASE_URL
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: OPENAI_BASE_URL
+      - key: OPENAI_MODEL
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: OPENAI_MODEL
+      - key: LLM_PROVIDER
+        fromService:
+          type: web
+          name: ai-automation-api
+          envVarKey: LLM_PROVIDER
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "90"
+      - key: MAX_RETRIES
+        value: "2"
+      - key: WORKFLOW_JOB_TIMEOUT_SECONDS
+        value: "600"
+      - key: DEMO_CONFIG_PATH
+        value: /app/config.json
+      - key: INTELLIGENCE_TIMEOUT_SECONDS
+        value: "10"
+      - key: MAX_INTELLIGENCE_ITEMS
+        value: "25"
+      - key: OTEL_ENABLED
+        value: "false"
