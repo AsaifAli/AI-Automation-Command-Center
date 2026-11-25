@@ -10,7 +10,7 @@ services:
     plan: starter
     region: singapore
     maxmemoryPolicy: noeviction
-    persistenceMode: journal_snapshot
+    persistenceMode: journal-snapshot
     ipAllowList: []
 
   - type: web
