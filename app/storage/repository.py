@@ -112,6 +112,23 @@ CREATE TABLE IF NOT EXISTS gateway_job_credentials (
 );
 CREATE INDEX IF NOT EXISTS idx_gateway_job_credentials_expires_at
     ON gateway_job_credentials(expires_at);
+-- These tables are backend-owned workflow state, not a browser Data API.
+-- The application connects using the database owner role; browser roles receive no access.
+ALTER TABLE workflow_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE gateway_job_credentials ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE workflow_runs, approvals, audit_events, gateway_job_credentials FROM PUBLIC;
+DO $
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        EXECUTE 'REVOKE ALL ON TABLE workflow_runs, approvals, audit_events, gateway_job_credentials FROM anon';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        EXECUTE 'REVOKE ALL ON TABLE workflow_runs, approvals, audit_events, gateway_job_credentials FROM authenticated';
+    END IF;
+END
+$;
 """
 
 

@@ -635,3 +635,20 @@ def test_schema_backfills_pre_owner_runs_to_the_existing_control_plane():
         "SET owner_id = 'flowpilot-control-plane'\n"
         "WHERE owner_id = 'legacy';"
     ) in SCHEMA
+
+
+
+def test_flowpilot_supabase_schema_enables_rls_and_revokes_browser_roles():
+    from app.storage.repository import SCHEMA
+
+    protected_tables = (
+        "workflow_runs",
+        "approvals",
+        "audit_events",
+        "gateway_job_credentials",
+    )
+    for table in protected_tables:
+        assert f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;" in SCHEMA
+    assert "REVOKE ALL ON TABLE workflow_runs, approvals, audit_events, gateway_job_credentials FROM PUBLIC;" in SCHEMA
+    assert "rolname = 'anon'" in SCHEMA
+    assert "rolname = 'authenticated'" in SCHEMA
