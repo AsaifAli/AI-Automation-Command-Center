@@ -764,21 +764,8 @@ async def execute_qstash_message(request: Request):
             detail="Workflow execution failed before a result could be persisted.",
         ) from None
 
-    latest = await asyncio.to_thread(
-        repo.get_run,
-        data["run_id"],
-        owner_id=data["owner_id"],
-        include_all=True,
-    )
-    latest_status = (latest or {}).get("status")
-    if latest_status == "paused":
-        await asyncio.to_thread(repo.save_paused_result, data["run_id"], result)
-        return {"run_id": data["run_id"], "status": "paused"}
-    if latest_status == "cancelled":
-        return {"run_id": data["run_id"], "status": "cancelled"}
-
-    await asyncio.to_thread(repo.save_result, result)
-    return {"run_id": data["run_id"], "status": result["status"]}
+    final_status = await asyncio.to_thread(repo.complete_qstash_run, result)
+    return {"run_id": data["run_id"], "status": final_status}
 
 
 @app.post("/internal/qstash/failure", include_in_schema=False)
