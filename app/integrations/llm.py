@@ -167,7 +167,13 @@ class LLMProvider:
     def gateway_session_active(self) -> bool:
         return bool(get_llm_gateway_token())
 
-    def generate(self, system: str, user: str) -> dict[str, Any]:
+    def generate(
+        self,
+        system: str,
+        user: str,
+        *,
+        response_format: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         gateway_token = get_llm_gateway_token()
         gateway_url = (self.settings.llm_gateway_url or self.settings.llm_base_url).strip()
 
@@ -210,6 +216,8 @@ class LLMProvider:
                 {"role": "user", "content": user},
             ],
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         api_key = gateway_token or self.settings.openai_api_key
         headers = {"Authorization": f"Bearer {api_key}"}
 

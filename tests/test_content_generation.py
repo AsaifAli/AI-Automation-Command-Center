@@ -10,6 +10,7 @@ class FakeLiveLLM:
     def __init__(self, text):
         self.responses = list(text) if isinstance(text, list) else [text]
         self.calls = []
+        self.response_formats = []
         self.settings = Settings(
             app_env="development",
             api_auth_enabled=False,
@@ -21,8 +22,9 @@ class FakeLiveLLM:
     def gateway_session_active(self):
         return self.gateway_active
 
-    def generate(self, system, user):
+    def generate(self, system, user, *, response_format=None):
         self.calls.append((system, user))
+        self.response_formats.append(response_format)
         text = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         call_number = len(self.calls)
         return {
@@ -84,6 +86,11 @@ def test_live_content_drafts_come_from_model_response():
     prompt_payload = json.loads(llm.calls[0][1])
     assert prompt_payload["hard_character_limits"] == CHANNEL_LIMITS
     assert prompt_payload["preferred_character_targets"] == CHANNEL_TARGETS
+    schema = llm.response_formats[0]["json_schema"]
+    assert llm.response_formats[0]["type"] == "json_schema"
+    assert schema["strict"] is True
+    assert schema["schema"]["properties"]["posts"]["items"]["properties"]["topic"]["enum"] == [topic]
+    assert schema["schema"]["properties"]["posts"]["items"]["properties"]["channel"]["enum"] == ["linkedin"]
 
 
 def test_live_content_requires_every_requested_topic_channel_pair():
@@ -92,7 +99,8 @@ def test_live_content_requires_every_requested_topic_channel_pair():
     with pytest.raises(ContentGenerationError, match="omitted 1"):
         ContentAgent(llm).run({"topics": ["AI"], "channels": ["linkedin"]})
 
-    assert len(llm.calls) == 1
+    assert len(llm.calls) == 2
+    assert "validation_error" in json.loads(llm.calls[1][1])["correction"]
 
 
 def test_live_content_rejects_invalid_json_instead_of_fabricating_drafts():
@@ -101,6 +109,20 @@ def test_live_content_rejects_invalid_json_instead_of_fabricating_drafts():
     with pytest.raises(ContentGenerationError, match="valid structured output"):
         ContentAgent(llm).run({"topics": ["AI"], "channels": ["linkedin"]})
 
+    assert len(llm.calls) == 2
+    assert "validation_error" in json.loads(llm.calls[1][1])["correction"]
+
+
+def test_live_content_extracts_json_from_fenced_or_prefaced_model_output():
+    topic = "AI operations"
+    response = "Here is the requested JSON:\n```json\n" + _response(
+        topic, "linkedin", "A concise draft for AI operations."
+    ) + "\n```"
+    llm = FakeLiveLLM(response)
+
+    result = ContentAgent(llm).run({"topics": [topic], "channels": ["linkedin"]})
+
+    assert result["posts"][0]["draft"] == "A concise draft for AI operations."
     assert len(llm.calls) == 1
 
 
@@ -131,6 +153,20 @@ def test_active_gateway_session_uses_live_content_even_when_demo_mode_is_on():
 
     assert result["posts"][0]["draft"] == generated["posts"][0]["draft"]
     assert "Demo draft" not in result["posts"][0]["draft"]
+
+
+def test_live_content_repairs_invalid_structured_output_once():
+    topic = "AI automation"
+    valid = _response(topic, "linkedin", "A structured draft for AI automation.")
+    llm = FakeLiveLLM(["The response should be JSON, but this is not.", valid])
+
+    result = ContentAgent(llm).run({"topics": [topic], "channels": ["linkedin"]})
+
+    assert result["posts"][0]["draft"] == "A structured draft for AI automation."
+    assert len(llm.calls) == 2
+    correction = json.loads(llm.calls[1][1])["correction"]
+    assert "validation_error" in correction
+    assert llm.response_formats[0] == llm.response_formats[1]
 
 
 def test_live_content_repairs_over_limit_draft_once_and_aggregates_usage():
