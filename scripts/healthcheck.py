@@ -14,29 +14,33 @@ def main() -> int:
     )
     try:
         parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        expected_ports = {None, 443} if scheme == "https" else {None, 80}
         if (
-            parsed.scheme.lower() not in {"http", "https"}
+            scheme not in {"http", "https"}
             or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
             or parsed.fragment
-            or parsed.port not in {None, 80, 443}
+            or parsed.port not in expected_ports
         ):
             raise ValueError("Health check URL must be a valid HTTP(S) URL.")
 
-        response = httpx.get(
-            url,
+        with httpx.Client(
             timeout=5.0,
             follow_redirects=False,
             trust_env=False,
-        )
-        response.raise_for_status()
+        ) as client:
+            with client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    print(
+                        f"health check failed: HTTP {response.status_code}",
+                        file=sys.stderr,
+                    )
+                    return 1
+
     except (ValueError, httpx.HTTPError) as exc:
         print(f"health check failed: {type(exc).__name__}", file=sys.stderr)
-        return 1
-
-    if response.status_code != 200:
-        print(f"health check failed: HTTP {response.status_code}", file=sys.stderr)
         return 1
 
     print(f"healthy: {url}")
