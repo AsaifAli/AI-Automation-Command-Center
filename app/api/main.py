@@ -732,6 +732,18 @@ async def execute_qstash_message(request: Request):
         # without executing the model a second time.
         return {"run_id": data["run_id"], "status": claim}
 
+    # Close the claim-to-execution race: Pause or Stop may win immediately
+    # after the atomic claim and before the model call is started.
+    current = await asyncio.to_thread(
+        repo.get_run,
+        data["run_id"],
+        owner_id=data["owner_id"],
+        include_all=True,
+    )
+    current_status = (current or {}).get("status")
+    if current_status != "running":
+        return {"run_id": data["run_id"], "status": current_status or "missing"}
+
     try:
         result = await asyncio.to_thread(
             execute_run,
