@@ -96,3 +96,32 @@ def test_qstash_failure_callback_is_terminal_and_late_success_cannot_overwrite_i
     stored = repo.get_run(run_id, owner_id="qstash-queue-owner")
     assert stored["status"] == "failed"
     assert stored["output"]["error"] == "QStash delivery timed out."
+
+
+def test_qstash_failure_while_paused_is_committed_when_resumed():
+    repo, run_id = _repo()
+    envelope = {"run_id": run_id, "dispatch_generation": 1}
+    repo.prepare_qstash_dispatch(run_id, envelope)
+    assert repo.claim_qstash_run(run_id, generation=1) == "claimed"
+    assert repo.pause_run(run_id) is True
+
+    failure = {
+        "run_id": run_id,
+        "workflow": "competitor",
+        "status": "failed",
+        "output": {"error": "QStash delivery timed out."},
+        "evidence": [],
+        "duration_ms": 0,
+        "created_at": datetime.now(UTC),
+        "usage": None,
+        "warnings": ["QStash exhausted the configured HTTP delivery attempt."],
+    }
+    assert repo.fail_run_if_active(failure) is True
+    assert repo.get_run(run_id, owner_id="qstash-queue-owner")["status"] == "paused"
+
+    assert repo.resume_run(run_id) is True
+    pending = repo.take_pending_result(run_id)
+    repo.save_result(pending)
+    resumed = repo.get_run(run_id, owner_id="qstash-queue-owner")
+    assert resumed["status"] == "failed"
+    assert resumed["output"]["error"] == "QStash delivery timed out."
