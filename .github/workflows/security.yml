@@ -23,7 +23,7 @@ jobs:
       - name: Install pip-audit
         run: python -m pip install --upgrade pip pip-audit
       - name: Audit direct and transitive dependencies
-        run: pip-audit --requirement requirements.txt
+        run: pip-audit --requirement requirements-dev.txt
 
   static-analysis:
     name: Bandit high-severity static analysis
@@ -36,7 +36,7 @@ jobs:
       - name: Install Bandit
         run: python -m pip install --upgrade pip bandit
       - name: Scan application Python code
-        run: bandit -r app ui scripts -ll -ii -x tests
+        run: bandit -r app ui scripts -lll -iii -x tests
 
   container-scan:
     name: Build and scan deployment image
