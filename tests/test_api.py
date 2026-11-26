@@ -418,7 +418,7 @@ def test_run_controls_pause_resume_and_stop_only_the_owned_run(monkeypatch):
         cancelled.append(run_id)
 
     monkeypatch.setattr(api_module, "repo", fake_repo)
-    monkeypatch.setattr(api_module, "settings.qstash_workflow_enabled", True)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
     monkeypatch.setattr(api_module, "_cancel_upstash_workflow", fake_cancel)
 
     run_id = fake_repo.run["run_id"]
