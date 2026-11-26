@@ -452,12 +452,18 @@ class Repository:
         return row["pending_result_json"] if row else None
 
     def fail_run_if_active(self, result: dict[str, Any]) -> bool:
-        """Persist a QStash terminal failure without overwriting user-controlled or terminal states."""
+        """Persist a QStash failure, staging it when the run is user-paused."""
         run_id = result["run_id"]
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
-                if not run or run.get("status") not in {"queued", "running"}:
+                if not run:
+                    return False
+                state = run.get("status")
+                if state == "paused":
+                    run["pending_result"] = copy.deepcopy(result)
+                    return True
+                if state not in {"queued", "running"}:
                     return False
                 run.update({
                     "status": "failed",
@@ -471,6 +477,19 @@ class Repository:
                 return True
         now = datetime.now(UTC)
         with self._connect() as conn:
+            row = conn.execute(
+                """UPDATE workflow_runs
+                   SET pending_result_json=%s
+                   WHERE run_id=%s AND status='paused'
+                   RETURNING run_id""",
+                (_json_dumps(result), run_id),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                    (run_id, "failure_staged", _json_dumps({"source": "qstash_failure_callback"}), now),
+                )
+                return True
             row = conn.execute(
                 """UPDATE workflow_runs
                    SET status='failed', output_json=%s, evidence_json=%s, duration_ms=%s,
