@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from app.core.config import Settings
 from app.workers import embedded
 
@@ -53,8 +55,10 @@ def test_embedded_worker_starts_child_and_replaces_it_after_stopping_current_job
 
     worker.start()
     first = context.processes[0]
+    first_worker_name = worker.worker_name
     assert first.started is True
     assert first.daemon is True
+    assert first.args[1] == first_worker_name
 
     registry_calls = []
 
@@ -85,6 +89,8 @@ def test_embedded_worker_starts_child_and_replaces_it_after_stopping_current_job
     assert job.cancelled is True
     assert len(context.processes) == 2
     assert context.processes[1].started is True
+    assert worker.worker_name != first_worker_name
+    assert context.processes[1].args[1] == worker.worker_name
 
     worker.stop()
     assert context.processes[1].terminated is True
@@ -143,6 +149,36 @@ def test_embedded_worker_configures_telemetry_inside_child_before_consuming_jobs
     assert calls[3:] == ["worker-created", "work"]
 
 
+def test_worker_process_exits_on_registration_error_for_supervisor_retry(monkeypatch):
+    calls = []
+
+    class FakeRedis:
+        @staticmethod
+        def from_url(*_args, **_kwargs):
+            return object()
+
+    class FakeSimpleWorker:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("created")
+            self._stop_requested = False
+
+        def work(self, **_kwargs):
+            calls.append("work")
+            if calls.count("work") == 1:
+                raise ValueError("There exists an active worker named already")
+            self._stop_requested = True
+
+    monkeypatch.setattr(embedded, "configure_telemetry", lambda _settings: None, raising=False)
+    monkeypatch.setattr(embedded, "Redis", FakeRedis)
+    monkeypatch.setattr(embedded, "Queue", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(embedded, "SimpleWorker", FakeSimpleWorker)
+
+    with pytest.raises(ValueError, match="active worker"):
+        embedded._run_worker(Settings(_env_file=None, otel_enabled=False), "worker-test")
+
+    assert calls == ["created", "work"]
+
+
 def test_api_forks_embedded_worker_before_initializing_parent_telemetry(monkeypatch):
     import app.api.main as api_module
 
@@ -173,6 +209,7 @@ def test_supervisor_recovers_if_the_worker_process_reference_is_missing(monkeypa
     monkeypatch.setattr(embedded.multiprocessing, "get_context", lambda method: context)
     worker = embedded.EmbeddedRQWorker(Settings(_env_file=None))
     worker.start()
+    first_worker_name = context.processes[0].args[1]
     worker._process = None
 
     class OneIterationEvent:
@@ -191,3 +228,4 @@ def test_supervisor_recovers_if_the_worker_process_reference_is_missing(monkeypa
 
     assert len(context.processes) == 2
     assert context.processes[1].started is True
+    assert context.processes[1].args[1] != first_worker_name
