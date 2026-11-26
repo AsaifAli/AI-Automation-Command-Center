@@ -347,7 +347,7 @@ def root():
 
     if settings.qstash_workflow_enabled:
         architecture = (
-            "api -> QStash Workflow -> signed execution callback -> "
+            "api -> QStash HTTP message -> signed execution endpoint + native failure callback -> "
             + ("PostgreSQL-backed run state" if settings.database_url.strip() else "ephemeral in-memory run state")
         )
     else:
@@ -380,7 +380,7 @@ def health():
         version=settings.app_version,
         demo_mode=settings.demo_mode,
         execution_mode=(
-            "upstash_workflow"
+            "qstash_http_queue"
             if settings.qstash_workflow_enabled
             else "inline_background" if settings.inline_execution else "redis_worker"
         ),
@@ -394,7 +394,7 @@ def ready():
         repo.metrics()
 
         redis_status = (
-            "upstash_workflow"
+            "qstash_http_queue"
             if settings.qstash_workflow_enabled
             else "inline" if settings.inline_execution else "available"
         )
