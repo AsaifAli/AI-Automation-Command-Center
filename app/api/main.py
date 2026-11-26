@@ -731,14 +731,14 @@ if settings.qstash_workflow_enabled:
                 "workflow": data["workflow"],
                 "status": "failed",
                 "output": {
-                    "error": "Workflow execution failed after automatic retries.",
+                    "error": "Workflow execution failed before the completion callback could be persisted.",
                     "recovery": "Check the workflow input or provider session, then submit a new run.",
                 },
                 "evidence": [],
                 "duration_ms": 0,
                 "created_at": datetime.now(UTC),
                 "usage": None,
-                "warnings": ["Upstash Workflow exhausted its configured execution retries."],
+                "warnings": ["Upstash Workflow execution ended before the run result was persisted."],
             })
             logger.warning("upstash_workflow_exhausted_retries run_id=%s status=%s", data["run_id"], int(fail_status))
         except Exception:
