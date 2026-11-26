@@ -359,3 +359,185 @@ def test_empty_usage_remains_none():
 
     assert _normalize_usage(None) is None
     assert _normalize_usage({}) is None
+
+
+def test_upstash_initial_payload_parser_decodes_nested_json_envelopes():
+    import json
+
+    envelope = {
+        "run_id": "11111111-1111-1111-1111-111111111111",
+        "workflow": "competitor",
+        "payload": {"competitors": ["AI"]},
+        "owner_id": "owner-1",
+    }
+
+    assert api_module._parse_upstash_workflow_initial_payload(envelope) == envelope
+    assert api_module._parse_upstash_workflow_initial_payload(json.dumps(envelope)) == envelope
+    assert api_module._parse_upstash_workflow_initial_payload(
+        json.dumps(json.dumps(envelope))
+    ) == envelope
+
+
+def test_run_controls_pause_resume_and_stop_only_the_owned_run(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.run = {
+        "run_id": "11111111-1111-1111-1111-111111111111",
+        "owner_id": "local-development",
+        "workflow": "competitor",
+        "status": "queued",
+        "output": {},
+        "evidence": [],
+        "duration_ms": 0,
+        "created_at": datetime.now(UTC),
+        "usage": None,
+        "warnings": [],
+    }
+
+    def pause_run(run_id):
+        assert fake_repo.run["run_id"] == run_id
+        fake_repo.run["resume_status"] = fake_repo.run["status"]
+        fake_repo.run["status"] = "paused"
+        return dict(fake_repo.run)
+
+    def resume_run(run_id):
+        assert fake_repo.run["run_id"] == run_id
+        fake_repo.run["status"] = fake_repo.run.pop("resume_status", "queued")
+        return dict(fake_repo.run)
+
+    def stop_run(run_id):
+        assert fake_repo.run["run_id"] == run_id
+        fake_repo.run["status"] = "cancelled"
+        return dict(fake_repo.run)
+
+    fake_repo.pause_run = pause_run
+    fake_repo.resume_run = resume_run
+    fake_repo.stop_run = stop_run
+    cancelled = []
+
+    async def fake_cancel(run_id):
+        cancelled.append(run_id)
+
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
+    monkeypatch.setattr(api_module, "_cancel_upstash_workflow", fake_cancel)
+
+    run_id = fake_repo.run["run_id"]
+    paused = client.post(f"/api/v1/runs/{run_id}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+
+    resumed = client.post(f"/api/v1/runs/{run_id}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "queued"
+
+    stopped = client.post(f"/api/v1/runs/{run_id}/stop")
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "cancelled"
+    assert cancelled == [run_id]
+
+
+def test_run_controls_do_not_disclose_another_owners_run(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.run = {
+        "run_id": "11111111-1111-1111-1111-111111111111",
+        "owner_id": "someone-else",
+        "workflow": "competitor",
+        "status": "queued",
+        "output": {},
+        "evidence": [],
+        "duration_ms": 0,
+        "created_at": datetime.now(UTC),
+        "usage": None,
+        "warnings": [],
+    }
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
+    monkeypatch.setattr(api_module.settings, "api_auth_enabled", True)
+    monkeypatch.setattr(api_module.settings, "api_operator_keys", "operator-secret")
+    monkeypatch.setattr(api_module.settings, "api_admin_keys", "")
+    monkeypatch.setattr(api_module.settings, "api_key", "")
+
+    response = client.post(
+        f"/api/v1/runs/{fake_repo.run['run_id']}/pause",
+        headers={"X-API-Key": "operator-secret"},
+    )
+
+    assert response.status_code == 404
+    assert fake_repo.run["status"] == "queued"
+
+
+def test_upstash_trigger_disables_duplicate_workflow_level_retries(monkeypatch):
+    import asyncio
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"workflowRunId": "wfr_flowpilot-test"}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured["headers"] = headers
+            return FakeResponse()
+
+    monkeypatch.setattr(api_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(api_module.settings, "qstash_url", "https://qstash-eu-central-1.upstash.io")
+    monkeypatch.setattr(api_module.settings, "qstash_token", "private-qstash-token")
+    monkeypatch.setattr(api_module.settings, "upstash_workflow_url", "https://flowpilot.example.com")
+
+    asyncio.run(api_module._trigger_upstash_workflow({"run_id": "id"}, "id"))
+
+    assert captured["headers"]["Upstash-Workflow-Sdk-Version"] == "1"
+    assert captured["headers"]["Upstash-Retries"] == "0"
+    assert captured["headers"]["Upstash-Flow-Control-Key"] == "flowpilot-global"
+
+
+def test_qstash_stop_cancels_only_the_requested_workflow_run(monkeypatch):
+    import asyncio
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            captured["client_options"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def delete(self, url, *, headers, params):
+            captured.update({"url": url, "headers": headers, "params": params})
+            return FakeResponse()
+
+    monkeypatch.setattr(api_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(api_module.settings, "qstash_url", "https://qstash-eu-central-1.upstash.io")
+    monkeypatch.setattr(api_module.settings, "qstash_token", "private-qstash-token")
+
+    asyncio.run(api_module._cancel_upstash_workflow(
+        "11111111-1111-1111-1111-111111111111"
+    ))
+
+    assert captured["url"] == (
+        "https://qstash-eu-central-1.upstash.io/v2/workflows/runs/"
+        "wfr_flowpilot-11111111-1111-1111-1111-111111111111"
+    )
+    assert captured["params"] == {"cancel": "true"}
+    assert captured["headers"]["Authorization"] == "Bearer private-qstash-token"
+    assert captured["client_options"]["trust_env"] is False

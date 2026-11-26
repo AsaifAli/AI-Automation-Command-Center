@@ -512,6 +512,32 @@ def _execute_inline_background(
 
 
 
+def _parse_upstash_workflow_initial_payload(raw_payload: object) -> dict:
+    """Normalize SDK initial/failure payloads into the original JSON envelope.
+
+    The Python SDK may hand the callback a decoded mapping, a JSON string, or
+    a JSON string nested inside another JSON string. Failure callbacks must
+    recover the same envelope that the initial invocation received.
+    """
+    candidate = raw_payload
+    for _ in range(3):
+        if isinstance(candidate, dict):
+            return candidate
+        if isinstance(candidate, bytes):
+            try:
+                candidate = candidate.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Workflow payload encoding is invalid.") from exc
+        if isinstance(candidate, str):
+            try:
+                candidate = json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Workflow payload is not valid JSON.") from exc
+            continue
+        break
+    raise TypeError("Workflow payload must decode to a JSON object.")
+
+
 def _validate_upstash_workflow_payload(raw_payload: object) -> dict:
     """Validate the signed QStash envelope before restoring or executing a run."""
     if not isinstance(raw_payload, dict):
@@ -566,7 +592,9 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
         "Authorization": f"Bearer {settings.qstash_token}",
         "Content-Type": "application/json",
         "Upstash-Workflow-RunId": f"flowpilot-{run_id}",
-        "Upstash-Retries": str(settings.qstash_workflow_retries),
+        # Explicitly identify the v1 Workflow protocol used by workflow-py 2.x.
+        "Upstash-Workflow-Sdk-Version": "1",
+        "Upstash-Retries": "0",
         "Upstash-Flow-Control-Key": "flowpilot-global",
         # QStash requires the full flow-control value tuple, not parallelism alone.
         "Upstash-Flow-Control-Value": (
@@ -622,9 +650,61 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
     return workflow_run_id
 
 
+async def _cancel_upstash_workflow(run_id: str) -> None:
+    """Cancel one QStash Workflow run without pausing the shared queue."""
+    workflow_run_id = f"wfr_flowpilot-{run_id}"
+    cancel_url = (
+        settings.qstash_url.rstrip("/")
+        + "/v2/workflows/runs/"
+        + workflow_run_id
+    )
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            response = await client.delete(
+                cancel_url,
+                headers={"Authorization": f"Bearer {settings.qstash_token}"},
+                params={"cancel": "true"},
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError("QStash could not confirm workflow cancellation.") from exc
+    if not 200 <= response.status_code < 300:
+        raise RuntimeError(
+            f"QStash rejected workflow cancellation (HTTP {response.status_code})."
+        )
+
+
 if settings.qstash_workflow_enabled:
     from upstash_workflow import AsyncWorkflowContext
     from upstash_workflow.fastapi import Serve
+
+    async def _wait_for_run_control(
+        context: AsyncWorkflowContext[dict],
+        run_id: str,
+        owner_id: str,
+        checkpoint: str,
+    ) -> bool:
+        """Wait durably while paused; return false if the run was stopped."""
+        sleep_index = 0
+        while True:
+            run = await asyncio.to_thread(
+                repo.get_run,
+                run_id,
+                owner_id=owner_id,
+                include_all=True,
+            )
+            if not run or run.get("status") == "cancelled":
+                return False
+            if run.get("status") != "paused":
+                return True
+            # QStash sleep suspends this execution without occupying a Render
+            # worker. Each iteration gets a stable replay-safe step name.
+            await context.sleep(f"flowpilot-{checkpoint}-pause-{sleep_index}", 15)
+            sleep_index += 1
+
 
     _workflow_serve = Serve(app)
     _workflow_environment = {
@@ -642,21 +722,23 @@ if settings.qstash_workflow_enabled:
     ) -> None:
         # Do not log or persist upstream response bodies, which may expose provider details.
         try:
-            data = _validate_upstash_workflow_payload(context.request_payload)
+            data = _validate_upstash_workflow_payload(
+                _parse_upstash_workflow_initial_payload(context.request_payload)
+            )
             await asyncio.to_thread(repo.ensure_pending_run, data["run_id"], data["workflow"], data["owner_id"])
             await asyncio.to_thread(repo.save_result, {
                 "run_id": data["run_id"],
                 "workflow": data["workflow"],
                 "status": "failed",
                 "output": {
-                    "error": "Workflow execution failed after automatic retries.",
+                    "error": "Workflow execution failed before the completion callback could be persisted.",
                     "recovery": "Check the workflow input or provider session, then submit a new run.",
                 },
                 "evidence": [],
                 "duration_ms": 0,
                 "created_at": datetime.now(UTC),
                 "usage": None,
-                "warnings": ["Upstash Workflow exhausted its configured execution retries."],
+                "warnings": ["Upstash Workflow execution ended before the run result was persisted."],
             })
             logger.warning("upstash_workflow_exhausted_retries run_id=%s status=%s", data["run_id"], int(fail_status))
         except Exception:
@@ -665,13 +747,21 @@ if settings.qstash_workflow_enabled:
     @_workflow_serve.post(
         "/internal/qstash/workflow",
         base_url=settings.upstash_workflow_url,
-        retries=settings.qstash_workflow_retries,
+        retries=0,
         env=_workflow_environment,
+        initial_payload_parser=_parse_upstash_workflow_initial_payload,
         failure_function=_upstash_workflow_failure,
     )
     async def _execute_upstash_workflow(context: AsyncWorkflowContext[dict]) -> None:
-        data = _validate_upstash_workflow_payload(context.request_payload)
+        data = _validate_upstash_workflow_payload(
+            _parse_upstash_workflow_initial_payload(context.request_payload)
+        )
         await asyncio.to_thread(repo.ensure_pending_run, data["run_id"], data["workflow"], data["owner_id"])
+
+        if not await _wait_for_run_control(
+            context, data["run_id"], data["owner_id"], "before-execute"
+        ):
+            return
 
         async def _execute_step() -> dict:
             result = await asyncio.to_thread(
@@ -687,7 +777,16 @@ if settings.qstash_workflow_enabled:
             return json.loads(_json_dumps(result))
 
         result = await context.run("execute-flowpilot-run", _execute_step)
-        # Persist outside context.run so a replay can restore local UI state after a Render wake.
+
+        # A pause requested during a model call takes effect at this boundary.
+        # The completed QStash step is replay-cached, so resume will not call
+        # the provider a second time.
+        if not await _wait_for_run_control(
+            context, data["run_id"], data["owner_id"], "after-execute"
+        ):
+            return
+
+        # Persist outside context.run so replays can restore local UI state.
         await asyncio.to_thread(repo.save_result, result)
 
 
@@ -994,6 +1093,90 @@ def clear_run_history(
             status_code=503,
             detail="Unable to clear run history",
         ) from None
+
+
+def _owned_run_for_control(
+    run_id: str,
+    llm_gateway_token: str,
+    principal: Principal,
+) -> dict:
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token
+        else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
+    result = repo.get_run(
+        run_id,
+        owner_id=owner_id,
+        include_all=principal.role == "admin",
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return result
+
+
+@app.post("/api/v1/runs/{run_id}/pause", tags=["workflows"])
+def pause_run(
+    run_id: str,
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("runs:execute")),
+):
+    if not settings.qstash_workflow_enabled:
+        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+    current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    if not repo.pause_run(run_id):
+        raise HTTPException(status_code=409, detail=f"Run cannot be paused from status '{current['status']}'.")
+    logger.info("workflow_paused run_id=%s", run_id)
+    return {"run_id": run_id, "status": "paused"}
+
+
+@app.post("/api/v1/runs/{run_id}/resume", tags=["workflows"])
+def resume_run(
+    run_id: str,
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("runs:execute")),
+):
+    if not settings.qstash_workflow_enabled:
+        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+    current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    if not repo.resume_run(run_id):
+        raise HTTPException(status_code=409, detail=f"Run cannot be resumed from status '{current['status']}'.")
+    resumed = repo.get_run(
+        run_id,
+        owner_id=current.get("owner_id") or principal.owner_id,
+        include_all=principal.role == "admin",
+    )
+    logger.info("workflow_resumed run_id=%s", run_id)
+    return {"run_id": run_id, "status": (resumed or {}).get("status", "queued")}
+
+
+@app.post("/api/v1/runs/{run_id}/stop", tags=["workflows"])
+async def stop_run(
+    run_id: str,
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_permission("runs:execute")),
+):
+    if not settings.qstash_workflow_enabled:
+        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+    current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    if not repo.stop_run(run_id):
+        raise HTTPException(status_code=409, detail=f"Run cannot be stopped from status '{current['status']}'.")
+    try:
+        await _cancel_upstash_workflow(run_id)
+    except RuntimeError:
+        # The local cancellation is already authoritative and protects against
+        # late results even when QStash's remote cancellation races or fails.
+        logger.warning("workflow_remote_cancel_unconfirmed run_id=%s", run_id)
+        raise HTTPException(
+            status_code=502,
+            detail="The run was marked canceled, but QStash could not confirm remote cancellation.",
+        ) from None
+    logger.info("workflow_stopped run_id=%s", run_id)
+    return {"run_id": run_id, "status": "cancelled"}
 
 
 @app.get(

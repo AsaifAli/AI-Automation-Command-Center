@@ -240,9 +240,9 @@ def fetch_run(run_id: str):
 def render_status_pill(status: str) -> None:
     normalized = (status or "unknown").lower()
     dot_class = "status-dot"
-    if normalized in {"pending", "awaiting_approval", "rejected"}:
+    if normalized in {"pending", "awaiting_approval", "rejected", "paused", "cancelled"}:
         dot_class = "status-dot warn"
-    elif normalized not in {"queued", "running", "awaiting_approval", "completed", "completed_with_warnings", "approved", "rejected"}:
+    elif normalized not in {"queued", "running", "awaiting_approval", "completed", "completed_with_warnings", "approved", "rejected", "paused", "cancelled"}:
         dot_class = "status-dot fail"
     label = normalized.replace("_", " ").upper()
     st.markdown(
@@ -835,6 +835,51 @@ try:
             detail_a.markdown(f'<div class="detail-stat"><span>STATUS</span><strong>{status_label}</strong></div>', unsafe_allow_html=True)
             detail_b.markdown(f'<div class="detail-stat"><span>DURATION</span><strong>{run["duration_ms"]} ms</strong></div>', unsafe_allow_html=True)
             detail_c.markdown(f'<div class="detail-stat"><span>RUN ID</span><strong>{escape(str(run["run_id"])[:12])}</strong></div>', unsafe_allow_html=True)
+
+            can_control_runs = bool(API_OPERATOR_KEY or API_ADMIN_KEY or LEGACY_API_KEY)
+            active_status = run.get("status") in {"queued", "running", "paused"}
+            if active_status and can_control_runs and health.get("execution_mode") == "upstash_workflow":
+                action_columns = st.columns(3)
+                if run.get("status") == "paused":
+                    with action_columns[0]:
+                        if st.button("▶ Resume", key=f"resume_{run['run_id']}", use_container_width=True):
+                            try:
+                                result = response_json(
+                                    api_post(f"/api/v1/runs/{run['run_id']}/resume", {}),
+                                    "Resume workflow",
+                                )
+                                st.success(f"Workflow resumed ({result['status']}).")
+                                st.rerun()
+                            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                                st.error(str(exc))
+                else:
+                    with action_columns[0]:
+                        if st.button("Ⅱ Pause", key=f"pause_{run['run_id']}", use_container_width=True):
+                            try:
+                                result = response_json(
+                                    api_post(f"/api/v1/runs/{run['run_id']}/pause", {}),
+                                    "Pause workflow",
+                                )
+                                st.success("Workflow will pause at its next safe step boundary.")
+                                st.rerun()
+                            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                                st.error(str(exc))
+                with action_columns[1]:
+                    if st.button("■ Stop", key=f"stop_{run['run_id']}", type="secondary", use_container_width=True):
+                        try:
+                            result = response_json(
+                                api_post(f"/api/v1/runs/{run['run_id']}/stop", {}),
+                                "Stop workflow",
+                            )
+                            st.success("Workflow cancellation requested.")
+                            st.rerun()
+                        except (requests.RequestException, RuntimeError, ValueError) as exc:
+                            st.error(str(exc))
+            elif active_status and health.get("execution_mode") != "upstash_workflow":
+                st.caption("Run controls are available when QStash Workflow execution is enabled.")
+            elif active_status and not can_control_runs:
+                st.caption("An operator API credential is required to control this run.")
+
             st.markdown('<div class="detail-label">CLIENT-READY RESULT</div>', unsafe_allow_html=True)
             render_workflow_output(run.get("workflow", ""), run.get("output", {}))
 except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
