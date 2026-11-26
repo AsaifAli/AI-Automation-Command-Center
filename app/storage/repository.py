@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     owner_id TEXT NOT NULL DEFAULT 'legacy',
     workflow VARCHAR(50) NOT NULL,
     status VARCHAR(50) NOT NULL,
+    resume_status VARCHAR(50),
     output_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     evidence_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
 -- Lightweight in-place migration for databases created by earlier portfolio releases.
 -- This keeps `docker compose up` upgrade-safe without requiring users to delete data.
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS resume_status VARCHAR(50);
 -- Before owner scopes existed, all authorized API roles shared one private control plane.
 -- Backfill those pre-migration rows to that same owner so existing history remains visible.
 UPDATE workflow_runs
@@ -166,6 +168,7 @@ class Repository:
             "owner_id": owner_id,
             "workflow": workflow,
             "status": "queued",
+            "resume_status": None,
             "output": {},
             "evidence": [],
             "duration_ms": 0,
@@ -219,6 +222,7 @@ class Repository:
                     "owner_id": owner_id,
                     "workflow": workflow,
                     "status": "queued",
+                    "resume_status": None,
                     "output": {},
                     "evidence": [],
                     "duration_ms": 0,
@@ -249,6 +253,105 @@ class Repository:
                        VALUES (%s,%s,%s,%s)""",
                     (normalized_run_id, "queued", json.dumps({"workflow": workflow}), now),
                 )
+
+    def pause_run(self, run_id: str) -> bool:
+        """Pause an active run at its next durable workflow boundary."""
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run or run.get("status") not in {"queued", "running"}:
+                    return False
+                run["resume_status"] = run["status"]
+                run["status"] = "paused"
+                return True
+
+        now = datetime.now(UTC)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not row or row["status"] not in {"queued", "running"}:
+                return False
+            conn.execute(
+                "UPDATE workflow_runs SET status='paused', resume_status=%s WHERE run_id=%s",
+                (row["status"], run_id),
+            )
+            conn.execute(
+                "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                (run_id, "paused", json.dumps({"resume_status": row["status"]}), now),
+            )
+        return True
+
+    def resume_run(self, run_id: str) -> bool:
+        """Resume a paused run, restoring its queued/running state."""
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run or run.get("status") != "paused":
+                    return False
+                run["status"] = run.pop("resume_status", None) or "queued"
+                return True
+
+        now = datetime.now(UTC)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status, resume_status FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not row or row["status"] != "paused":
+                return False
+            restored_status = row["resume_status"] if row["resume_status"] in {"queued", "running"} else "queued"
+            conn.execute(
+                "UPDATE workflow_runs SET status=%s, resume_status=NULL WHERE run_id=%s",
+                (restored_status, run_id),
+            )
+            conn.execute(
+                "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                (run_id, "resumed", json.dumps({"status": restored_status}), now),
+            )
+        return True
+
+    def stop_run(self, run_id: str) -> bool:
+        """Mark an active run canceled; late worker results may not revive it."""
+        stopped_output = {"error": "Workflow was stopped by the user."}
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run or run.get("status") not in {"queued", "running", "paused"}:
+                    return False
+                run["status"] = "cancelled"
+                run["resume_status"] = None
+                run["output"] = stopped_output
+                run["warnings"] = ["Execution was canceled by the user."]
+                return True
+
+        now = datetime.now(UTC)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not row or row["status"] not in {"queued", "running", "paused"}:
+                return False
+            conn.execute(
+                """UPDATE workflow_runs
+                   SET status='cancelled', resume_status=NULL, output_json=%s,
+                       evidence_json='[]'::jsonb, warnings_json=%s, duration_ms=0,
+                       usage_json=NULL, error=%s
+                   WHERE run_id=%s""",
+                (
+                    _json_dumps(stopped_output),
+                    _json_dumps(["Execution was canceled by the user."]),
+                    stopped_output["error"],
+                    run_id,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                (run_id, "cancelled", "{}", now),
+            )
+        return True
 
     def store_gateway_job_credential(
         self,
@@ -340,19 +443,24 @@ class Repository:
             )
 
     def mark_running(self, run_id: str) -> None:
+        """Promote queued work without reviving paused or canceled runs."""
         now = datetime.now(UTC)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
-                if run:
+                if run and run.get("status") == "queued":
                     run["status"] = "running"
             return
         with self._connect() as conn:
-            conn.execute("UPDATE workflow_runs SET status='running' WHERE run_id=%s", (run_id,))
-            conn.execute(
-                "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
-                (run_id, "started", "{}", now),
-            )
+            changed = conn.execute(
+                "UPDATE workflow_runs SET status='running' WHERE run_id=%s AND status='queued' RETURNING run_id",
+                (run_id,),
+            ).fetchone()
+            if changed:
+                conn.execute(
+                    "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                    (run_id, "started", "{}", now),
+                )
 
     def save_result(self, result: dict[str, Any]) -> None:
         if self._use_memory:
@@ -360,6 +468,10 @@ class Repository:
                 record = self._memory_runs.get(result["run_id"])
                 if not record:
                     raise KeyError(f"Run not found: {result['run_id']}")
+                # A canceled or paused state is authoritative. Late worker
+                # completions must not resurrect a run that an operator controlled.
+                if record.get("status") in {"cancelled", "paused"}:
+                    return
                 record.update(
                     {
                         "workflow": result.get("workflow", record["workflow"]),
@@ -374,6 +486,12 @@ class Repository:
                 )
             return
         with self._connect() as conn:
+            current = conn.execute(
+                "SELECT status FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                (result["run_id"],),
+            ).fetchone()
+            if not current or current["status"] in {"cancelled", "paused"}:
+                return
             conn.execute(
                 """UPDATE workflow_runs
                    SET status=%s, output_json=%s, evidence_json=%s, duration_ms=%s,
@@ -450,10 +568,10 @@ class Repository:
     def clear_history(self) -> int:
         if self._use_memory:
             with self._memory_lock:
-                active = [run for run in self._memory_runs.values() if run["status"] in ("queued", "running", "awaiting_approval")]
+                active = [run for run in self._memory_runs.values() if run["status"] in ("queued", "running", "paused", "awaiting_approval")]
                 if active:
                     raise ValueError("Cannot clear history while queued, running, or awaiting-approval workflows exist")
-                doomed = [run_id for run_id, run in self._memory_runs.items() if run["status"] not in ("queued", "running", "awaiting_approval")]
+                doomed = [run_id for run_id, run in self._memory_runs.items() if run["status"] not in ("queued", "running", "paused", "awaiting_approval")]
                 for run_id in doomed:
                     self._memory_runs.pop(run_id, None)
                     for approval_id, approval in list(self._memory_approvals.items()):
@@ -461,10 +579,10 @@ class Repository:
                             self._memory_approvals.pop(approval_id, None)
                 return len(doomed)
         with self._connect() as conn:
-            active = conn.execute("SELECT COUNT(*) AS count FROM workflow_runs WHERE status IN ('queued', 'running', 'awaiting_approval')").fetchone()
+            active = conn.execute("SELECT COUNT(*) AS count FROM workflow_runs WHERE status IN ('queued', 'running', 'paused', 'awaiting_approval')").fetchone()
             if int(active["count"] or 0) > 0:
                 raise ValueError("Cannot clear history while queued, running, or awaiting-approval workflows exist")
-            result = conn.execute("DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running', 'awaiting_approval') RETURNING run_id")
+            result = conn.execute("DELETE FROM workflow_runs WHERE status NOT IN ('queued', 'running', 'paused', 'awaiting_approval') RETURNING run_id")
             return sum(1 for _ in result)
 
     def list_pending_approvals(
