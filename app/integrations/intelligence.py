@@ -2,7 +2,8 @@
 import ipaddress
 import logging
 import socket
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET
+from defusedxml.common import DefusedXmlException
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -202,7 +203,17 @@ class IntelligenceSource:
         url: str,
     ) -> list[dict[str, Any]]:
 
-        root = ET.fromstring(body)
+        try:
+            root = ET.fromstring(
+                body,
+                forbid_dtd=True,
+                forbid_entities=True,
+                forbid_external=True,
+            )
+        except DefusedXmlException as exc:
+            raise ValueError(
+                "Feed XML DTD and entity declarations are not allowed"
+            ) from exc
 
         feed_items = (
             root.findall(".//item")
