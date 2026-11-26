@@ -379,8 +379,6 @@ def test_upstash_initial_payload_parser_decodes_nested_json_envelopes():
 
 
 def test_run_controls_pause_resume_and_stop_only_the_owned_run(monkeypatch):
-    import asyncio
-
     fake_repo = FakeRepo()
     fake_repo.run = {
         "run_id": "11111111-1111-1111-1111-111111111111",
