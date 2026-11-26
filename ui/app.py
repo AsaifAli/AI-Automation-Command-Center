@@ -8,14 +8,13 @@ import streamlit as st
 from api_access import api_timeout_for, build_api_headers
 from api_resilience import RETRYABLE_GET_STATUSES, resilient_get
 from content_input import parse_topic_briefs
+from execution_modes import execution_mode_label, is_queue_backed_execution
 from gateway_handoff import GatewayHandoffError, exchange_handoff_code
 from output_formatting import build_client_report_markdown
 from output_renderer import render_workflow_output
 from sidebar_toggle import render_sidebar_toggle
 from streamlit.errors import StreamlitAPIException
 from ui_theme import apply_theme
-
-from ui.execution_modes import execution_mode_label, is_queue_backed_execution
 
 API = os.getenv("API_BASE_URL", "").strip()
 if not API:
