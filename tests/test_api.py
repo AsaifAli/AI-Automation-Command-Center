@@ -656,3 +656,39 @@ def test_empty_usage_remains_none():
 
     assert _normalize_usage(None) is None
     assert _normalize_usage({}) is None
+
+
+def test_qstash_signature_verification_binds_the_exact_delivery_url(monkeypatch):
+    captured = {}
+
+    class FakeReceiver:
+        def __init__(self, *, current_signing_key, next_signing_key):
+            captured["current"] = current_signing_key
+            captured["next"] = next_signing_key
+
+        def verify(self, *, signature, body, url, clock_tolerance):
+            captured.update({
+                "signature": signature,
+                "body": body,
+                "url": url,
+                "clock_tolerance": clock_tolerance,
+            })
+
+    monkeypatch.setattr(api_module, "Receiver", FakeReceiver)
+    monkeypatch.setattr(api_module.settings, "qstash_current_signing_key", "current-key")
+    monkeypatch.setattr(api_module.settings, "qstash_next_signing_key", "next-key")
+
+    api_module._verify_qstash_signature(
+        b'{"run_id":"123"}',
+        "signed-jwt",
+        "https://flowpilot.example.com/internal/qstash/failure",
+    )
+
+    assert captured == {
+        "current": "current-key",
+        "next": "next-key",
+        "signature": "signed-jwt",
+        "body": '{"run_id":"123"}',
+        "url": "https://flowpilot.example.com/internal/qstash/failure",
+        "clock_tolerance": 5,
+    }
