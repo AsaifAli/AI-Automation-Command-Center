@@ -896,29 +896,28 @@ async def run_workflow(
             "gateway_token_ttl_seconds": credential_ttl,
         }
         try:
-            await _trigger_upstash_workflow(envelope, run_id)
+            generation = repo.prepare_qstash_dispatch(run_id, envelope)
+            message_id = await _publish_qstash_message(envelope, run_id, generation)
+            repo.set_qstash_message_id(run_id, generation, message_id)
         except Exception:
-            logger.exception("upstash_workflow_dispatch_failed run_id=%s", run_id)
-            try:
-                repo.save_result({
-                    "run_id": run_id,
-                    "workflow": request.workflow.value,
-                    "status": "failed",
-                    "output": {
-                        "error": "Workflow could not be queued.",
-                        "recovery": "QStash did not accept the request. Retry after checking the workflow connection.",
-                    },
-                    "evidence": [],
-                    "duration_ms": 0,
-                    "created_at": datetime.now(UTC),
-                    "usage": None,
-                    "warnings": ["Background dispatch failed before execution."],
-                })
-            except Exception:
-                logger.exception("upstash_workflow_dispatch_failure_persist_failed run_id=%s", run_id)
+            logger.exception("qstash_message_dispatch_failed run_id=%s", run_id)
+            repo.save_result({
+                "run_id": run_id,
+                "workflow": request.workflow.value,
+                "status": "failed",
+                "output": {
+                    "error": "Workflow could not be queued.",
+                    "recovery": "QStash did not accept the message. Retry after checking the queue connection.",
+                },
+                "evidence": [],
+                "duration_ms": 0,
+                "created_at": datetime.now(UTC),
+                "usage": None,
+                "warnings": ["Message dispatch failed before execution."],
+            })
             raise HTTPException(
                 status_code=503,
-                detail="Workflow could not be queued. Retry after checking the background execution connection.",
+                detail="Workflow could not be queued. Check the QStash connection and retry.",
             ) from None
     elif settings.inline_execution:
         # Do not hold the HTTP request open for a potentially slow model call.
@@ -1133,38 +1132,91 @@ def _owned_run_for_control(
 
 
 @app.post("/api/v1/runs/{run_id}/pause", tags=["workflows"])
-def pause_run(
+async def pause_run(
     run_id: str,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
     current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    dispatch = repo.get_qstash_dispatch(run_id) or {}
     if not repo.pause_run(run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be paused from status '{current['status']}'.")
-    logger.info("workflow_paused run_id=%s", run_id)
-    return {"run_id": run_id, "status": "paused"}
+    cancelled = False
+    if current["status"] == "queued" and dispatch.get("message_id"):
+        try:
+            cancelled = await _cancel_qstash_message(dispatch["message_id"])
+        except RuntimeError:
+            logger.warning("qstash_pause_cancel_unconfirmed run_id=%s", run_id)
+    logger.info("workflow_paused run_id=%s queued_message_cancelled=%s", run_id, cancelled)
+    return {
+        "run_id": run_id,
+        "status": "paused",
+        "queued_message_cancelled": cancelled,
+        "note": "An in-flight model request may finish; its result is held until Resume.",
+    }
 
 
 @app.post("/api/v1/runs/{run_id}/resume", tags=["workflows"])
-def resume_run(
+async def resume_run(
     run_id: str,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
     current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    dispatch = repo.get_qstash_dispatch(run_id) or {}
+    resume_status = current.get("resume_status") or "queued"
     if not repo.resume_run(run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be resumed from status '{current['status']}'.")
+
+    pending_result = repo.take_pending_result(run_id)
+    if pending_result is not None:
+        repo.save_result(pending_result)
+        resumed = repo.get_run(
+            run_id,
+            owner_id=current.get("owner_id") or principal.owner_id,
+            include_all=principal.role == "admin",
+        )
+        logger.info("workflow_resumed_from_checkpoint run_id=%s", run_id)
+        return {"run_id": run_id, "status": (resumed or {}).get("status", "completed"), "requeued": False}
+
+    if resume_status == "queued":
+        envelope = dispatch.get("payload")
+        if not isinstance(envelope, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="The queued message payload is unavailable; submit a new workflow run.",
+            )
+        try:
+            generation = repo.prepare_qstash_dispatch(run_id, envelope)
+            message_id = await _publish_qstash_message(envelope, run_id, generation)
+            repo.set_qstash_message_id(run_id, generation, message_id)
+        except Exception:
+            logger.exception("qstash_resume_dispatch_failed run_id=%s", run_id)
+            failure = {
+                "run_id": run_id,
+                "workflow": current["workflow"],
+                "status": "failed",
+                "output": {"error": "Workflow could not be resumed.", "failure_code": "resume_dispatch_failed"},
+                "evidence": [],
+                "duration_ms": 0,
+                "created_at": datetime.now(UTC),
+                "usage": None,
+                "warnings": ["Resume could not enqueue a new QStash message."],
+            }
+            repo.fail_run_if_active(failure)
+            raise HTTPException(status_code=503, detail="Workflow could not be resumed through QStash.") from None
+
     resumed = repo.get_run(
         run_id,
         owner_id=current.get("owner_id") or principal.owner_id,
         include_all=principal.role == "admin",
     )
-    logger.info("workflow_resumed run_id=%s", run_id)
-    return {"run_id": run_id, "status": (resumed or {}).get("status", "queued")}
+    logger.info("workflow_resumed run_id=%s resume_status=%s", run_id, resume_status)
+    return {"run_id": run_id, "status": (resumed or {}).get("status", "queued"), "requeued": resume_status == "queued"}
 
 
 @app.post("/api/v1/runs/{run_id}/stop", tags=["workflows"])
@@ -1174,22 +1226,23 @@ async def stop_run(
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
     current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    dispatch = repo.get_qstash_dispatch(run_id) or {}
     if not repo.stop_run(run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be stopped from status '{current['status']}'.")
-    try:
-        await _cancel_upstash_workflow(run_id)
-    except RuntimeError:
-        # The local cancellation is already authoritative and protects against
-        # late results even when QStash's remote cancellation races or fails.
-        logger.warning("workflow_remote_cancel_unconfirmed run_id=%s", run_id)
-        raise HTTPException(
-            status_code=502,
-            detail="The run was marked canceled, but QStash could not confirm remote cancellation.",
-        ) from None
-    logger.info("workflow_stopped run_id=%s", run_id)
-    return {"run_id": run_id, "status": "cancelled"}
+    cancellation_confirmed = False
+    if dispatch.get("message_id"):
+        try:
+            cancellation_confirmed = await _cancel_qstash_message(dispatch["message_id"])
+        except RuntimeError:
+            logger.warning("qstash_stop_cancel_unconfirmed run_id=%s", run_id)
+    logger.info("workflow_stopped run_id=%s cancellation_confirmed=%s", run_id, cancellation_confirmed)
+    return {
+        "run_id": run_id,
+        "status": "cancelled",
+        "remote_cancellation_confirmed": cancellation_confirmed,
+    }
 
 
 @app.get(
