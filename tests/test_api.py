@@ -692,3 +692,33 @@ def test_qstash_signature_verification_binds_the_exact_delivery_url(monkeypatch)
         "url": "https://flowpilot.example.com/internal/qstash/failure",
         "clock_tolerance": 5,
     }
+
+
+def test_pause_after_qstash_claim_prevents_model_execution(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.ensure_pending_run(
+        "11111111-1111-1111-1111-111111111111",
+        "competitor",
+        "owner-1",
+    )
+    envelope = _qstash_envelope()
+    fake_repo.restore_qstash_dispatch(envelope["run_id"], envelope)
+    original_claim = fake_repo.claim_qstash_run
+
+    def claim_then_pause(run_id, generation):
+        claim = original_claim(run_id, generation)
+        fake_repo.pause_run(run_id)
+        return claim
+
+    calls = []
+    monkeypatch.setattr(fake_repo, "claim_qstash_run", claim_then_pause)
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
+    monkeypatch.setattr(api_module, "_verify_qstash_signature", lambda body, signature, expected_url: None)
+    monkeypatch.setattr(api_module, "execute_run", lambda *args, **kwargs: calls.append(args))
+
+    response = client.post("/internal/qstash/execute", json=envelope)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "paused"
+    assert calls == []
