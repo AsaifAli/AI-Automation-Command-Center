@@ -417,7 +417,9 @@ workflow = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.markdown('<div class="premium-kicker">SYSTEM HEALTH</div>', unsafe_allow_html=True)
 execution_label = (
-    "API background execution"
+    "QStash HTTP message queue"
+    if health.get("execution_mode") == "qstash_http_queue"
+    else "API background execution"
     if health.get("execution_mode") == "inline_background"
     else "Redis + worker"
 )
