@@ -592,6 +592,8 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
         "Authorization": f"Bearer {settings.qstash_token}",
         "Content-Type": "application/json",
         "Upstash-Workflow-RunId": f"flowpilot-{run_id}",
+        # Explicitly identify the v1 Workflow protocol used by workflow-py 2.x.
+        "Upstash-Workflow-Sdk-Version": "1",
         "Upstash-Retries": "0",
         "Upstash-Flow-Control-Key": "flowpilot-global",
         # QStash requires the full flow-control value tuple, not parallelism alone.
