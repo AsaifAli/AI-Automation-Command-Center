@@ -26,11 +26,11 @@ The current workspace exposes four workflow types:
 
 ## Architecture
 
-- **Frontend:** Streamlit operator workspace (`ui/app.py`).
-- **API:** FastAPI control plane (`app/api/main.py`).
-- **Execution:** the lightweight portfolio Render topology uses in-process background execution; the durable topology uses the existing Redis Queue (RQ) worker, with PostgreSQL-backed run state.
-- **State:** persistent PostgreSQL/Redis support in the durable topology; the lightweight portfolio manifest documents ephemeral run state for the inline demo configuration.
-- **LLM access:** portfolio BYOK uses a short-lived, project-scoped Gateway session; raw provider credentials are not forwarded to the application.
+- **Frontend:** Streamlit operator workspace (ui/app.py).
+- **API:** FastAPI control plane (app/api/main.py).
+- **Execution:** the no-new-service Free Render topology enqueues RQ jobs to the existing Upstash Redis database. A supervised SimpleWorker child process runs workflows separately from the API request loop.
+- **State:** owner-scoped run records, dispatch metadata, approval state, and short-lived encrypted Gateway job credentials are stored in the same Redis database under a dedicated key prefix. PostgreSQL remains an optional backend.
+- **LLM access:** portfolio BYOK uses a short-lived, project-scoped Gateway session; raw provider credentials are not put in RQ job arguments.
 - **Observability:** health, run metrics, structured logs, and optional OpenTelemetry instrumentation.
 
 ## BYOK and Gateway handoff
@@ -41,37 +41,39 @@ Do not put provider API keys or reusable Gateway bearer tokens in source control
 
 ## Deployment
 
-The root `render.yaml` defines a portfolio/demo topology with two Render web services:
+The root render.yaml defines the current **no-new-service Free-tier topology**:
 
-- `ai-automation-api` — FastAPI API, using inline background execution and ephemeral run state.
-- `ai-automation-ui` — Streamlit workspace, configured to call the API service.
+- ai-automation-api — FastAPI, Redis-backed run state, RQ enqueueing, and a supervised embedded worker child process in the same existing Free web service.
+- ai-automation-ui — Streamlit workspace.
 
-This is intentionally a lightweight demo topology, not the durable PostgreSQL + Redis worker topology. See `render.production.yaml` for the separate durable deployment manifest and review its required secrets and resources before using it.
+This topology does not create a Render Background Worker, Render Key Value, Render Postgres, or a second Upstash database. It reuses the existing Free Upstash Redis database. The API parent remains available to serve HTTP while the isolated child process consumes workflow jobs.
 
-Required or externally supplied Render configuration includes the LLM provider credential, Gateway URL, allowed CORS origins, and the Gateway handoff root URL. Generated API role keys are provisioned by the manifest. Never commit real values.
+### Free-tier RQ worker configuration
 
-### Background execution with plain QStash messages
+Configure these variables on ai-automation-api:
 
-The free Render deployment uses the existing QStash account as a single-job HTTP message queue. It does **not** use the Upstash Workflow SDK or its step-replay protocol. QStash publishes one message to the existing FlowPilot API, the API verifies the signed delivery, executes the job, and persists the run result. QStash's native failure callback records delivery failures and timeouts.
+- REDIS_URL — native TLS Redis connection URL, `rediss://default:<password>@<host>:6379/0`. Use the Upstash TCP endpoint and password, not the Upstash REST URL/token.
+- REDIS_STATE_ENABLED=true — stores run history and control state in Redis when DATABASE_URL is blank.
+- REDIS_KEY_PREFIX=aiac-flowpilot — isolates FlowPilot state keys from other applications sharing the Redis database.
+- QUEUE_NAME=aiac-flowpilot — isolates the RQ queue name.
+- EMBEDDED_RQ_WORKER_ENABLED=true — supervises one RQ worker child process inside the existing API service.
+- QSTASH_WORKFLOW_ENABLED=false and INLINE_EXECUTION=false — select RQ instead of the older QStash or in-process execution paths.
+- WORKFLOW_JOB_TIMEOUT_SECONDS=600 — bounds each workflow job.
+- FLOWPILOT_GATEWAY_CREDENTIAL_KEY — Fernet key used to encrypt short-lived Gateway session tokens stored in Redis with a TTL.
 
-Configure these variables on **ai-automation-api** in Render (the existing names are retained for compatibility):
+DATABASE_URL is optional. Leave it unset for this zero-new-database setup; when configured, PostgreSQL remains the preferred run-state backend while Redis is still used for the RQ queue.
 
-- `QSTASH_WORKFLOW_ENABLED=true` — legacy setting name; it now selects the plain QStash message queue.
-- `QSTASH_TOKEN` — token for the selected QStash region.
-- `QSTASH_CURRENT_SIGNING_KEY` and `QSTASH_NEXT_SIGNING_KEY` — signing keys for that same region.
-- `QSTASH_URL` — e.g. `https://qstash-eu-central-1.upstash.io`.
-- `UPSTASH_WORKFLOW_URL` — legacy setting name; supply the public FlowPilot API origin, e.g. `https://ai-automation-api.onrender.com`. It is used to construct the signed execute and failure-callback URLs.
-- `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` — Fernet key used to encrypt short-lived BYOK session tokens before dispatch.
+The embedded worker is deliberately limited to **one concurrent workflow** on the Free API instance. It uses RQ's SimpleWorker in a supervised child process: long model calls do not occupy the FastAPI request loop, and Stop can terminate the isolated worker process without killing the API. The supervisor starts a replacement worker after a stop or unexpected worker exit. Run state and queued jobs remain in Upstash Redis across Render process restarts.
 
-The raw BYOK bearer is never included in the QStash message. The envelope contains only encrypted credential ciphertext, a short TTL, owner scope, run ID and workflow input. Each run has a generation number and a recorded QStash message ID; duplicate and superseded deliveries are acknowledged without invoking the model again. Both execute and failure endpoints verify the QStash signature against the exact callback URL and request body.
+**Run controls:** Pause prevents a queued job from starting. For a running job, the model call is allowed to reach its next completion boundary and its result is held in Redis until Resume; Resume commits that result without repeating the inference. Stop marks the run cancelled, cancels queued work or terminates the isolated worker process, and prevents any late result from replacing the cancelled state. An external provider request already accepted by the provider may still finish remotely.
 
-**Run controls:** Run History exposes Pause, Resume and Stop. Pausing a queued run attempts to cancel its pending QStash message. If execution is already in progress, the model call may finish but its result is held until Resume. Resume either commits that held result without another model call or republishes queued work as a new generation. Stop marks the run canceled and attempts to cancel its pending message; a model request already in flight is not forcibly interrupted, but its late result is discarded and cannot revive the run.
+**Free-tier limits:** this shares the API service's CPU and memory, so it is suitable for the portfolio/demo workload rather than heavy parallel load. Render's free service may sleep when idle; queued work is consumed when the service is awake. The existing Upstash Free database is shared with the Portfolio LLM Gateway, so its 500K monthly-command, 256 MB data, and 10 GB monthly-bandwidth limits apply to both applications together. Keep the separate aiac-flowpilot key prefix and monitor combined usage.
 
-**Execution limit:** The QStash free tier permits HTTP responses up to 15 minutes. FlowPilot uses a 14-minute message timeout to leave room for the native failure callback. Longer jobs are marked failed; they are not left indefinitely active. The free QStash quota and message/flow-control limits still apply.
+### Alternative queue deployments
 
-**Persistence boundary:** The current free Render deployment still uses the in-memory FlowPilot run repository unless `DATABASE_URL` is configured. QStash can redeliver a message and the callback can rehydrate that individual run record, but a Render restart can still erase completed run history and other in-memory state. A fully durable queue and history require persistent PostgreSQL/Redis plus the dedicated RQ worker topology; that is a separate paid deployment and has not been provisioned.
+render.durable-worker.yaml and render.production.yaml describe optional paid topologies with separate worker/Redis/PostgreSQL resources. **Do not apply those manifests for the current no-cost deployment.** The current path does not provision or upgrade any paid service.
 
-The existing `flowpilot-global` flow-control key caps concurrent deliveries to protect the small free Render API instance. Use this as a portfolio/demo job queue, not an SLA-backed production queue.
+The previous QStash HTTP-message integration remains in the code as a compatibility path, but it is disabled in the current deployment configuration. The old QStash credentials can remain in Render without being used.
 
 ## Local development
 
@@ -114,14 +116,13 @@ A passing CI run establishes the checks included in that workflow; it does not b
 ## Portfolio positioning
 
 **FlowPilot — AI Workflow Automation:** a distinct AI application for orchestrating bounded workflows, tracking execution, and keeping consequential actions reviewable. It is not the shared Evaluation Harness dashboard and is not the private Agency OS.
-## Live portfolio demo verification
+## Hosted deployment status
 
-The website-configured hosted endpoints were checked on November 25, 2026:
+The existing public services are:
 
-- UI: `https://ai-automation-ui-ac2c.onrender.com` — Streamlit `/_stcore/health` returned `ok`.
-- API: `https://ai-automation-api.onrender.com/health` returned `status: ok`.
-- API: `https://ai-automation-api.onrender.com/ready` returned `status: ready`.
+- UI: `https://ai-automation-ui-ac2c.onrender.com`
+- API: `https://ai-automation-api.onrender.com`
 
-The hosted deployment uses the lightweight portfolio/demo topology declared by the root `render.yaml`. The API reports `state_store=ephemeral-memory` unless `DATABASE_URL` is configured; run history is therefore not restart-durable. The optional QStash HTTP message queue does not create a persistent database or a separate worker. The durable PostgreSQL + Redis worker topology in `render.production.yaml` remains a distinct deployment choice.
+The prior hosted revision was last health-checked on November 25, 2026. It reported `state_store=ephemeral-memory` and used the earlier QStash path. **That is not the target configuration described above.** The no-new-service RQ/Redis topology becomes active only after the updated API code is deployed and the existing API service receives its native TLS `REDIS_URL` and worker flags.
 
-These checks confirm service health/readiness only. A full live workflow execution with a real BYOK session and approval path still needs a synthetic end-to-end test.
+After rollout, verify `/`, `/health`, and `/ready`: the root endpoint should report `state_store=redis`, the worker execution mode should be `embedded_rq_worker`, and readiness should return `state_store=redis`. These checks do not invoke an LLM provider. A separate synthetic workflow/BYOK smoke test should be run only when provider usage is acceptable.

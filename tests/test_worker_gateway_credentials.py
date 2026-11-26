@@ -40,9 +40,13 @@ def test_workflow_retry_can_decrypt_encrypted_token_without_consuming_repository
 
         def mark_running(self, run_id):
             observed["running"] = run_id
+            return True
 
         def save_result(self, result):
             observed.setdefault("saved", []).append(result)
+
+        def save_paused_result(self, run_id, result):
+            return False
 
     class FakeVault:
         def __init__(self, encryption_key, ttl_seconds):
@@ -104,10 +108,13 @@ def test_workflow_retry_does_not_persist_an_intermediate_failure(monkeypatch):
             pass
 
         def mark_running(self, run_id):
-            return None
+            return True
 
         def save_result(self, result):
             observed["saved"].append(result)
+
+        def save_paused_result(self, run_id, result):
+            return False
 
     class FakeEngine:
         def __init__(self, llm):
@@ -152,9 +159,13 @@ def test_worker_consumes_credential_reference_and_clears_context(monkeypatch):
 
         def mark_running(self, run_id):
             observed["running"] = run_id
+            return True
 
         def save_result(self, result):
             observed["result"] = result
+
+        def save_paused_result(self, run_id, result):
+            return False
 
     class FakeVault:
         def __init__(self, encryption_key, ttl_seconds):

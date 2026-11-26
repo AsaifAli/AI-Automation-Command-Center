@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api.main as api_module
+from app.core.config import Settings
 
 
 class FakeRepo:
@@ -36,6 +37,7 @@ class FakeRepo:
             "warnings": [],
         }
         self.dispatch = None
+        self.rq_dispatch = None
         return self.run["run_id"]
 
     def ensure_pending_run(self, run_id, workflow, owner_id):
@@ -57,6 +59,7 @@ class FakeRepo:
             "warnings": [],
         }
         self.dispatch = None
+        self.rq_dispatch = None
 
     def prepare_qstash_dispatch(self, run_id, payload):
         if not self.run or self.run["run_id"] != run_id or self.run["status"] != "queued":
@@ -70,6 +73,32 @@ class FakeRepo:
             "pending_result": None,
         }
         return generation
+
+    def prepare_rq_dispatch(self, run_id, payload):
+        if not self.run or self.run["run_id"] != run_id or self.run["status"] not in {"queued", "awaiting_approval"}:
+            raise ValueError("Only queued runs can be dispatched.")
+        generation = (self.rq_dispatch or {}).get("generation", 0) + 1
+        payload["dispatch_generation"] = generation
+        self.rq_dispatch = {
+            "payload": json.loads(json.dumps(payload)),
+            "job_id": None,
+            "generation": generation,
+            "pending_result": None,
+        }
+        return generation
+
+    def set_rq_job_id(self, run_id, generation, job_id):
+        if not self.run or self.run["run_id"] != run_id or not self.rq_dispatch:
+            return False
+        if self.rq_dispatch["generation"] != generation:
+            return False
+        self.rq_dispatch["job_id"] = job_id
+        return True
+
+    def get_rq_dispatch(self, run_id):
+        if not self.run or self.run["run_id"] != run_id:
+            return None
+        return dict(self.rq_dispatch) if self.rq_dispatch else None
 
     def restore_qstash_dispatch(self, run_id, payload):
         if not self.run or self.run["run_id"] != run_id:
@@ -535,6 +564,68 @@ def test_pause_resume_and_stop_target_only_the_owned_run(monkeypatch):
     assert cancelled == ["msg_flowpilot_test", "msg_flowpilot_resumed"]
 
 
+def test_rq_pause_resume_and_stop_work_without_qstash(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.create_pending_run("competitor", owner_id="local-development")
+    run_id = fake_repo.run["run_id"]
+    envelope = {
+        "run_id": run_id,
+        "workflow": "competitor",
+        "payload": {"competitors": ["AI"]},
+        "owner_id": "local-development",
+        "gateway_credential_id": "credential-ref",
+    }
+    generation = fake_repo.prepare_rq_dispatch(run_id, envelope)
+    first_job_id = f"{run_id}-{generation}"
+    fake_repo.set_rq_job_id(run_id, generation, first_job_id)
+
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+
+    queue_jobs = []
+    class FakeRQQueue:
+        def enqueue(self, *args, **kwargs):
+            queue_jobs.append({"args": args, "kwargs": dict(kwargs)})
+            return SimpleNamespace(id=kwargs["job_id"])
+
+    monkeypatch.setattr(api_module, "queue", lambda: FakeRQQueue())
+    cancelled = []
+    stopped = []
+    monkeypatch.setattr(api_module, "_cancel_rq_job", lambda job_id: cancelled.append(job_id) or True)
+    monkeypatch.setattr(api_module, "_stop_rq_job", lambda job_id: stopped.append(job_id) or True)
+
+    paused = client.post(f"/api/v1/runs/{run_id}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+    assert paused.json()["queued_job_cancelled"] is True
+    assert cancelled == [first_job_id]
+
+    resumed = client.post(f"/api/v1/runs/{run_id}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "queued"
+    assert resumed.json()["requeued"] is True
+    assert len(queue_jobs) == 1
+    assert queue_jobs[0]["kwargs"]["job_id"] == f"{run_id}-2"
+    assert queue_jobs[0]["kwargs"]["gateway_credential_id"] == "credential-ref"
+
+    stopped_response = client.post(f"/api/v1/runs/{run_id}/stop")
+    assert stopped_response.status_code == 200
+    assert stopped_response.json()["status"] == "cancelled"
+    assert stopped == [f"{run_id}-2"]
+
+
+def test_run_controls_are_rejected_for_inline_demo_execution(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.create_pending_run("competitor", owner_id="local-development")
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", True)
+
+    response = client.post(f"/api/v1/runs/{fake_repo.run['run_id']}/pause")
+    assert response.status_code == 409
+
+
 def test_run_controls_do_not_disclose_another_owners_run(monkeypatch):
     fake_repo = FakeRepo()
     fake_repo.create_pending_run("competitor", owner_id="someone-else")
@@ -722,3 +813,271 @@ def test_pause_after_qstash_claim_prevents_model_execution(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "paused"
     assert calls == []
+
+
+
+def test_rq_queue_helpers_cancel_only_queued_jobs_and_stop_started_jobs(monkeypatch):
+    from rq.job import JobStatus
+
+    class FakeJob:
+        def __init__(self, status):
+            self.status = status
+            self.id = "rq-job-test"
+            self.connection = object()
+            self.cancelled = False
+
+        def get_status(self, refresh=False):
+            return self.status
+
+        def cancel(self):
+            self.cancelled = True
+
+    class FakeQueue:
+        def __init__(self, job):
+            self.job = job
+
+        def fetch_job(self, job_id):
+            assert job_id == "rq-job-test"
+            return self.job
+
+    queued = FakeJob(JobStatus.QUEUED)
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue(queued))
+    assert api_module._cancel_rq_job("rq-job-test") is True
+    assert queued.cancelled is True
+
+    running = FakeJob(JobStatus.STARTED)
+    stop_commands = []
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue(running))
+    monkeypatch.setattr(
+        api_module,
+        "send_stop_job_command",
+        lambda connection, job_id: stop_commands.append((connection, job_id)),
+    )
+    assert api_module._cancel_rq_job("rq-job-test") is False
+    assert api_module._stop_rq_job("rq-job-test") is True
+    assert stop_commands == [(running.connection, "rq-job-test")]
+
+
+def test_rq_enqueue_persists_job_identity_and_worker_callbacks(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.create_pending_run("competitor", owner_id="local-development")
+    run_id = fake_repo.run["run_id"]
+    envelope = {
+        "run_id": run_id,
+        "workflow": "competitor",
+        "payload": {"competitors": ["AI"]},
+        "owner_id": "local-development",
+        "gateway_credential_id": None,
+    }
+    generation = fake_repo.prepare_rq_dispatch(run_id, envelope)
+    captured = {}
+
+    class FakeRQQueue:
+        def enqueue(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "queue", lambda: FakeRQQueue())
+    monkeypatch.setattr(api_module.settings, "workflow_job_timeout_seconds", 432)
+
+    job_id = api_module._enqueue_rq_dispatch(envelope, generation)
+
+    assert job_id == f"{run_id}-1"
+    assert fake_repo.get_rq_dispatch(run_id)["job_id"] == job_id
+    assert captured["kwargs"]["job_timeout"] == 432
+    assert captured["kwargs"]["rq_generation"] == 1
+    assert captured["kwargs"]["rq_job_id"] == job_id
+    assert captured["kwargs"]["on_failure"] is api_module.record_rq_job_failure
+    assert captured["kwargs"]["on_stopped"] is api_module.record_rq_job_stopped
+
+
+def test_production_embedded_worker_accepts_tls_upstash_url():
+    settings = Settings(
+        _env_file=None,
+        app_env="production",
+        api_auth_enabled=True,
+        api_auth_require_keys=False,
+        redis_url="rediss://default:nonempty-test-password@upstash.example:6379/0",
+        redis_state_enabled=True,
+        redis_key_prefix="flowpilot",
+        embedded_rq_worker_enabled=True,
+        inline_execution=False,
+        qstash_workflow_enabled=False,
+    )
+
+    assert settings.redis_state_enabled is True
+    assert settings.embedded_rq_worker_enabled is True
+
+
+def test_embedded_worker_requires_redis_state_and_exclusive_queue_mode():
+    with pytest.raises(ValueError, match="requires REDIS_STATE_ENABLED"):
+        Settings(_env_file=None, embedded_rq_worker_enabled=True)
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        Settings(
+            _env_file=None,
+            redis_state_enabled=True,
+            embedded_rq_worker_enabled=True,
+            inline_execution=True,
+        )
+
+
+def test_embedded_worker_stop_does_not_send_rq_kill_horse_command(monkeypatch):
+    class FakeJob:
+        id = "active-job"
+        worker_name = "embedded-worker"
+        connection = object()
+
+        def get_status(self, refresh=False):
+            return api_module.JobStatus.STARTED
+
+    class FakeQueue:
+        def fetch_job(self, job_id):
+            assert job_id == "active-job"
+            return FakeJob()
+
+    calls = []
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue())
+    monkeypatch.setattr(api_module.settings, "embedded_rq_worker_enabled", True)
+    monkeypatch.setattr(
+        api_module,
+        "send_stop_job_command",
+        lambda *_args, **_kwargs: pytest.fail("must not issue kill-horse for the embedded SimpleWorker"),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "embedded_rq_worker",
+        SimpleNamespace(stop_current_job=lambda job: calls.append(job.id) or True),
+    )
+
+    assert api_module._stop_rq_job("active-job") is True
+    assert calls == ["active-job"]
+
+
+
+def test_rq_byoK_sessions_can_be_queued_with_redis_backed_state(monkeypatch):
+    captured = {}
+
+    class RedisBackedFakeRepo(FakeRepo):
+        def store_gateway_job_credential(self, run_id, encrypted_token, ttl_seconds):
+            captured["credential"] = (run_id, encrypted_token, ttl_seconds)
+            return "redis-credential-reference"
+
+    class FakeVault:
+        def __init__(self, key, ttl_seconds):
+            captured["vault"] = (key, ttl_seconds)
+
+        def encrypt(self, token):
+            captured["raw_token_seen_by_vault"] = token
+            return b"encrypted-gateway-session"
+
+    fake_repo = RedisBackedFakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "GatewayCredentialVault", FakeVault)
+    monkeypatch.setattr(
+        api_module,
+        "verify_flowpilot_gateway_session",
+        lambda _token: api_module.GatewaySessionLifetime(720, "b" * 64),
+    )
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue())
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "redis_state_enabled", True)
+    monkeypatch.setattr(api_module.settings, "database_url", "")
+    monkeypatch.setattr(api_module.settings, "gateway_job_credential_encryption_key", "test-fernet-key")
+    monkeypatch.setattr(api_module.settings, "gateway_job_credential_ttl_seconds", 900)
+
+    raw_token = "raw-byoK-bearer"
+    response = client.post(
+        "/api/v1/runs",
+        headers={"X-LLM-Gateway-Token": raw_token},
+        json={"workflow": "competitor", "payload": {"competitors": ["Example AI"]}},
+    )
+
+    assert response.status_code == 202
+    assert captured["vault"] == ("test-fernet-key", 900)
+    assert captured["raw_token_seen_by_vault"] == raw_token
+    assert captured["credential"] == (
+        fake_repo.run["run_id"],
+        b"encrypted-gateway-session",
+        720,
+    )
+    assert FakeQueue.last_enqueue["kwargs"]["gateway_credential_id"] == "redis-credential-reference"
+    assert raw_token not in repr(FakeQueue.last_enqueue)
+    assert b"encrypted-gateway-session" not in repr(FakeQueue.last_enqueue).encode()
+    assert response.json()["status"] == "queued"
+
+
+def test_rq_submission_keeps_sync_redis_and_queue_calls_off_the_api_event_loop(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    class ThreadAwareFakeRepo(FakeRepo):
+        @staticmethod
+        def _record(operation):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                calls.append((operation, "worker-thread"))
+            else:
+                calls.append((operation, "event-loop"))
+
+        def create_pending_run(self, workflow, owner_id="legacy"):
+            self._record("create_pending_run")
+            return super().create_pending_run(workflow, owner_id=owner_id)
+
+        def prepare_rq_dispatch(self, run_id, payload):
+            self._record("prepare_rq_dispatch")
+            return super().prepare_rq_dispatch(run_id, payload)
+
+        def set_rq_job_id(self, run_id, generation, job_id):
+            self._record("set_rq_job_id")
+            return super().set_rq_job_id(run_id, generation, job_id)
+
+        def get_run(self, run_id, *, owner_id=None, include_all=False):
+            self._record("get_run")
+            return super().get_run(run_id, owner_id=owner_id, include_all=include_all)
+
+    monkeypatch.setattr(api_module, "repo", ThreadAwareFakeRepo())
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue())
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "redis_state_enabled", True)
+    monkeypatch.setattr(api_module.settings, "database_url", "")
+
+    response = client.post(
+        "/api/v1/runs",
+        json={"workflow": "competitor", "payload": {"competitors": ["Example AI"]}},
+    )
+
+    assert response.status_code == 202
+    assert calls
+    assert {thread for _operation, thread in calls} == {"worker-thread"}
+
+
+def test_readiness_uses_backend_ping_without_scanning_run_metrics(monkeypatch):
+    calls = []
+
+    class ReadinessRepo:
+        def ping(self):
+            calls.append("ping")
+            return True
+
+        def metrics(self):
+            pytest.fail("readiness must not scan run metrics")
+
+    monkeypatch.setattr(api_module, "repo", ReadinessRepo())
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "redis_state_enabled", True)
+    monkeypatch.setattr(api_module.settings, "embedded_rq_worker_enabled", True)
+    monkeypatch.setattr(api_module.settings, "database_url", "")
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json()["state_store"] == "redis"
+    assert response.json()["redis"] == "embedded_rq_worker"
+    assert calls == ["ping"]

@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     # Infrastructure
     database_url: str = ""
     redis_url: str = "redis://redis:6379/0"
+    redis_state_enabled: bool = False
+    redis_key_prefix: str = "aiac"
     queue_name: str = "automation"
     upstash_redis_rest_url: str = ""
     upstash_redis_rest_token: str = Field(default="", repr=False)
@@ -49,6 +51,7 @@ class Settings(BaseSettings):
     request_timeout_seconds: int = 30
     max_retries: int = 2
     inline_execution: bool = False
+    embedded_rq_worker_enabled: bool = False
     # Maximum time RQ may spend executing one workflow job.
     workflow_job_timeout_seconds: int = Field(default=600, ge=60, le=1800)
     # Queue BYOK tokens only as encrypted PostgreSQL records; RQ stores UUID references.
@@ -151,6 +154,32 @@ class Settings(BaseSettings):
                 or workflow_url.port not in allowed_workflow_ports
             ):
                 raise ValueError("UPSTASH_WORKFLOW_URL must be the public HTTPS FlowPilot API base URL.")
+
+        if self.redis_state_enabled:
+            if not self.redis_url.strip():
+                raise ValueError("REDIS_STATE_ENABLED requires REDIS_URL.")
+            redis_url = urlsplit(self.redis_url)
+            if (
+                redis_url.scheme not in {"redis", "rediss"}
+                or not redis_url.hostname
+                or redis_url.path not in {"", "/", "/0"}
+                or redis_url.query
+                or redis_url.fragment
+                or redis_url.username not in {None, "default"}
+                or (redis_url.username is not None and not redis_url.password)
+            ):
+                raise ValueError("REDIS_URL must be a valid Redis connection URL.")
+            if self.app_env.strip().lower() in {"prod", "production"} and redis_url.scheme != "rediss":
+                raise ValueError("Production REDIS_URL must use TLS (rediss://).")
+            if not self.redis_key_prefix or len(self.redis_key_prefix) > 64 or any(
+                not (char.isalnum() or char in "-_:") for char in self.redis_key_prefix
+            ):
+                raise ValueError("REDIS_KEY_PREFIX contains invalid characters.")
+        if self.embedded_rq_worker_enabled:
+            if not self.redis_state_enabled:
+                raise ValueError("EMBEDDED_RQ_WORKER_ENABLED requires REDIS_STATE_ENABLED.")
+            if self.qstash_workflow_enabled or self.inline_execution:
+                raise ValueError("Embedded RQ worker cannot be combined with QStash or inline execution.")
 
         if not 60 <= self.gateway_job_credential_ttl_seconds <= 1800:
             raise ValueError(

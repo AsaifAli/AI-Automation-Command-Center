@@ -1,6 +1,7 @@
-# Portfolio/demo topology. Workflows run as in-process background tasks and
-# use ephemeral run state; HTTP requests return the run reference immediately.
-# See render.production.yaml for the durable PostgreSQL + Redis worker topology.
+# No-new-service Free-tier topology. The API and a supervised RQ worker
+# child share the existing Free Render web service. Queue + run state use the
+# already-existing Upstash Redis database over native TLS Redis TCP.
+# No new Render worker, Key Value, or PostgreSQL resource is provisioned.
 services:
   - type: web
     name: ai-automation-api
@@ -20,7 +21,7 @@ services:
       # Optional QStash Workflow background execution; credentials are added
       # privately to the existing ai-automation-api Render service.
       - key: QSTASH_WORKFLOW_ENABLED
-        sync: false
+        value: "false"
       - key: QSTASH_TOKEN
         sync: false
       - key: QSTASH_CURRENT_SIGNING_KEY
@@ -33,15 +34,29 @@ services:
         sync: false
       - key: FLOWPILOT_GATEWAY_CREDENTIAL_KEY
         sync: false
-      # Optional Supabase PostgreSQL connection for durable, owner-scoped run history.
+      # Optional existing PostgreSQL connection. Leave blank to use Redis state.
       - key: DATABASE_URL
         sync: false
+      # Existing Upstash Redis TCP URL (rediss://default:<password>@<host>:6379/0).
+      # Do not use the Upstash REST URL here; RQ requires native Redis commands.
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_STATE_ENABLED
+        value: "true"
+      - key: REDIS_KEY_PREFIX
+        value: aiac-flowpilot
+      - key: QUEUE_NAME
+        value: aiac-flowpilot
+      - key: EMBEDDED_RQ_WORKER_ENABLED
+        value: "true"
+      - key: WORKFLOW_JOB_TIMEOUT_SECONDS
+        value: "600"
       - key: APP_VERSION
         value: 3.5.0
       - key: DEMO_MODE
         value: "false"
       - key: INLINE_EXECUTION
-        value: "true"
+        value: "false"
       - key: LLM_PROVIDER
         value: openrouter
       - key: OPENAI_BASE_URL
@@ -67,7 +82,7 @@ services:
       - key: LLM_GATEWAY_ALLOWED_HOSTS
         value: portfolio-llm-gateway.onrender.com
       - key: REQUEST_TIMEOUT_SECONDS
-        value: "60"
+        value: "90"
       - key: MAX_RETRIES
         value: "1"
       - key: SCHEDULE_ENABLED

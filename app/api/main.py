@@ -20,6 +20,8 @@ from qstash import Receiver
 from qstash.errors import SignatureError
 from redis import Redis
 from rq import Queue
+from rq.command import send_stop_job_command
+from rq.job import JobStatus
 from starlette.responses import Response
 
 from app.core.auth import Principal, authenticate_api_key, require_permission
@@ -43,13 +45,15 @@ from app.models.schemas import (
     WorkflowResult,
 )
 from app.storage.repository import Repository
-from app.workers.jobs import execute_run
+from app.workers.embedded import EmbeddedRQWorker
+from app.workers.jobs import execute_run, record_rq_job_failure, record_rq_job_stopped
 
 settings = get_settings()
 configure_logging(settings.log_level)
 
 logger = logging.getLogger(__name__)
 repo = Repository(settings)
+embedded_rq_worker: EmbeddedRQWorker | None = None
 
 PROM_METRICS = {
     name: Gauge(name, f"{name.replace('_', ' ')}")
@@ -95,10 +99,14 @@ app.add_middleware(
 
 
 def queue() -> Queue:
-    return Queue(
-        settings.queue_name,
-        connection=Redis.from_url(settings.redis_url),
+    connection = Redis.from_url(
+        settings.redis_url,
+        decode_responses=False,
+        socket_connect_timeout=5,
+        socket_timeout=15,
+        health_check_interval=30,
     )
+    return Queue(settings.queue_name, connection=connection)
 
 
 class GatewaySessionLifetime(int):
@@ -245,16 +253,39 @@ def verify_flowpilot_gateway_session(gateway_token: str) -> GatewaySessionLifeti
 
 @app.on_event("startup")
 def startup() -> None:
-    if settings.database_url.strip():
+    global embedded_rq_worker
+
+    if settings.database_url.strip() or settings.redis_state_enabled:
         repo.init_db()
     else:
-        logger.info(
-            "database persistence disabled; using ephemeral in-memory state"
-        )
+        logger.warning("database persistence disabled; using ephemeral in-memory state")
 
     LLMProvider(settings)
+
+    # Fork the isolated worker before configuring the API process' telemetry
+    # exporter threads. The child configures its own exporter after the fork.
+    if settings.embedded_rq_worker_enabled:
+        embedded_rq_worker = EmbeddedRQWorker(settings)
+        embedded_rq_worker.start()
+
     configure_telemetry(settings)
-    logger.info("api_started version=%s", settings.app_version)
+
+    logger.info(
+        "api_started version=%s state_store=%s embedded_rq_worker=%s",
+        settings.app_version,
+        "postgresql" if settings.database_url.strip() else (
+            "redis" if settings.redis_state_enabled else "ephemeral-memory"
+        ),
+        bool(embedded_rq_worker),
+    )
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    global embedded_rq_worker
+    if embedded_rq_worker is not None:
+        embedded_rq_worker.stop()
+        embedded_rq_worker = None
 
 
 @app.middleware("http")
@@ -341,24 +372,27 @@ async def request_context(request: Request, call_next):
 @app.get("/", tags=["system"])
 def root():
     state_store = (
-        "ephemeral-memory"
-        if not settings.database_url.strip()
-        else "postgresql"
+        "postgresql"
+        if settings.database_url.strip()
+        else "redis" if settings.redis_state_enabled
+        else "ephemeral-memory"
     )
 
     if settings.qstash_workflow_enabled:
         architecture = (
             "api -> QStash HTTP message -> signed execution endpoint + native failure callback -> "
-            + ("PostgreSQL-backed run state" if settings.database_url.strip() else "ephemeral in-memory run state")
+            + (
+                "PostgreSQL-backed run state" if settings.database_url.strip()
+                else "Redis-backed run state" if settings.redis_state_enabled
+                else "ephemeral in-memory run state"
+            )
         )
+    elif settings.inline_execution:
+        architecture = "api -> in-process background execution -> " + state_store
+    elif settings.embedded_rq_worker_enabled:
+        architecture = "free API service -> RQ/Upstash Redis queue -> supervised embedded worker process -> Redis run state"
     else:
-        architecture = (
-            "api -> in-process background execution -> ephemeral in-memory state"
-            if settings.inline_execution and not settings.database_url.strip()
-            else "api -> execution -> persistent postgres state"
-            if settings.database_url.strip()
-            else "api -> execution -> ephemeral in-memory state"
-        )
+        architecture = "api -> Redis Queue -> dedicated RQ worker -> durable state store"
 
     return {
         "service": settings.app_name,
@@ -383,7 +417,9 @@ def health():
         execution_mode=(
             "qstash_http_queue"
             if settings.qstash_workflow_enabled
-            else "inline_background" if settings.inline_execution else "redis_worker"
+            else "inline_background" if settings.inline_execution
+            else "embedded_rq_worker" if settings.embedded_rq_worker_enabled
+            else "redis_worker"
         ),
     )
 
@@ -392,23 +428,42 @@ def health():
 def ready():
     # Kept public for Docker and deployment health probes.
     try:
-        repo.metrics()
+        repo.ping()
 
         redis_status = (
             "qstash_http_queue"
             if settings.qstash_workflow_enabled
-            else "inline" if settings.inline_execution else "available"
+            else "inline" if settings.inline_execution
+            else "embedded_rq_worker" if settings.embedded_rq_worker_enabled
+            else "rq_worker"
         )
 
-        if not settings.inline_execution and not settings.qstash_workflow_enabled:
-            Redis.from_url(settings.redis_url).ping()
+        # Redis-backed state and RQ share REDIS_URL, so the repository ping
+        # above already checks both. With PostgreSQL run state, separately
+        # verify Redis because it still carries the RQ queue.
+        if (
+            not settings.qstash_workflow_enabled
+            and not settings.inline_execution
+            and not settings.redis_state_enabled
+        ) or (
+            settings.database_url.strip()
+            and not settings.qstash_workflow_enabled
+            and not settings.inline_execution
+        ):
+            Redis.from_url(
+                settings.redis_url,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+                health_check_interval=30,
+            ).ping()
 
         return {
             "status": "ready",
             "state_store": (
-                "ephemeral-memory"
-                if not settings.database_url.strip()
-                else "postgresql"
+                "postgresql"
+                if settings.database_url.strip()
+                else "redis" if settings.redis_state_enabled
+                else "ephemeral-memory"
             ),
             "redis": redis_status,
             "llm": "demo" if settings.demo_mode else "configured",
@@ -700,6 +755,70 @@ async def _cancel_qstash_message(message_id: str) -> bool:
         return True
 
 
+def _enqueue_rq_dispatch(envelope: dict, generation: int) -> str:
+    """Persist a generation-specific RQ job reference, then enqueue its payload."""
+    run_id = envelope.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("RQ workflow run identifier is invalid.")
+    job_id = f"{run_id}-{generation}"
+    if not repo.set_rq_job_id(run_id, generation, job_id):
+        raise RuntimeError("RQ dispatch generation changed before enqueue.")
+
+    enqueue_kwargs = {
+        "job_id": job_id,
+        "job_timeout": settings.workflow_job_timeout_seconds,
+        "on_failure": record_rq_job_failure,
+        "on_stopped": record_rq_job_stopped,
+        "rq_generation": generation,
+        "rq_job_id": job_id,
+    }
+    credential_id = envelope.get("gateway_credential_id")
+    if credential_id:
+        enqueue_kwargs["gateway_credential_id"] = credential_id
+
+    queue().enqueue(
+        execute_run,
+        run_id,
+        envelope["workflow"],
+        envelope["payload"],
+        **enqueue_kwargs,
+    )
+    return job_id
+
+
+def _cancel_rq_job(job_id: str) -> bool:
+    """Cancel a queued RQ job. Running jobs are left to their safe completion point."""
+    if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 256:
+        return False
+    job = queue().fetch_job(job_id)
+    if job is None or job.get_status(refresh=True) != JobStatus.QUEUED:
+        return False
+    job.cancel()
+    return True
+
+
+def _stop_rq_job(job_id: str) -> bool:
+    """Cancel queued work or send RQ's stop command to an active worker process."""
+    if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 256:
+        return False
+    job = queue().fetch_job(job_id)
+    if job is None:
+        return False
+    status = job.get_status(refresh=True)
+    if status == JobStatus.QUEUED:
+        job.cancel()
+        return True
+    if status == JobStatus.STARTED:
+        if settings.embedded_rq_worker_enabled:
+            if embedded_rq_worker is None:
+                logger.error("embedded_worker_missing_for_stop job_id=%s", job_id)
+                return False
+            return embedded_rq_worker.stop_current_job(job)
+        send_stop_job_command(job.connection, job.id)
+        return True
+    return False
+
+
 @app.post("/internal/qstash/execute", include_in_schema=False)
 async def execute_qstash_message(request: Request):
     """Execute one QStash message and acknowledge its delivery exactly once."""
@@ -876,12 +995,12 @@ async def run_workflow(
             except GatewayCredentialError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from None
         elif not settings.inline_execution:
-            if not settings.database_url.strip():
+            if not settings.database_url.strip() and not settings.redis_state_enabled:
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "Queued Gateway sessions require persistent PostgreSQL storage. "
-                        "Use the service-level LLM key or configure PostgreSQL."
+                        "Queued Gateway sessions require persistent state storage. "
+                        "Configure PostgreSQL or enable the Redis-backed repository."
                     ),
                 )
             try:
@@ -911,7 +1030,7 @@ async def run_workflow(
         if submitted_payload_size > settings.qstash_workflow_max_payload_bytes - 20_000:
             raise HTTPException(status_code=413, detail="Workflow payload is too large for background delivery.")
 
-    run_id = repo.create_pending_run(request.workflow.value, owner_id=owner_id)
+    run_id = await asyncio.to_thread(repo.create_pending_run, request.workflow.value, owner_id=owner_id)
     payload = dict(request.payload)
     credential_id: str | None = None
 
@@ -932,12 +1051,16 @@ async def run_workflow(
             "gateway_token_ttl_seconds": credential_ttl,
         }
         try:
-            generation = repo.prepare_qstash_dispatch(run_id, envelope)
+            generation = await asyncio.to_thread(
+                repo.prepare_qstash_dispatch, run_id, envelope
+            )
             message_id = await _publish_qstash_message(envelope, run_id, generation)
-            repo.set_qstash_message_id(run_id, generation, message_id)
+            await asyncio.to_thread(
+                repo.set_qstash_message_id, run_id, generation, message_id
+            )
         except Exception:
             logger.exception("qstash_message_dispatch_failed run_id=%s", run_id)
-            repo.save_result({
+            await asyncio.to_thread(repo.save_result, {
                 "run_id": run_id,
                 "workflow": request.workflow.value,
                 "status": "failed",
@@ -973,31 +1096,31 @@ async def run_workflow(
                     settings.gateway_job_credential_ttl_seconds,
                     gateway_session_remaining or settings.gateway_job_credential_ttl_seconds,
                 )
-                credential_id = repo.store_gateway_job_credential(
+                credential_id = await asyncio.to_thread(
+                    repo.store_gateway_job_credential,
                     run_id,
                     encrypted_gateway_token,
                     credential_ttl,
                 )
 
-            enqueue_kwargs = {
-                "job_id": run_id,
-                "job_timeout": settings.workflow_job_timeout_seconds,
-            }
-            if credential_id is not None:
+            rq_envelope = {
+                "run_id": run_id,
+                "workflow": request.workflow.value,
+                "payload": payload,
+                "owner_id": owner_id,
                 # Redis receives only this opaque reference, never the bearer.
-                enqueue_kwargs["gateway_credential_id"] = credential_id
-
-            queue().enqueue(
-                execute_run,
-                run_id,
-                request.workflow.value,
-                payload,
-                **enqueue_kwargs,
+                "gateway_credential_id": credential_id,
+            }
+            generation = await asyncio.to_thread(
+                repo.prepare_rq_dispatch, run_id, rq_envelope
             )
+            await asyncio.to_thread(_enqueue_rq_dispatch, rq_envelope, generation)
         except Exception:
             if credential_id is not None:
                 try:
-                    repo.delete_gateway_job_credential(run_id, credential_id)
+                    await asyncio.to_thread(
+                        repo.delete_gateway_job_credential, run_id, credential_id
+                    )
                 except Exception:
                     logger.exception(
                         "gateway_credential_cleanup_failed run_id=%s",
@@ -1005,7 +1128,7 @@ async def run_workflow(
                     )
             logger.exception("workflow_enqueue_failed run_id=%s", run_id)
             try:
-                repo.save_result({
+                await asyncio.to_thread(repo.save_result, {
                     "run_id": run_id,
                     "workflow": request.workflow.value,
                     "status": "failed",
@@ -1026,7 +1149,7 @@ async def run_workflow(
                 detail="Workflow could not be queued. Check queue availability and retry.",
             ) from None
 
-    result = repo.get_run(run_id)
+    result = await asyncio.to_thread(repo.get_run, run_id)
     if not result:
         raise HTTPException(
             status_code=500,
@@ -1173,24 +1296,33 @@ async def pause_run(
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
-    if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
-    current = _owned_run_for_control(run_id, llm_gateway_token, principal)
-    dispatch = repo.get_qstash_dispatch(run_id) or {}
-    if not repo.pause_run(run_id):
+    if not settings.qstash_workflow_enabled and settings.inline_execution:
+        raise HTTPException(status_code=409, detail="Run controls require a queue-backed execution mode.")
+    current = await asyncio.to_thread(_owned_run_for_control, run_id, llm_gateway_token, principal)
+    dispatch_getter = (
+        repo.get_qstash_dispatch
+        if settings.qstash_workflow_enabled
+        else repo.get_rq_dispatch
+    )
+    dispatch = (await asyncio.to_thread(dispatch_getter, run_id)) or {}
+    if not await asyncio.to_thread(repo.pause_run, run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be paused from status '{current['status']}'.")
     cancelled = False
-    if current["status"] == "queued" and dispatch.get("message_id"):
+    if current["status"] == "queued":
         try:
-            cancelled = await _cancel_qstash_message(dispatch["message_id"])
-        except RuntimeError:
-            logger.warning("qstash_pause_cancel_unconfirmed run_id=%s", run_id)
-    logger.info("workflow_paused run_id=%s queued_message_cancelled=%s", run_id, cancelled)
+            if settings.qstash_workflow_enabled and dispatch.get("message_id"):
+                cancelled = await _cancel_qstash_message(dispatch["message_id"])
+            elif not settings.qstash_workflow_enabled and dispatch.get("job_id"):
+                cancelled = await asyncio.to_thread(_cancel_rq_job, dispatch["job_id"])
+        except Exception:
+            logger.warning("workflow_pause_queue_cancel_unconfirmed run_id=%s", run_id, exc_info=True)
+    logger.info("workflow_paused run_id=%s queued_delivery_cancelled=%s", run_id, cancelled)
     return {
         "run_id": run_id,
         "status": "paused",
-        "queued_message_cancelled": cancelled,
-        "note": "An in-flight model request may finish; its result is held until Resume.",
+        "queued_message_cancelled": cancelled if settings.qstash_workflow_enabled else False,
+        "queued_job_cancelled": cancelled if not settings.qstash_workflow_enabled else False,
+        "note": "Queued work will not start while paused. An in-flight workflow may finish; its result is held until Resume.",
     }
 
 
@@ -1200,18 +1332,31 @@ async def resume_run(
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
-    if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
-    current = _owned_run_for_control(run_id, llm_gateway_token, principal)
-    dispatch = repo.get_qstash_dispatch(run_id) or {}
+    if not settings.qstash_workflow_enabled and settings.inline_execution:
+        raise HTTPException(status_code=409, detail="Run controls require a queue-backed execution mode.")
+    current = await asyncio.to_thread(_owned_run_for_control, run_id, llm_gateway_token, principal)
+    dispatch_getter = (
+        repo.get_qstash_dispatch
+        if settings.qstash_workflow_enabled
+        else repo.get_rq_dispatch
+    )
+    dispatch = (await asyncio.to_thread(dispatch_getter, run_id)) or {}
     resume_status = current.get("resume_status") or "queued"
-    if not repo.resume_run(run_id):
+    pending_checkpoint = dispatch.get("pending_result")
+    dispatch_payload = dispatch.get("payload")
+    if resume_status == "queued" and pending_checkpoint is None and not isinstance(dispatch_payload, dict):
+        raise HTTPException(
+            status_code=409,
+            detail="The queued task payload is unavailable; submit a new workflow run.",
+        )
+    if not await asyncio.to_thread(repo.resume_run, run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be resumed from status '{current['status']}'.")
 
-    pending_result = repo.take_pending_result(run_id)
+    pending_result = await asyncio.to_thread(repo.take_pending_result, run_id)
     if pending_result is not None:
-        repo.save_result(pending_result)
-        resumed = repo.get_run(
+        await asyncio.to_thread(repo.save_result, pending_result)
+        resumed = await asyncio.to_thread(
+            repo.get_run,
             run_id,
             owner_id=current.get("owner_id") or principal.owner_id,
             include_all=principal.role == "admin",
@@ -1220,33 +1365,40 @@ async def resume_run(
         return {"run_id": run_id, "status": (resumed or {}).get("status", "completed"), "requeued": False}
 
     if resume_status == "queued":
-        envelope = dispatch.get("payload")
-        if not isinstance(envelope, dict):
-            raise HTTPException(
-                status_code=409,
-                detail="The queued message payload is unavailable; submit a new workflow run.",
-            )
-        try:
-            generation = repo.prepare_qstash_dispatch(run_id, envelope)
-            message_id = await _publish_qstash_message(envelope, run_id, generation)
-            repo.set_qstash_message_id(run_id, generation, message_id)
-        except Exception:
-            logger.exception("qstash_resume_dispatch_failed run_id=%s", run_id)
-            failure = {
-                "run_id": run_id,
-                "workflow": current["workflow"],
-                "status": "failed",
-                "output": {"error": "Workflow could not be resumed.", "failure_code": "resume_dispatch_failed"},
-                "evidence": [],
-                "duration_ms": 0,
-                "created_at": datetime.now(UTC),
-                "usage": None,
-                "warnings": ["Resume could not enqueue a new QStash message."],
-            }
-            repo.fail_run_if_active(failure)
-            raise HTTPException(status_code=503, detail="Workflow could not be resumed through QStash.") from None
+        envelope = dispatch_payload
+        if pending_checkpoint is None:
+            try:
+                if settings.qstash_workflow_enabled:
+                    generation = await asyncio.to_thread(
+                        repo.prepare_qstash_dispatch, run_id, envelope
+                    )
+                    message_id = await _publish_qstash_message(envelope, run_id, generation)
+                    await asyncio.to_thread(
+                        repo.set_qstash_message_id, run_id, generation, message_id
+                    )
+                else:
+                    generation = await asyncio.to_thread(
+                        repo.prepare_rq_dispatch, run_id, envelope
+                    )
+                    await asyncio.to_thread(_enqueue_rq_dispatch, envelope, generation)
+            except Exception:
+                logger.exception("workflow_resume_dispatch_failed run_id=%s", run_id)
+                failure = {
+                    "run_id": run_id,
+                    "workflow": current["workflow"],
+                    "status": "failed",
+                    "output": {"error": "Workflow could not be resumed.", "failure_code": "resume_dispatch_failed"},
+                    "evidence": [],
+                    "duration_ms": 0,
+                    "created_at": datetime.now(UTC),
+                    "usage": None,
+                    "warnings": ["Resume could not enqueue a new background job."],
+                }
+                await asyncio.to_thread(repo.fail_run_if_active, failure)
+                raise HTTPException(status_code=503, detail="Workflow could not be resumed through the configured queue.") from None
 
-    resumed = repo.get_run(
+    resumed = await asyncio.to_thread(
+        repo.get_run,
         run_id,
         owner_id=current.get("owner_id") or principal.owner_id,
         include_all=principal.role == "admin",
@@ -1261,23 +1413,36 @@ async def stop_run(
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
-    if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
-    current = _owned_run_for_control(run_id, llm_gateway_token, principal)
-    dispatch = repo.get_qstash_dispatch(run_id) or {}
-    if not repo.stop_run(run_id):
+    if not settings.qstash_workflow_enabled and settings.inline_execution:
+        raise HTTPException(status_code=409, detail="Run controls require a queue-backed execution mode.")
+    current = await asyncio.to_thread(_owned_run_for_control, run_id, llm_gateway_token, principal)
+    dispatch_getter = (
+        repo.get_qstash_dispatch
+        if settings.qstash_workflow_enabled
+        else repo.get_rq_dispatch
+    )
+    dispatch = (await asyncio.to_thread(dispatch_getter, run_id)) or {}
+    if not await asyncio.to_thread(repo.stop_run, run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be stopped from status '{current['status']}'.")
     cancellation_confirmed = False
-    if dispatch.get("message_id"):
-        try:
+    try:
+        if settings.qstash_workflow_enabled and dispatch.get("message_id"):
             cancellation_confirmed = await _cancel_qstash_message(dispatch["message_id"])
-        except RuntimeError:
-            logger.warning("qstash_stop_cancel_unconfirmed run_id=%s", run_id)
+        elif not settings.qstash_workflow_enabled and dispatch.get("job_id"):
+            cancellation_confirmed = await asyncio.to_thread(_stop_rq_job, dispatch["job_id"])
+    except Exception:
+        logger.warning("workflow_stop_queue_cancel_unconfirmed run_id=%s", run_id, exc_info=True)
     logger.info("workflow_stopped run_id=%s cancellation_confirmed=%s", run_id, cancellation_confirmed)
     return {
         "run_id": run_id,
         "status": "cancelled",
         "remote_cancellation_confirmed": cancellation_confirmed,
+        "note": (
+            "The queued job was canceled, or its isolated worker process was stopped. "
+            "The run is already marked canceled, so any late result cannot be committed."
+            if cancellation_confirmed
+            else "The run is marked canceled. An in-flight provider request may finish before the worker reaches its next boundary; its result will be discarded."
+        ),
     }
 
 
