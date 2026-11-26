@@ -124,3 +124,48 @@ def test_gateway_empty_completion_is_not_retried_and_has_specific_failure(monkey
     assert exc_info.value.retryable is False
     assert exc_info.value.status_code == 502
     assert len(calls) == 1
+
+
+def test_gateway_forwards_strict_json_schema_response_format(monkeypatch):
+    from app.core.llm_gateway_context import reset_llm_gateway_token
+
+    provider = make_provider()
+    captured = {}
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "test_response",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"result": {"type": "string"}},
+                "required": ["result"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    def successful_response(url, *, json, **kwargs):
+        captured["url"] = url
+        captured["payload"] = json
+        request = httpx.Request("POST", url)
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "model": "test-model",
+                "choices": [{"message": {"content": '{"result":"ok"}'}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    monkeypatch.setattr("app.integrations.llm.httpx.post", successful_response)
+    context = _with_gateway_session()
+    try:
+        result = provider.generate("system", "user", response_format=response_format)
+    finally:
+        reset_llm_gateway_token(context)
+
+    assert result["text"] == '{"result":"ok"}'
+    assert captured["url"] == "https://gateway.example/v1/chat/completions"
+    assert captured["payload"]["response_format"] == response_format

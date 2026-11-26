@@ -11,7 +11,7 @@ from app.core.demo import load_demo_config
 # Hard limits are enforced locally. The lower targets leave room for model
 # variation and reduce the chance that a generated draft needs correction.
 CHANNEL_LIMITS = {"x": 280, "linkedin": 1300, "telegram": 800}
-CHANNEL_TARGETS = {"x": 260, "linkedin": 1200, "telegram": 700}
+CHANNEL_TARGETS = {"x": 220, "linkedin": 1200, "telegram": 700}
 
 
 class ContentGenerationError(ValueError):
@@ -104,9 +104,11 @@ class ContentAgent(Agent):
                 "Observe the preferred character targets and never exceed any hard character limit. "
                 "Do not wrap the JSON in Markdown fences."
             )
+            response_format = self._response_format(topics, channels)
             llm_note = self.llm.generate(
                 system_prompt,
                 json.dumps(request, ensure_ascii=False),
+                response_format=response_format,
             )
             response_text = llm_note.get("text", "")
             try:
@@ -124,7 +126,8 @@ class ContentAgent(Agent):
                             "The previous response exceeded one or more hard channel limits. "
                             "Rewrite the complete response and correct every listed violation. "
                             "Include exactly one replacement draft for every requested topic/channel pair. "
-                            "Do not truncate with ellipses or omit any pair."
+                            "Keep every draft comfortably below its hard limit, count characters exactly, "
+                            "and do not truncate with ellipses or omit any pair."
                         ),
                         "violations": exc.violations,
                     },
@@ -132,6 +135,36 @@ class ContentAgent(Agent):
                 correction_note = self.llm.generate(
                     system_prompt + " Your previous output failed length validation. Correct every listed violation.",
                     json.dumps(repair_request, ensure_ascii=False),
+                    response_format=response_format,
+                )
+                posts, strategy_note = self._parse_model_response(
+                    correction_note.get("text", ""), topics, channels
+                )
+                correction_note = dict(correction_note)
+                correction_note["usage"] = self._combine_usage(
+                    llm_note.get("usage"), correction_note.get("usage")
+                )
+                llm_note = correction_note
+            except ContentGenerationError as exc:
+                # Providers can still return malformed JSON despite a strict
+                # schema request. Give the model one bounded opportunity to
+                # regenerate the complete payload; never accept partial output.
+                repair_request = {
+                    **request,
+                    "correction": {
+                        "instruction": (
+                            "Your previous response failed structured-output validation. "
+                            "Regenerate the entire response as one valid JSON object matching "
+                            "the required schema. Include every requested topic/channel pair exactly once. "
+                            "Return no Markdown, comments, or prose outside the JSON object."
+                        ),
+                        "validation_error": str(exc)[:500],
+                    },
+                }
+                correction_note = self.llm.generate(
+                    system_prompt + " The previous response failed strict structured-output validation. Return valid JSON only.",
+                    json.dumps(repair_request, ensure_ascii=False),
+                    response_format=response_format,
                 )
                 posts, strategy_note = self._parse_model_response(
                     correction_note.get("text", ""), topics, channels
@@ -154,6 +187,38 @@ class ContentAgent(Agent):
             "strategy_note": llm_note["text"],
             "next_step": "Human review before publishing.",
             "_usage": llm_note.get("usage", {}),
+        }
+
+    @staticmethod
+    def _response_format(topics: list[str], channels: list[str]) -> dict[str, Any]:
+        """Request a strict JSON schema through OpenAI-compatible Gateway providers."""
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "flowpilot_content_response",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "posts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "topic": {"type": "string", "enum": topics},
+                                    "channel": {"type": "string", "enum": channels},
+                                    "draft": {"type": "string"},
+                                },
+                                "required": ["topic", "channel", "draft"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "strategy_note": {"type": "string"},
+                    },
+                    "required": ["posts", "strategy_note"],
+                    "additionalProperties": False,
+                },
+            },
         }
 
     @staticmethod
@@ -194,9 +259,25 @@ class ContentAgent(Agent):
         try:
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ContentGenerationError(
-                "The content model did not return valid structured output. Retry the workflow."
-            ) from exc
+            # Some models add a short preamble or Markdown fence even when
+            # instructed to return JSON. Extract one complete object only;
+            # downstream schema/pair validation remains strict.
+            decoder = json.JSONDecoder()
+            payload = None
+            for index, character in enumerate(text):
+                if character != "{":
+                    continue
+                try:
+                    candidate, _ = decoder.raw_decode(text[index:])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict):
+                    payload = candidate
+                    break
+            if payload is None:
+                raise ContentGenerationError(
+                    "The content model did not return valid structured output. Retry the workflow."
+                ) from exc
 
         if not isinstance(payload, dict) or not isinstance(payload.get("posts"), list):
             raise ContentGenerationError(
