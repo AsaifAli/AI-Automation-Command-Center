@@ -420,14 +420,15 @@ class Repository:
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
-                if not run or run.get("status") != "paused":
+                if not run or run.get("status") != "paused" or run.get("pending_result") is not None:
                     return False
                 run["pending_result"] = copy.deepcopy(result)
                 return True
         with self._connect() as conn:
             row = conn.execute(
                 """UPDATE workflow_runs SET pending_result_json=%s
-                   WHERE run_id=%s AND status='paused' RETURNING run_id""",
+                   WHERE run_id=%s AND status='paused' AND pending_result_json IS NULL
+                   RETURNING run_id""",
                 (_json_dumps(result), run_id),
             ).fetchone()
         return bool(row)
@@ -461,6 +462,8 @@ class Repository:
                     return False
                 state = run.get("status")
                 if state == "paused":
+                    if run.get("pending_result") is not None:
+                        return False
                     run["pending_result"] = copy.deepcopy(result)
                     return True
                 if state not in {"queued", "running"}:
