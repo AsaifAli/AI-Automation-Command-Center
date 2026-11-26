@@ -121,6 +121,20 @@ def _http_failure(response: httpx.Response) -> LLMProviderError:
             retryable=True,
             retry_after_seconds=_retry_after_seconds(response.headers, 0),
         )
+    if status == 502:
+        try:
+            gateway_error = response.json().get("error")
+        except (ValueError, TypeError, AttributeError):
+            gateway_error = None
+        if isinstance(gateway_error, dict) and gateway_error.get("code") == "empty_completion":
+            return LLMProviderError(
+                "provider_empty_completion",
+                "The selected model returned no visible text. Its reasoning may have "
+                "consumed the output-token budget; lower reasoning effort or choose "
+                "another model.",
+                status_code=status,
+                retryable=False,
+            )
     if status in RETRYABLE_HTTP_STATUSES:
         return LLMProviderError(
             "provider_temporarily_unavailable",
