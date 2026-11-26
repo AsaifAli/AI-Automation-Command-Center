@@ -4,7 +4,7 @@ import logging
 import multiprocessing
 import os
 import threading
-import time
+import uuid
 
 from redis import Redis
 from rq import Queue, SimpleWorker
@@ -35,28 +35,32 @@ def _run_worker(settings: Settings, worker_name: str) -> None:
     )
     queue = Queue(settings.queue_name, connection=connection)
 
-    while True:
-        worker = SimpleWorker(
-            [queue],
-            connection=connection,
-            name=worker_name,
-            worker_ttl=worker_ttl,
-            job_monitoring_interval=30,
-            maintenance_interval=300,
+    worker = SimpleWorker(
+        [queue],
+        connection=connection,
+        name=worker_name,
+        worker_ttl=worker_ttl,
+        job_monitoring_interval=30,
+        maintenance_interval=300,
+    )
+    try:
+        logger.info(
+            "embedded_rq_worker_started worker=%s queue=%s",
+            worker_name,
+            settings.queue_name,
         )
-        try:
-            logger.info(
-                "embedded_rq_worker_started worker=%s queue=%s",
+        worker.work(with_scheduler=False, logging_level=settings.log_level)
+        if not worker._stop_requested:
+            logger.warning(
+                "embedded_rq_worker_loop_exited worker=%s; supervisor will restart with a fresh identity",
                 worker_name,
-                settings.queue_name,
             )
-            worker.work(with_scheduler=False, logging_level=settings.log_level)
-            if worker._stop_requested:
-                break
-            logger.warning("embedded_rq_worker_loop_exited worker=%s; restarting", worker_name)
-        except Exception:
-            logger.exception("embedded_rq_worker_loop_failed worker=%s", worker_name)
-        time.sleep(3)
+    except Exception:
+        logger.exception("embedded_rq_worker_loop_failed worker=%s", worker_name)
+        # Exit this child instead of reusing a possibly stale RQ identity.
+        # The parent supervisor starts a new child with a new worker name.
+        raise
+
 
 
 class EmbeddedRQWorker:
@@ -69,7 +73,7 @@ class EmbeddedRQWorker:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.worker_name = f"aiac-worker-{os.getpid()}"
+        self.worker_name: str | None = None
         self._context = multiprocessing.get_context("fork")
         self._process: multiprocessing.Process | None = None
         self._lock = threading.RLock()
@@ -81,12 +85,18 @@ class EmbeddedRQWorker:
             return
         if self._process is not None and self._process.is_alive():
             return
+        # Docker commonly runs the API as PID 1. PID-only RQ names collide
+        # across overlapping Render deploys and after a hard-stopped child.
+        # Give every child process its own identity so stale registrations do
+        # not block the replacement worker from consuming queued jobs.
+        worker_name = f"aiac-worker-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         process = self._context.Process(
             target=_run_worker,
-            args=(self.settings, self.worker_name),
-            name=self.worker_name,
+            args=(self.settings, worker_name),
+            name=worker_name,
             daemon=True,
         )
+        self.worker_name = worker_name
         process.start()
         self._process = process
         logger.info("embedded_rq_worker_process_started pid=%s", getattr(process, "pid", None))
