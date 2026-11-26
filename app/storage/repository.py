@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     resume_status VARCHAR(50),
     dispatch_payload_json JSONB,
     qstash_message_id TEXT,
+    rq_job_id TEXT,
     dispatch_generation INTEGER NOT NULL DEFAULT 0,
     pending_result_json JSONB,
     output_json JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -77,6 +78,7 @@ ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAUL
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS resume_status VARCHAR(50);
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS dispatch_payload_json JSONB;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS qstash_message_id TEXT;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS rq_job_id TEXT;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS dispatch_generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS pending_result_json JSONB;
 -- Before owner scopes existed, all authorized API roles shared one private control plane.
@@ -179,6 +181,7 @@ class Repository:
             "resume_status": None,
             "dispatch_payload": None,
             "qstash_message_id": None,
+            "rq_job_id": None,
             "dispatch_generation": 0,
             "pending_result": None,
             "output": {},
@@ -237,6 +240,7 @@ class Repository:
                     "resume_status": None,
                     "dispatch_payload": None,
                     "qstash_message_id": None,
+                    "rq_job_id": None,
                     "dispatch_generation": 0,
                     "pending_result": None,
                     "output": {},
@@ -300,6 +304,142 @@ class Repository:
                 (_json_dumps(payload), generation, run_id),
             )
         return generation
+
+    def prepare_rq_dispatch(self, run_id: str, payload: dict[str, Any]) -> int:
+        """Persist the complete RQ task envelope before making it visible to Redis.
+
+        Reusing the dispatch payload column lets a paused queued run be recreated
+        after the original RQ job has left its queue registry or expired.
+        """
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run or run.get("status") != "queued":
+                    raise ValueError("Only queued runs can be dispatched.")
+                generation = int(run.get("dispatch_generation", 0)) + 1
+                payload["dispatch_generation"] = generation
+                run["dispatch_generation"] = generation
+                run["dispatch_payload"] = copy.deepcopy(payload)
+                run["rq_job_id"] = None
+                return generation
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status, dispatch_generation FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not row or row["status"] != "queued":
+                raise ValueError("Only queued runs can be dispatched.")
+            generation = int(row["dispatch_generation"] or 0) + 1
+            payload["dispatch_generation"] = generation
+            conn.execute(
+                """UPDATE workflow_runs
+                   SET dispatch_payload_json=%s, dispatch_generation=%s, rq_job_id=NULL
+                   WHERE run_id=%s""",
+                (_json_dumps(payload), generation, run_id),
+            )
+        return generation
+
+    def set_rq_job_id(self, run_id: str, generation: int, job_id: str) -> bool:
+        if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 256:
+            raise ValueError("RQ job identifier is invalid.")
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run or int(run.get("dispatch_generation", 0)) != generation:
+                    return False
+                run["rq_job_id"] = job_id
+                return True
+        with self._connect() as conn:
+            row = conn.execute(
+                """UPDATE workflow_runs SET rq_job_id=%s
+                   WHERE run_id=%s AND dispatch_generation=%s RETURNING run_id""",
+                (job_id, run_id, generation),
+            ).fetchone()
+        return bool(row)
+
+    def claim_rq_run(self, run_id: str, generation: int, job_id: str) -> bool:
+        """Claim the currently persisted RQ generation, allowing RQ's own safe replay."""
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+            return False
+        if not isinstance(job_id, str) or not job_id.strip():
+            return False
+        now = datetime.now(UTC)
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run:
+                    return False
+                if (
+                    int(run.get("dispatch_generation", 0)) != generation
+                    or run.get("rq_job_id") != job_id
+                ):
+                    return False
+                status = run.get("status")
+                if status == "queued":
+                    run["status"] = "running"
+                    return True
+                # RQ can redeliver the same job after a worker process dies. It is
+                # safe to replay this generation because RQ has recovered the job.
+                return status == "running"
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT status FROM workflow_runs
+                   WHERE run_id=%s AND dispatch_generation=%s AND rq_job_id=%s
+                   FOR UPDATE""",
+                (run_id, generation, job_id),
+            ).fetchone()
+            if not row:
+                return False
+            if row["status"] == "running":
+                return True
+            if row["status"] != "queued":
+                return False
+            changed = conn.execute(
+                """UPDATE workflow_runs SET status='running'
+                   WHERE run_id=%s AND dispatch_generation=%s AND rq_job_id=%s
+                     AND status='queued' RETURNING run_id""",
+                (run_id, generation, job_id),
+            ).fetchone()
+            if changed:
+                conn.execute(
+                    "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                    (run_id, "started", _json_dumps({"queue": "rq", "generation": generation}), now),
+                )
+        return bool(changed)
+
+    def get_rq_dispatch(self, run_id: str) -> dict[str, Any] | None:
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run:
+                    return None
+                return {
+                    "payload": copy.deepcopy(run.get("dispatch_payload")),
+                    "job_id": run.get("rq_job_id"),
+                    "generation": int(run.get("dispatch_generation", 0)),
+                    "pending_result": copy.deepcopy(run.get("pending_result")),
+                    "status": run.get("status"),
+                    "resume_status": run.get("resume_status"),
+                }
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT dispatch_payload_json, rq_job_id, dispatch_generation,
+                          pending_result_json, status, resume_status
+                   FROM workflow_runs WHERE run_id=%s""",
+                (run_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "payload": row["dispatch_payload_json"],
+            "job_id": row["rq_job_id"],
+            "generation": int(row["dispatch_generation"] or 0),
+            "pending_result": row["pending_result_json"],
+            "status": row["status"],
+            "resume_status": row["resume_status"],
+        }
 
     def restore_qstash_dispatch(self, run_id: str, payload: dict[str, Any]) -> None:
         """Restore dispatch metadata from an authenticated QStash delivery after process restart."""
@@ -453,7 +593,7 @@ class Repository:
         return row["pending_result_json"] if row else None
 
     def fail_run_if_active(self, result: dict[str, Any]) -> bool:
-        """Persist a QStash failure, staging it when the run is user-paused."""
+        """Persist a queue failure, staging it once when the run is user-paused."""
         run_id = result["run_id"]
         if self._use_memory:
             with self._memory_lock:
@@ -483,14 +623,14 @@ class Repository:
             row = conn.execute(
                 """UPDATE workflow_runs
                    SET pending_result_json=%s
-                   WHERE run_id=%s AND status='paused'
+                   WHERE run_id=%s AND status='paused' AND pending_result_json IS NULL
                    RETURNING run_id""",
                 (_json_dumps(result), run_id),
             ).fetchone()
             if row:
                 conn.execute(
                     "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
-                    (run_id, "failure_staged", _json_dumps({"source": "qstash_failure_callback"}), now),
+                    (run_id, "failure_staged", _json_dumps({"source": "queue_failure_callback"}), now),
                 )
                 return True
             row = conn.execute(
@@ -511,7 +651,7 @@ class Repository:
             if row:
                 conn.execute(
                     "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
-                    (run_id, "failed", _json_dumps({"source": "qstash_failure_callback"}), now),
+                    (run_id, "failed", _json_dumps({"source": "queue_failure_callback"}), now),
                 )
         return bool(row)
 
@@ -583,6 +723,7 @@ class Repository:
                     return False
                 run["status"] = "cancelled"
                 run["resume_status"] = None
+                run["pending_result"] = None
                 run["output"] = stopped_output
                 run["warnings"] = ["Execution was canceled by the user."]
                 return True
@@ -597,9 +738,9 @@ class Repository:
                 return False
             conn.execute(
                 """UPDATE workflow_runs
-                   SET status='cancelled', resume_status=NULL, output_json=%s,
-                       evidence_json='[]'::jsonb, warnings_json=%s, duration_ms=0,
-                       usage_json=NULL, error=%s
+                   SET status='cancelled', resume_status=NULL, pending_result_json=NULL,
+                       output_json=%s, evidence_json='[]'::jsonb, warnings_json=%s,
+                       duration_ms=0, usage_json=NULL, error=%s
                    WHERE run_id=%s""",
                 (
                     _json_dumps(stopped_output),
@@ -703,16 +844,29 @@ class Repository:
                 (credential_id, run_id),
             )
 
-    def mark_running(self, run_id: str) -> None:
-        """Promote queued work without reviving paused or canceled runs."""
+    def mark_running(self, run_id: str) -> bool:
+        """Atomically claim queued work; return False for paused or terminal runs."""
         now = datetime.now(UTC)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
-                if run and run.get("status") == "queued":
-                    run["status"] = "running"
-            return
+                if not run:
+                    return False
+                status = run.get("status")
+                if status != "queued":
+                    return False
+                run["status"] = "running"
+                return True
+
         with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not row:
+                return False
+            if row["status"] != "queued":
+                return False
             changed = conn.execute(
                 "UPDATE workflow_runs SET status='running' WHERE run_id=%s AND status='queued' RETURNING run_id",
                 (run_id,),
@@ -722,6 +876,7 @@ class Repository:
                     "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
                     (run_id, "started", "{}", now),
                 )
+        return bool(changed)
 
     def save_result(self, result: dict[str, Any]) -> None:
         if self._use_memory:

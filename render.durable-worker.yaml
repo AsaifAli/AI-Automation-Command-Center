@@ -29,6 +29,8 @@ services:
         value: production
       - key: INLINE_EXECUTION
         value: "false"
+      - key: QSTASH_WORKFLOW_ENABLED
+        value: "false"
       - key: REDIS_URL
         fromService:
           type: keyvalue

@@ -840,7 +840,11 @@ try:
 
             can_control_runs = bool(API_OPERATOR_KEY or API_ADMIN_KEY or LEGACY_API_KEY)
             active_status = run.get("status") in {"queued", "running", "paused"}
-            if active_status and can_control_runs and health.get("execution_mode") == "qstash_http_queue":
+            queue_backed_execution = health.get("execution_mode") in {
+                "qstash_http_queue",
+                "redis_worker",
+            }
+            if active_status and can_control_runs and queue_backed_execution:
                 action_columns = st.columns(3)
                 if run.get("status") == "paused":
                     with action_columns[0]:
@@ -862,7 +866,10 @@ try:
                                     api_post(f"/api/v1/runs/{run['run_id']}/pause", {}),
                                     "Pause workflow",
                                 )
-                                st.success("Workflow will pause at its next safe step boundary.")
+                                st.info(result.get(
+                                    "note",
+                                    "Queued work is held. An in-flight workflow may finish and be held until Resume.",
+                                ))
                                 st.rerun()
                             except (requests.RequestException, RuntimeError, ValueError) as exc:
                                 st.error(str(exc))
@@ -877,10 +884,10 @@ try:
                             st.rerun()
                         except (requests.RequestException, RuntimeError, ValueError) as exc:
                             st.error(str(exc))
-            elif active_status and health.get("execution_mode") != "qstash_http_queue":
-                st.caption("Run controls are available when QStash message queue is enabled.")
             elif active_status and not can_control_runs:
                 st.caption("An operator API credential is required to control this run.")
+            elif active_status and not queue_backed_execution:
+                st.caption("Run controls are available with QStash or the dedicated Redis worker.")
 
             st.markdown('<div class="detail-label">CLIENT-READY RESULT</div>', unsafe_allow_html=True)
             render_workflow_output(run.get("workflow", ""), run.get("output", {}))

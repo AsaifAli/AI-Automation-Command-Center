@@ -36,6 +36,7 @@ class FakeRepo:
             "warnings": [],
         }
         self.dispatch = None
+        self.rq_dispatch = None
         return self.run["run_id"]
 
     def ensure_pending_run(self, run_id, workflow, owner_id):
@@ -57,6 +58,7 @@ class FakeRepo:
             "warnings": [],
         }
         self.dispatch = None
+        self.rq_dispatch = None
 
     def prepare_qstash_dispatch(self, run_id, payload):
         if not self.run or self.run["run_id"] != run_id or self.run["status"] != "queued":
@@ -70,6 +72,32 @@ class FakeRepo:
             "pending_result": None,
         }
         return generation
+
+    def prepare_rq_dispatch(self, run_id, payload):
+        if not self.run or self.run["run_id"] != run_id or self.run["status"] not in {"queued", "awaiting_approval"}:
+            raise ValueError("Only queued runs can be dispatched.")
+        generation = (self.rq_dispatch or {}).get("generation", 0) + 1
+        payload["dispatch_generation"] = generation
+        self.rq_dispatch = {
+            "payload": json.loads(json.dumps(payload)),
+            "job_id": None,
+            "generation": generation,
+            "pending_result": None,
+        }
+        return generation
+
+    def set_rq_job_id(self, run_id, generation, job_id):
+        if not self.run or self.run["run_id"] != run_id or not self.rq_dispatch:
+            return False
+        if self.rq_dispatch["generation"] != generation:
+            return False
+        self.rq_dispatch["job_id"] = job_id
+        return True
+
+    def get_rq_dispatch(self, run_id):
+        if not self.run or self.run["run_id"] != run_id:
+            return None
+        return dict(self.rq_dispatch) if self.rq_dispatch else None
 
     def restore_qstash_dispatch(self, run_id, payload):
         if not self.run or self.run["run_id"] != run_id:
@@ -535,6 +563,68 @@ def test_pause_resume_and_stop_target_only_the_owned_run(monkeypatch):
     assert cancelled == ["msg_flowpilot_test", "msg_flowpilot_resumed"]
 
 
+def test_rq_pause_resume_and_stop_work_without_qstash(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.create_pending_run("competitor", owner_id="local-development")
+    run_id = fake_repo.run["run_id"]
+    envelope = {
+        "run_id": run_id,
+        "workflow": "competitor",
+        "payload": {"competitors": ["AI"]},
+        "owner_id": "local-development",
+        "gateway_credential_id": "credential-ref",
+    }
+    generation = fake_repo.prepare_rq_dispatch(run_id, envelope)
+    first_job_id = f"{run_id}-{generation}"
+    fake_repo.set_rq_job_id(run_id, generation, first_job_id)
+
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+
+    queue_jobs = []
+    class FakeRQQueue:
+        def enqueue(self, *args, **kwargs):
+            queue_jobs.append({"args": args, "kwargs": dict(kwargs)})
+            return SimpleNamespace(id=kwargs["job_id"])
+
+    monkeypatch.setattr(api_module, "queue", lambda: FakeRQQueue())
+    cancelled = []
+    stopped = []
+    monkeypatch.setattr(api_module, "_cancel_rq_job", lambda job_id: cancelled.append(job_id) or True)
+    monkeypatch.setattr(api_module, "_stop_rq_job", lambda job_id: stopped.append(job_id) or True)
+
+    paused = client.post(f"/api/v1/runs/{run_id}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+    assert paused.json()["queued_job_cancelled"] is True
+    assert cancelled == [first_job_id]
+
+    resumed = client.post(f"/api/v1/runs/{run_id}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "queued"
+    assert resumed.json()["requeued"] is True
+    assert len(queue_jobs) == 1
+    assert queue_jobs[0]["kwargs"]["job_id"] == f"{run_id}-2"
+    assert queue_jobs[0]["kwargs"]["gateway_credential_id"] == "credential-ref"
+
+    stopped_response = client.post(f"/api/v1/runs/{run_id}/stop")
+    assert stopped_response.status_code == 200
+    assert stopped_response.json()["status"] == "cancelled"
+    assert stopped == [f"{run_id}-2"]
+
+
+def test_run_controls_are_rejected_for_inline_demo_execution(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.create_pending_run("competitor", owner_id="local-development")
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", True)
+
+    response = client.post(f"/api/v1/runs/{fake_repo.run['run_id']}/pause")
+    assert response.status_code == 409
+
+
 def test_run_controls_do_not_disclose_another_owners_run(monkeypatch):
     fake_repo = FakeRepo()
     fake_repo.create_pending_run("competitor", owner_id="someone-else")
@@ -722,3 +812,80 @@ def test_pause_after_qstash_claim_prevents_model_execution(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "paused"
     assert calls == []
+
+
+
+def test_rq_queue_helpers_cancel_only_queued_jobs_and_stop_started_jobs(monkeypatch):
+    from rq.job import JobStatus
+
+    class FakeJob:
+        def __init__(self, status):
+            self.status = status
+            self.id = "rq-job-test"
+            self.connection = object()
+            self.cancelled = False
+
+        def get_status(self, refresh=False):
+            return self.status
+
+        def cancel(self):
+            self.cancelled = True
+
+    class FakeQueue:
+        def __init__(self, job):
+            self.job = job
+
+        def fetch_job(self, job_id):
+            assert job_id == "rq-job-test"
+            return self.job
+
+    queued = FakeJob(JobStatus.QUEUED)
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue(queued))
+    assert api_module._cancel_rq_job("rq-job-test") is True
+    assert queued.cancelled is True
+
+    running = FakeJob(JobStatus.STARTED)
+    stop_commands = []
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue(running))
+    monkeypatch.setattr(
+        api_module,
+        "send_stop_job_command",
+        lambda connection, job_id: stop_commands.append((connection, job_id)),
+    )
+    assert api_module._cancel_rq_job("rq-job-test") is False
+    assert api_module._stop_rq_job("rq-job-test") is True
+    assert stop_commands == [(running.connection, "rq-job-test")]
+
+
+def test_rq_enqueue_persists_job_identity_and_worker_callbacks(monkeypatch):
+    fake_repo = FakeRepo()
+    fake_repo.create_pending_run("competitor", owner_id="local-development")
+    run_id = fake_repo.run["run_id"]
+    envelope = {
+        "run_id": run_id,
+        "workflow": "competitor",
+        "payload": {"competitors": ["AI"]},
+        "owner_id": "local-development",
+        "gateway_credential_id": None,
+    }
+    generation = fake_repo.prepare_rq_dispatch(run_id, envelope)
+    captured = {}
+
+    class FakeRQQueue:
+        def enqueue(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "queue", lambda: FakeRQQueue())
+    monkeypatch.setattr(api_module.settings, "workflow_job_timeout_seconds", 432)
+
+    job_id = api_module._enqueue_rq_dispatch(envelope, generation)
+
+    assert job_id == f"{run_id}-1"
+    assert fake_repo.get_rq_dispatch(run_id)["job_id"] == job_id
+    assert captured["kwargs"]["job_timeout"] == 432
+    assert captured["kwargs"]["rq_generation"] == 1
+    assert captured["kwargs"]["rq_job_id"] == job_id
+    assert captured["kwargs"]["on_failure"] is api_module.record_rq_job_failure
+    assert captured["kwargs"]["on_stopped"] is api_module.record_rq_job_stopped

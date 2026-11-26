@@ -28,7 +28,7 @@ The current workspace exposes four workflow types:
 
 - **Frontend:** Streamlit operator workspace (`ui/app.py`).
 - **API:** FastAPI control plane (`app/api/main.py`).
-- **Execution:** the lightweight portfolio Render topology uses in-process background execution; the durable topology uses the existing Redis Queue (RQ) worker, with PostgreSQL-backed run state.
+- **Execution:** the lightweight portfolio Render topology uses in-process background execution; queue-backed deployments can use plain QStash HTTP messages or a dedicated Redis Queue (RQ) worker, with PostgreSQL-backed run state.
 - **State:** persistent PostgreSQL/Redis support in the durable topology; the lightweight portfolio manifest documents ephemeral run state for the inline demo configuration.
 - **LLM access:** portfolio BYOK uses a short-lived, project-scoped Gateway session; raw provider credentials are not forwarded to the application.
 - **Observability:** health, run metrics, structured logs, and optional OpenTelemetry instrumentation.
@@ -65,9 +65,15 @@ Configure these variables on **ai-automation-api** in Render (the existing names
 
 The raw BYOK bearer is never included in the QStash message. The envelope contains only encrypted credential ciphertext, a short TTL, owner scope, run ID and workflow input. Each run has a generation number and a recorded QStash message ID; duplicate and superseded deliveries are acknowledged without invoking the model again. Both execute and failure endpoints verify the QStash signature against the exact callback URL and request body.
 
-**Run controls:** Run History exposes Pause, Resume and Stop. Pausing a queued run attempts to cancel its pending QStash message. If execution is already in progress, the model call may finish but its result is held until Resume. Resume either commits that held result without another model call or republishes queued work as a new generation. Stop marks the run canceled and attempts to cancel its pending message; a model request already in flight is not forcibly interrupted, but its late result is discarded and cannot revive the run.
+**Run controls:** Run History exposes Pause, Resume and Stop for queue-backed execution. With QStash, Pause cancels a queued message and Resume publishes a new generation. With RQ, Pause cancels a queued job and Resume reconstructs it from the PostgreSQL dispatch envelope as a new generation. If execution has already started, the workflow is allowed to finish and its result (including a failure) is held until Resume; Pause does not pretend to suspend an in-flight provider request. Stop marks the run canceled, cancels queued work, and sends RQ's stop command to a running worker job. Late results cannot revive a canceled run.
 
-**Execution limit:** The QStash free tier permits HTTP responses up to 15 minutes. FlowPilot uses a 14-minute message timeout to leave room for the native failure callback. Longer jobs are marked failed; they are not left indefinitely active. The free QStash quota and message/flow-control limits still apply.
+**Execution limits:** QStash HTTP deliveries use a 14-minute timeout to leave room for its native failure callback; the free QStash quota and flow-control limits still apply. In RQ mode, `WORKFLOW_JOB_TIMEOUT_SECONDS` bounds a job (600 seconds in the durable worker Blueprint). An RQ failure callback records hard worker timeouts so the API does not leave a run indefinitely marked as running.
+
+### Dedicated Redis Queue worker deployment
+
+`render.durable-worker.yaml` is the recommended topology when long-running workflows should not occupy the API process. It reuses the existing API service and its configured PostgreSQL `DATABASE_URL`, and adds a private persistent Render Key Value service plus a dedicated `ai-automation-worker` background worker. It does not provision another PostgreSQL database. The API requires `INLINE_EXECUTION=false`, `QSTASH_WORKFLOW_ENABLED=false`, `REDIS_URL`, `DATABASE_URL`, and the same Gateway credential encryption key as the worker. The worker runs `python -m app.worker` and consumes the `automation` RQ queue.
+
+The worker Blueprint provisions billable Render resources (a Starter Key Value service and Starter worker); review Render pricing before applying it. The current live Free API/UI pair is not silently converted by this code change. For RQ mode, the API readiness check requires persistent PostgreSQL and a reachable Redis service. `render.yaml` remains the lightweight demo topology; `render.durable-worker.yaml` is a separate deployment choice.
 
 **Persistence boundary:** The current free Render deployment still uses the in-memory FlowPilot run repository unless `DATABASE_URL` is configured. QStash can redeliver a message and the callback can rehydrate that individual run record, but a Render restart can still erase completed run history and other in-memory state. A fully durable queue and history require persistent PostgreSQL/Redis plus the dedicated RQ worker topology; that is a separate paid deployment and has not been provisioned.
 

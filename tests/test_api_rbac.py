@@ -14,6 +14,7 @@ class FakeRepo:
     def __init__(self):
         self.runs = {}
         self.approvals = []
+        self.rq_dispatches = {}
 
     def create_pending_run(self, workflow, owner_id="legacy"):
         run_id = f"run-{len(self.runs) + 1}"
@@ -32,6 +33,35 @@ class FakeRepo:
         }
 
         return run_id
+
+    def prepare_rq_dispatch(self, run_id, payload):
+        if run_id not in self.runs:
+            raise KeyError(run_id)
+        generation = self.rq_dispatches.get(run_id, {}).get("generation", 0) + 1
+        payload["dispatch_generation"] = generation
+        self.rq_dispatches[run_id] = {
+            "payload": dict(payload),
+            "generation": generation,
+            "job_id": None,
+            "pending_result": None,
+        }
+        return generation
+
+    def set_rq_job_id(self, run_id, generation, job_id):
+        dispatch = self.rq_dispatches.get(run_id)
+        if not dispatch or dispatch["generation"] != generation:
+            return False
+        dispatch["job_id"] = job_id
+        return True
+
+    def get_rq_dispatch(self, run_id):
+        dispatch = self.rq_dispatches.get(run_id)
+        return dict(dispatch) if dispatch else None
+
+    def save_result(self, result):
+        run = self.runs.get(result["run_id"])
+        if run:
+            run.update(result)
 
     def get_run(self, run_id, *, owner_id=None, include_all=False):
         run = self.runs.get(run_id)
@@ -302,7 +332,9 @@ def test_queued_gateway_token_is_encrypted_and_only_reference_enters_rq(monkeypa
     args, kwargs = fake_queue.calls[0]
     assert args[0].__name__ == "execute_run"
     assert kwargs["gateway_credential_id"] == "credential-reference-only"
-    assert kwargs["job_id"] == response.json()["run_id"]
+    assert kwargs["job_id"] == f'{response.json()["run_id"]}-1'
+    assert kwargs["rq_generation"] == 1
+    assert kwargs["rq_job_id"] == kwargs["job_id"]
     assert secret not in repr(fake_queue.calls)
     assert secret not in repr(fake_repo.stored_credentials)
 
