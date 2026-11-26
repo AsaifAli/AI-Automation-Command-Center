@@ -275,3 +275,14 @@ def test_atom_entry_uses_link_href_attribute():
     assert items[0]["title"] == "Example update"
     assert items[0]["url"] == "https://example.com/article/1"
     assert items[0]["published"] == "2026-11-06T10:00:00Z"
+
+def test_feed_parser_rejects_dtd_and_entity_declarations():
+    malicious_feed = b'''<!DOCTYPE rss [<!ENTITY expansion "expanded">]>
+    <rss><channel><item><title>&expansion;</title></item></channel></rss>'''
+
+    with pytest.raises(ValueError, match="DTD"):
+        IntelligenceSource._parse_feed(
+            malicious_feed,
+            "Untrusted feed",
+            "https://example.com/feed.xml",
+        )
