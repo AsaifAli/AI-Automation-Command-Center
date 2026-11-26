@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import UTC, datetime
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
@@ -560,7 +560,8 @@ def _validate_upstash_workflow_payload(raw_payload: object) -> dict:
 async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
     """Trigger the signed Workflow route through the documented QStash REST API."""
     workflow_url = settings.upstash_workflow_url.rstrip("/") + "/internal/qstash/workflow"
-    trigger_url = settings.qstash_url.rstrip("/") + "/v2/trigger/" + quote(workflow_url, safe="")
+    # QStash expects the destination URL directly after /v2/trigger/, not percent-encoded.
+    trigger_url = settings.qstash_url.rstrip("/") + "/v2/trigger/" + workflow_url
     headers = {
         "Authorization": f"Bearer {settings.qstash_token}",
         "Content-Type": "application/json",
@@ -569,7 +570,7 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
         "Upstash-Flow-Control-Key": "flowpilot-global",
         # QStash requires the full flow-control value tuple, not parallelism alone.
         "Upstash-Flow-Control-Value": (
-            f"parallelism={settings.qstash_workflow_parallelism},rate=2,period=1s"
+            f"parallelism={settings.qstash_workflow_parallelism}, rate=2, period=1s"
         ),
         "Upstash-Label": "flowpilot",
     }
