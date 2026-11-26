@@ -588,12 +588,21 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
     workflow_url = settings.upstash_workflow_url.rstrip("/") + "/internal/qstash/workflow"
     # QStash expects the destination URL directly after /v2/trigger/, not percent-encoded.
     trigger_url = settings.qstash_url.rstrip("/") + "/v2/trigger/" + workflow_url
+    workflow_run_id = f"wfr_flowpilot-{run_id}"
     headers = {
         "Authorization": f"Bearer {settings.qstash_token}",
         "Content-Type": "application/json",
-        "Upstash-Workflow-RunId": f"flowpilot-{run_id}",
-        # Explicitly identify the v1 Workflow protocol used by workflow-py 2.x.
+        # These are the initialization headers used by the Workflow SDK. The
+        # trigger REST endpoint needs them to distinguish an SDK Workflow
+        # invocation from an ordinary QStash message.
+        "Upstash-Workflow-Init": "true",
+        "Upstash-Workflow-RunId": workflow_run_id,
+        "Upstash-Workflow-Url": workflow_url,
+        "Upstash-Feature-Set": "LazyFetch,InitialBody,WF_DetectTrigger",
         "Upstash-Workflow-Sdk-Version": "1",
+        # Forward the protocol version to the Workflow endpoint for SDK
+        # request validation on the initial invocation and subsequent steps.
+        "Upstash-Forward-Upstash-Workflow-Sdk-Version": "1",
         "Upstash-Retries": "0",
         "Upstash-Flow-Control-Key": "flowpilot-global",
         # QStash requires the full flow-control value tuple, not parallelism alone.
