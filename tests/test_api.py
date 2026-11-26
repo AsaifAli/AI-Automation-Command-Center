@@ -504,3 +504,42 @@ def test_upstash_trigger_disables_duplicate_workflow_level_retries(monkeypatch):
     assert captured["headers"]["Upstash-Workflow-Sdk-Version"] == "1"
     assert captured["headers"]["Upstash-Retries"] == "0"
     assert captured["headers"]["Upstash-Flow-Control-Key"] == "flowpilot-global"
+
+
+def test_qstash_stop_cancels_only_the_requested_workflow_run(monkeypatch):
+    import asyncio
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            captured["client_options"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def delete(self, url, *, headers, params):
+            captured.update({"url": url, "headers": headers, "params": params})
+            return FakeResponse()
+
+    monkeypatch.setattr(api_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(api_module.settings, "qstash_url", "https://qstash-eu-central-1.upstash.io")
+    monkeypatch.setattr(api_module.settings, "qstash_token", "private-qstash-token")
+
+    asyncio.run(api_module._cancel_upstash_workflow(
+        "11111111-1111-1111-1111-111111111111"
+    ))
+
+    assert captured["url"] == (
+        "https://qstash-eu-central-1.upstash.io/v2/workflows/runs/"
+        "wfr_flowpilot-11111111-1111-1111-1111-111111111111"
+    )
+    assert captured["params"] == {"cancel": "true"}
+    assert captured["headers"]["Authorization"] == "Bearer private-qstash-token"
+    assert captured["client_options"]["trust_env"] is False
