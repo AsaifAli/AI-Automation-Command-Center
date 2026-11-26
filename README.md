@@ -116,13 +116,19 @@ A passing CI run establishes the checks included in that workflow; it does not b
 ## Portfolio positioning
 
 **FlowPilot — AI Workflow Automation:** a distinct AI application for orchestrating bounded workflows, tracking execution, and keeping consequential actions reviewable. It is not the shared Evaluation Harness dashboard and is not the private Agency OS.
-## Hosted deployment status
+## Hosted deployment verification
 
 The existing public services are:
 
 - UI: `https://ai-automation-ui-ac2c.onrender.com`
 - API: `https://ai-automation-api.onrender.com`
 
-The prior hosted revision was last health-checked on November 25, 2026. It reported `state_store=ephemeral-memory` and used the earlier QStash path. **That is not the target configuration described above.** The no-new-service RQ/Redis topology becomes active only after the updated API code is deployed and the existing API service receives its native TLS `REDIS_URL` and worker flags.
+The no-new-service RQ/Redis topology was deployed on November 26, 2026 from merge commit `a47cbe9` to the existing Free API service. Live checks returned:
 
-After rollout, verify `/`, `/health`, and `/ready`: the root endpoint should report `state_store=redis`, the worker execution mode should be `embedded_rq_worker`, and readiness should return `state_store=redis`. These checks do not invoke an LLM provider. A separate synthetic workflow/BYOK smoke test should be run only when provider usage is acceptable.
+- `GET /` — `state_store=redis` and `free API service -> RQ/Upstash Redis queue -> supervised embedded worker process -> Redis run state`.
+- `GET /health` — `execution_mode=embedded_rq_worker`.
+- `GET /ready` — `status=ready`, `state_store=redis`, `redis=embedded_rq_worker`.
+
+Render still has only the existing `ai-automation-api` and `ai-automation-ui` Free web services. The worker runs as a supervised child inside the API service. It uses the existing Free Upstash Redis database shared with the Portfolio LLM Gateway; no new Render service, Redis database, or PostgreSQL database was created.
+
+Local validation: `198` tests passed, including a real RQ `SimpleWorker` integration test against fakeredis with Redis-backed run-state persistence. No live LLM/provider request was sent during deployment verification. A full live BYOK workflow execution is intentionally not claimed as tested.
