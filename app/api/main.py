@@ -591,18 +591,18 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
         if isinstance(error_detail, str) and error_detail.strip():
             error_detail = " ".join(error_detail.split())
             error_detail = re.sub(
-                r"(?i)(authorization\\s*[:=]\\s*)bearer\\s+[^\\s,;]+",
-                r"\\1Bearer [REDACTED]",
+                r"(?i)(authorization\s*[:=]\s*)bearer\s+[^\s,;]+",
+                r"\1Bearer [REDACTED]",
                 error_detail,
             )
             error_detail = re.sub(
-                r"(?i)\\bbearer\\s+[^\\s,;]+",
+                r"(?i)\bbearer\s+[^\s,;]+",
                 "Bearer [REDACTED]",
                 error_detail,
             )
             error_detail = re.sub(
-                r"(?i)\\b((?:api[_-]?key|token|secret)\\s*[:=]\\s*)[^\\s,;]+",
-                r"\\1[REDACTED]",
+                r"(?i)\b((?:api[_-]?key|token|secret)\s*[:=]\s*)[^\s,;]+",
+                r"\1[REDACTED]",
                 error_detail,
             )
             error_detail = error_detail[:240]
