@@ -564,8 +564,12 @@ def _validate_qstash_payload(raw_payload: object) -> dict:
     }
 
 
-def _verify_qstash_signature(body: bytes, signature: str | None) -> None:
-    """Verify the raw body against either active QStash signing key."""
+def _verify_qstash_signature(
+    body: bytes,
+    signature: str | None,
+    expected_url: str,
+) -> None:
+    """Verify body and exact destination URL against either active QStash key."""
     if not signature:
         raise HTTPException(status_code=401, detail="Missing QStash signature.")
     try:
@@ -573,7 +577,12 @@ def _verify_qstash_signature(body: bytes, signature: str | None) -> None:
         Receiver(
             current_signing_key=settings.qstash_current_signing_key,
             next_signing_key=settings.qstash_next_signing_key,
-        ).verify(signature=signature, body=raw_text)
+        ).verify(
+            signature=signature,
+            body=raw_text,
+            url=expected_url,
+            clock_tolerance=5,
+        )
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid QStash signature.") from None
 
@@ -694,7 +703,11 @@ async def _cancel_qstash_message(message_id: str) -> bool:
 async def execute_qstash_message(request: Request):
     """Execute one QStash message and acknowledge its delivery exactly once."""
     body = await request.body()
-    _verify_qstash_signature(body, request.headers.get("Upstash-Signature"))
+    _verify_qstash_signature(
+        body,
+        request.headers.get("Upstash-Signature"),
+        settings.upstash_workflow_url.rstrip("/") + request.url.path,
+    )
     try:
         envelope = json.loads(body.decode("utf-8"))
         data = _validate_qstash_payload(envelope)
