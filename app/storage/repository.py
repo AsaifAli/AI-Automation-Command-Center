@@ -415,6 +415,100 @@ class Repository:
             return "superseded"
         return str(current["status"])
 
+    def complete_qstash_run(self, result: dict[str, Any]) -> str:
+        """Atomically stage a completion while paused or persist it while running.
+
+        This removes the read-status/write-result race with Resume and Stop.
+        The repository lock/row lock serializes completion with all run controls.
+        """
+        run_id = result["run_id"]
+        terminal_statuses = {
+            "completed",
+            "completed_with_warnings",
+            "failed",
+            "cancelled",
+            "awaiting_approval",
+            "approved",
+            "rejected",
+        }
+        if self._use_memory:
+            with self._memory_lock:
+                record = self._memory_runs.get(run_id)
+                if not record:
+                    return "missing"
+                status = record.get("status")
+                if status == "paused":
+                    if record.get("pending_result") is None:
+                        record["pending_result"] = copy.deepcopy(result)
+                    return "paused"
+                if status in terminal_statuses:
+                    return str(status)
+                if status not in {"queued", "running"}:
+                    return str(status or "missing")
+                record.update(
+                    {
+                        "workflow": result.get("workflow", record["workflow"]),
+                        "status": result["status"],
+                        "output": copy.deepcopy(result.get("output", {})),
+                        "evidence": copy.deepcopy(result.get("evidence", [])),
+                        "duration_ms": result.get("duration_ms", 0),
+                        "created_at": result.get("created_at", record["created_at"]),
+                        "usage": _normalize_usage(result.get("usage")),
+                        "warnings": copy.deepcopy(result.get("warnings", [])),
+                    }
+                )
+                return str(result["status"])
+
+        now = datetime.now(UTC)
+        with self._connect() as conn:
+            current = conn.execute(
+                """SELECT status, pending_result_json
+                   FROM workflow_runs WHERE run_id=%s FOR UPDATE""",
+                (run_id,),
+            ).fetchone()
+            if not current:
+                return "missing"
+            status = str(current["status"])
+            if status == "paused":
+                if current["pending_result_json"] is None:
+                    conn.execute(
+                        "UPDATE workflow_runs SET pending_result_json=%s WHERE run_id=%s",
+                        (_json_dumps(result), run_id),
+                    )
+                    conn.execute(
+                        """INSERT INTO audit_events(run_id,event,detail_json,created_at)
+                           VALUES (%s,%s,%s,%s)""",
+                        (run_id, "result_staged", _json_dumps({"source": "qstash_execute"}), now),
+                    )
+                return "paused"
+            if status in terminal_statuses:
+                return status
+            if status not in {"queued", "running"}:
+                return status
+
+            conn.execute(
+                """UPDATE workflow_runs
+                   SET status=%s, output_json=%s, evidence_json=%s, duration_ms=%s,
+                       usage_json=%s, warnings_json=%s, error=%s
+                   WHERE run_id=%s""",
+                (
+                    result["status"],
+                    _json_dumps(result.get("output", {})),
+                    _json_dumps(result.get("evidence", [])),
+                    result.get("duration_ms", 0),
+                    _json_dumps(_normalize_usage(result.get("usage"))) if result.get("usage") else None,
+                    _json_dumps(result.get("warnings", [])),
+                    result.get("output", {}).get("error") if result["status"] == "failed" else None,
+                    run_id,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO audit_events(run_id,event,detail_json,created_at)
+                   VALUES (%s,%s,%s,%s)""",
+                (run_id, result["status"], _json_dumps({"duration_ms": result.get("duration_ms", 0)}), now),
+            )
+        return str(result["status"])
+
     def save_paused_result(self, run_id: str, result: dict[str, Any]) -> bool:
         """Stage a completed inference result while keeping the run paused."""
         if self._use_memory:
