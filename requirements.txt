@@ -18,4 +18,4 @@ opentelemetry-exporter-otlp-proto-http==1.36.0
 cryptography==50.0.2
 
 upstash-redis>=1.4,<2
-upstash-workflow==2.0.1
+qstash==3.4.0
