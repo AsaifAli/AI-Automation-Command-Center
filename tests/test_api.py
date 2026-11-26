@@ -454,9 +454,14 @@ def test_run_controls_do_not_disclose_another_owners_run(monkeypatch):
     }
     monkeypatch.setattr(api_module, "repo", fake_repo)
     monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
+    monkeypatch.setattr(api_module.settings, "api_auth_enabled", True)
+    monkeypatch.setattr(api_module.settings, "api_operator_keys", "operator-secret")
+    monkeypatch.setattr(api_module.settings, "api_admin_keys", "")
+    monkeypatch.setattr(api_module.settings, "api_key", "")
 
     response = client.post(
-        f"/api/v1/runs/{fake_repo.run['run_id']}/pause"
+        f"/api/v1/runs/{fake_repo.run['run_id']}/pause",
+        headers={"X-API-Key": "operator-secret"},
     )
 
     assert response.status_code == 404
