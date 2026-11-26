@@ -501,5 +501,6 @@ def test_upstash_trigger_disables_duplicate_workflow_level_retries(monkeypatch):
 
     asyncio.run(api_module._trigger_upstash_workflow({"run_id": "id"}, "id"))
 
+    assert captured["headers"]["Upstash-Workflow-Sdk-Version"] == "1"
     assert captured["headers"]["Upstash-Retries"] == "0"
     assert captured["headers"]["Upstash-Flow-Control-Key"] == "flowpilot-global"
