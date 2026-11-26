@@ -119,6 +119,13 @@ def test_qstash_failure_while_paused_is_committed_when_resumed():
     assert repo.fail_run_if_active(failure) is True
     assert repo.get_run(run_id, owner_id="qstash-queue-owner")["status"] == "paused"
 
+    late_success = {
+        **failure,
+        "status": "completed",
+        "output": {"summary": "late success"},
+    }
+    assert repo.save_paused_result(run_id, late_success) is False
+
     assert repo.resume_run(run_id) is True
     pending = repo.take_pending_result(run_id)
     repo.save_result(pending)
