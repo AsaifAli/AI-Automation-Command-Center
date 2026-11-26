@@ -15,8 +15,9 @@ import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from qstash import Receiver
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
+from qstash import Receiver
+from qstash.errors import SignatureError
 from redis import Redis
 from rq import Queue
 from starlette.responses import Response
@@ -41,7 +42,7 @@ from app.models.schemas import (
     RunRequest,
     WorkflowResult,
 )
-from app.storage.repository import Repository, _json_dumps
+from app.storage.repository import Repository
 from app.workers.jobs import execute_run
 
 settings = get_settings()
@@ -583,7 +584,7 @@ def _verify_qstash_signature(
             url=expected_url,
             clock_tolerance=5,
         )
-    except Exception:
+    except (SignatureError, UnicodeDecodeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid QStash signature.") from None
 
 
