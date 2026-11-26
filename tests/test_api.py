@@ -162,7 +162,7 @@ def test_upstash_trigger_encodes_route_and_limits_parallel_callbacks(monkeypatch
     assert "%3A%2F%2Fflowpilot.example.com%2Finternal%2Fqstash%2Fworkflow" in captured["url"]
     assert captured["headers"]["Authorization"] == "Bearer private-qstash-token"
     assert captured["headers"]["Upstash-Flow-Control-Key"] == "flowpilot-global"
-    assert captured["headers"]["Upstash-Flow-Control-Value"] == "parallelism=2"
+    assert captured["headers"]["Upstash-Flow-Control-Value"] == "parallelism=2, rate=2, period=1s"
     assert captured["body"] == {"run_id": "id"}
     assert captured["client_options"]["trust_env"] is False
 
