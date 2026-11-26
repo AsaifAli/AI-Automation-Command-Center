@@ -106,6 +106,28 @@ class FakeRepo:
         self.run["status"] = "running"
         return "claimed"
 
+    def complete_qstash_run(self, result):
+        if not self.run or self.run["run_id"] != result["run_id"]:
+            return "missing"
+        state = self.run["status"]
+        if state == "paused":
+            if self.dispatch.get("pending_result") is None:
+                self.dispatch["pending_result"] = dict(result)
+            return "paused"
+        if state in {"completed", "completed_with_warnings", "failed", "cancelled", "awaiting_approval", "approved", "rejected"}:
+            return state
+        if state not in {"queued", "running"}:
+            return state or "missing"
+        self.run.update({
+            "status": result["status"],
+            "output": result.get("output", {}),
+            "evidence": result.get("evidence", []),
+            "duration_ms": result.get("duration_ms", 0),
+            "usage": result.get("usage"),
+            "warnings": result.get("warnings", []),
+        })
+        return result["status"]
+
     def save_paused_result(self, run_id, result):
         if not self.run or self.run["run_id"] != run_id or self.run["status"] != "paused":
             return False
