@@ -132,3 +132,58 @@ def test_qstash_failure_while_paused_is_committed_when_resumed():
     resumed = repo.get_run(run_id, owner_id="qstash-queue-owner")
     assert resumed["status"] == "failed"
     assert resumed["output"]["error"] == "QStash delivery timed out."
+
+
+def test_atomic_completion_does_not_lose_result_if_resume_wins_the_checkpoint_race():
+    repo, run_id = _repo()
+    envelope = {"run_id": run_id}
+    repo.prepare_qstash_dispatch(run_id, envelope)
+    assert repo.claim_qstash_run(run_id, generation=1) == "claimed"
+    assert repo.pause_run(run_id) is True
+
+    # Resume happens after the worker observed a paused state but before it
+    # stores the finished result. The atomic completion operation must see
+    # that the run is active again and commit the result instead of dropping it.
+    assert repo.resume_run(run_id) is True
+    result = {
+        "run_id": run_id,
+        "workflow": "competitor",
+        "status": "completed",
+        "output": {"summary": "finished exactly once"},
+        "evidence": [],
+        "duration_ms": 900,
+        "created_at": datetime.now(UTC),
+        "usage": None,
+        "warnings": [],
+    }
+
+    assert repo.complete_qstash_run(result) == "completed"
+    stored = repo.get_run(run_id, owner_id="qstash-queue-owner")
+    assert stored["status"] == "completed"
+    assert stored["output"]["summary"] == "finished exactly once"
+
+
+def test_atomic_completion_stages_while_paused_and_discards_after_stop():
+    repo, run_id = _repo()
+    envelope = {"run_id": run_id}
+    repo.prepare_qstash_dispatch(run_id, envelope)
+    assert repo.claim_qstash_run(run_id, generation=1) == "claimed"
+    assert repo.pause_run(run_id) is True
+    result = {
+        "run_id": run_id,
+        "workflow": "competitor",
+        "status": "completed",
+        "output": {"summary": "paused result"},
+        "evidence": [],
+        "duration_ms": 900,
+        "created_at": datetime.now(UTC),
+        "usage": None,
+        "warnings": [],
+    }
+
+    assert repo.complete_qstash_run(result) == "paused"
+    assert repo.stop_run(run_id) is True
+    assert repo.complete_qstash_run({
+        **result,
+        "output": {"summary": "late completion"},
+    }) == "cancelled"
