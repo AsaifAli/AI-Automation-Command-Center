@@ -1,6 +1,6 @@
 -r requirements.txt
 
-pytest>=9.0.3,<10
+pytest==8.4.1
 pytest-asyncio==1.1.0
 ruff==0.17.5
 fakeredis==2.41.0
