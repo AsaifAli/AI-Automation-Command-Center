@@ -12,6 +12,7 @@ from app.core.demo import load_demo_config
 # variation and reduce the chance that a generated draft needs correction.
 CHANNEL_LIMITS = {"x": 280, "linkedin": 1300, "telegram": 800}
 CHANNEL_TARGETS = {"x": 220, "linkedin": 1200, "telegram": 700}
+MAX_CHARACTER_REPAIR_ATTEMPTS = 2
 
 
 class ContentGenerationError(ValueError):
@@ -116,35 +117,57 @@ class ContentAgent(Agent):
                     response_text, topics, channels
                 )
             except ContentCharacterLimitError as exc:
-                # One bounded repair attempt: regenerate the full, structured
-                # response with explicit violations. Hard validation remains in
-                # place after the retry; output is never silently truncated.
-                repair_request = {
-                    **request,
-                    "correction": {
-                        "instruction": (
-                            "The previous response exceeded one or more hard channel limits. "
-                            "Rewrite the complete response and correct every listed violation. "
-                            "Include exactly one replacement draft for every requested topic/channel pair. "
-                            "Keep every draft comfortably below its hard limit, count characters exactly, "
-                            "and do not truncate with ellipses or omit any pair."
+                # A provider can ignore a prose limit even with structured output.
+                # Retry only the invalid drafts, and cap repairs to avoid an
+                # unbounded loop or surprise usage when a model keeps misbehaving.
+                aggregate_usage = llm_note.get("usage", {})
+                previous_response = response_text
+                latest_error = exc
+                for attempt in range(1, MAX_CHARACTER_REPAIR_ATTEMPTS + 1):
+                    repair_request = {
+                        **request,
+                        "correction": {
+                            "instruction": (
+                                "Rewrite only the listed over-limit draft(s). Keep every already-valid "
+                                "draft unchanged. Return the complete JSON response with exactly one "
+                                "draft for every requested topic/channel pair. For each listed draft, "
+                                "stay at or below its hard character limit and aim for its preferred "
+                                "target. Count all characters, including spaces and punctuation. "
+                                "Do not truncate with ellipses, omit a draft, or change the supplied topic. "
+                                f"This is shortening attempt {attempt} of {MAX_CHARACTER_REPAIR_ATTEMPTS}."
+                            ),
+                            "violations": latest_error.violations,
+                            "previous_response": previous_response,
+                        },
+                    }
+                    correction_note = self.llm.generate(
+                        system_prompt + (
+                            " The previous output exceeded a channel character limit. Shorten only "
+                            "the offending draft(s), obey the schema's per-channel maxLength, and "
+                            "preserve all already-valid drafts."
                         ),
-                        "violations": exc.violations,
-                    },
-                }
-                correction_note = self.llm.generate(
-                    system_prompt + " Your previous output failed length validation. Correct every listed violation.",
-                    json.dumps(repair_request, ensure_ascii=False),
-                    response_format=response_format,
-                )
-                posts, strategy_note = self._parse_model_response(
-                    correction_note.get("text", ""), topics, channels
-                )
-                correction_note = dict(correction_note)
-                correction_note["usage"] = self._combine_usage(
-                    llm_note.get("usage"), correction_note.get("usage")
-                )
-                llm_note = correction_note
+                        json.dumps(repair_request, ensure_ascii=False),
+                        response_format=response_format,
+                    )
+                    aggregate_usage = self._combine_usage(
+                        aggregate_usage, correction_note.get("usage")
+                    )
+                    previous_response = correction_note.get("text", "")
+                    try:
+                        posts, strategy_note = self._parse_model_response(
+                            previous_response, topics, channels
+                        )
+                    except ContentCharacterLimitError as next_error:
+                        latest_error = next_error
+                        if attempt == MAX_CHARACTER_REPAIR_ATTEMPTS:
+                            raise
+                        continue
+
+                    llm_note = dict(correction_note)
+                    llm_note["usage"] = aggregate_usage
+                    break
+                else:
+                    raise latest_error
             except ContentGenerationError as exc:
                 # Providers can still return malformed JSON despite a strict
                 # schema request. Give the model one bounded opportunity to
@@ -192,6 +215,24 @@ class ContentAgent(Agent):
     @staticmethod
     def _response_format(topics: list[str], channels: list[str]) -> dict[str, Any]:
         """Request a strict JSON schema through OpenAI-compatible Gateway providers."""
+        channel_variants = []
+        for channel in channels:
+            channel_variants.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        "topic": {"type": "string", "enum": topics},
+                        "channel": {"type": "string", "enum": [channel]},
+                        "draft": {
+                            "type": "string",
+                            "maxLength": CHANNEL_LIMITS[channel],
+                        },
+                    },
+                    "required": ["topic", "channel", "draft"],
+                    "additionalProperties": False,
+                }
+            )
+
         return {
             "type": "json_schema",
             "json_schema": {
@@ -202,16 +243,7 @@ class ContentAgent(Agent):
                     "properties": {
                         "posts": {
                             "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "topic": {"type": "string", "enum": topics},
-                                    "channel": {"type": "string", "enum": channels},
-                                    "draft": {"type": "string"},
-                                },
-                                "required": ["topic", "channel", "draft"],
-                                "additionalProperties": False,
-                            },
+                            "items": {"anyOf": channel_variants},
                         },
                         "strategy_note": {"type": "string"},
                     },

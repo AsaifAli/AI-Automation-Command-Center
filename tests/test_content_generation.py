@@ -89,8 +89,10 @@ def test_live_content_drafts_come_from_model_response():
     schema = llm.response_formats[0]["json_schema"]
     assert llm.response_formats[0]["type"] == "json_schema"
     assert schema["strict"] is True
-    assert schema["schema"]["properties"]["posts"]["items"]["properties"]["topic"]["enum"] == [topic]
-    assert schema["schema"]["properties"]["posts"]["items"]["properties"]["channel"]["enum"] == ["linkedin"]
+    variants = schema["schema"]["properties"]["posts"]["items"]["anyOf"]
+    assert variants[0]["properties"]["topic"]["enum"] == [topic]
+    assert variants[0]["properties"]["channel"]["enum"] == ["linkedin"]
+    assert variants[0]["properties"]["draft"]["maxLength"] == CHANNEL_LIMITS["linkedin"]
 
 
 def test_live_content_requires_every_requested_topic_channel_pair():
@@ -201,11 +203,66 @@ def test_live_content_repairs_over_limit_draft_once_and_aggregates_usage():
     assert result["_usage"]["estimated_cost_usd"] == 0.002
 
 
+
+def test_live_content_schema_enforces_each_channel_hard_character_limit():
+    topic = "AI agents in enterprise finance operations, including reconciliation and exception handling"
+    llm = FakeLiveLLM(json.dumps({
+        "posts": [
+            {"topic": topic, "channel": channel, "draft": f"A concise {channel} draft."}
+            for channel in ("x", "linkedin", "telegram")
+        ],
+        "strategy_note": "Adapt each channel to its format.",
+    }))
+
+    ContentAgent(llm).run({"topics": [topic], "channels": ["x", "linkedin", "telegram"]})
+
+    variants = llm.response_formats[0]["json_schema"]["schema"]["properties"]["posts"]["items"]["anyOf"]
+    limits_by_channel = {
+        variant["properties"]["channel"]["enum"][0]: variant["properties"]["draft"]["maxLength"]
+        for variant in variants
+    }
+    assert limits_by_channel == CHANNEL_LIMITS
+
+
+def test_live_content_repairs_a_389_character_x_draft_with_a_second_bounded_attempt():
+    topic = "AI agents in enterprise finance operations, including reconciliation and exception handling"
+    too_long_first = "X" * 389
+    too_long_second = "Y" * 315
+    short_x_draft = (
+        "AI agents match finance transactions, flag reconciliation exceptions, "
+        "and route unusual cases for human review."
+    )
+    llm = FakeLiveLLM([
+        _response(topic, "x", too_long_first),
+        _response(topic, "x", too_long_second),
+        _response(topic, "x", short_x_draft),
+    ])
+
+    result = ContentAgent(llm).run({"topics": [topic], "channels": ["x"]})
+
+    assert len(llm.calls) == 3
+    assert result["posts"][0]["draft"] == short_x_draft
+    assert len(short_x_draft) <= CHANNEL_TARGETS["x"]
+    first_repair = json.loads(llm.calls[1][1])["correction"]
+    second_repair = json.loads(llm.calls[2][1])["correction"]
+    assert first_repair["violations"][0]["actual_characters"] == 389
+    assert second_repair["violations"][0]["actual_characters"] == 315
+    assert "rewrite only the listed over-limit draft" in second_repair["instruction"].lower()
+    assert all(
+        llm.response_formats[0] == response_format
+        for response_format in llm.response_formats[1:]
+    )
+    assert result["_usage"]["prompt_tokens"] == 30
+    assert result["_usage"]["completion_tokens"] == 15
+    assert result["_usage"]["total_tokens"] == 45
+    assert result["_usage"]["estimated_cost_usd"] == 0.003
+
+
 def test_live_content_fails_closed_if_repair_still_exceeds_channel_limit():
     over_limit = _response("AI", "x", "x" * (CHANNEL_LIMITS["x"] + 1))
-    llm = FakeLiveLLM([over_limit, over_limit])
+    llm = FakeLiveLLM([over_limit, over_limit, over_limit])
 
     with pytest.raises(ContentGenerationError, match="exceeds its 280-character limit"):
         ContentAgent(llm).run({"topics": ["AI"], "channels": ["x"]})
 
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3
