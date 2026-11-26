@@ -60,6 +60,7 @@ class HealthResponse(BaseModel):
 class ApprovalRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected)$")
     note: str = Field(default="", max_length=1000)
+    item_index: int | None = Field(default=None, ge=0, strict=True)
 
     # Deprecated compatibility field.
     # Never use this as the authenticated reviewer identity.
@@ -73,6 +74,7 @@ class ApprovalResponse(BaseModel):
     reviewer: str
     note: str
     decided_at: datetime
+    item_index: int | None = None
 
 
 class RunListResponse(BaseModel):

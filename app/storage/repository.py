@@ -11,6 +11,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.core.config import Settings
+from app.storage.approval import apply_approval_decision
 from app.storage.redis_state import RedisStateStore
 
 logger = logging.getLogger(__name__)
@@ -103,10 +104,12 @@ CREATE TABLE IF NOT EXISTS approvals (
     decision VARCHAR(20) NOT NULL,
     reviewer VARCHAR(100) NOT NULL,
     note TEXT NOT NULL DEFAULT '',
-    decided_at TIMESTAMPTZ NOT NULL
+    decided_at TIMESTAMPTZ NOT NULL,
+    item_index INTEGER
 );
 ALTER TABLE approvals ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
 ALTER TABLE approvals ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS item_index INTEGER;
 CREATE TABLE IF NOT EXISTS audit_events (
     id BIGSERIAL PRIMARY KEY,
     run_id UUID NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
@@ -1121,12 +1124,21 @@ class Repository:
             for run in runs[:safe_limit]
         ]
 
-    def create_approval(self, run_id: str, decision: str, reviewer: str, note: str) -> dict[str, Any]:
-        """Record one reviewer decision and atomically close the pending gate."""
-        if self._redis_state is not None:
-            return self._redis_state.create_approval(run_id, decision, reviewer, note)
+    def create_approval(
+        self,
+        run_id: str,
+        decision: str,
+        reviewer: str,
+        note: str,
+        *,
+        item_index: int | None = None,
+    ) -> dict[str, Any]:
+        """Record a reviewer decision, individually for content drafts."""
         if decision not in {"approved", "rejected"}:
             raise ValueError("Approval decision must be approved or rejected")
+        if item_index is not None and (not isinstance(item_index, int) or isinstance(item_index, bool) or item_index < 0):
+            raise ValueError("Content draft item_index is invalid")
+
         approval_id = str(uuid.uuid4())
         decided_at = datetime.now(UTC)
         approval = {
@@ -1136,69 +1148,53 @@ class Repository:
             "reviewer": reviewer,
             "note": note,
             "decided_at": decided_at,
+            "item_index": item_index,
         }
-        next_status = "approved" if decision == "approved" else "rejected"
+        if self._redis_state is not None:
+            return self._redis_state.create_approval(
+                run_id, decision, reviewer, note, item_index=item_index, approval_record=approval
+            )
+
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
                 if not run:
                     raise KeyError("Run not found")
-                if run.get("status") != "awaiting_approval":
-                    raise ValueError("This run is no longer awaiting approval")
-                output = run.setdefault("output", {})
-                request = output.get("approval")
-                if not isinstance(request, dict) or request.get("status") != "pending":
-                    raise ValueError("No pending approval exists for this run")
-                request.update({
-                    "status": next_status,
-                    "decision": decision,
-                    "reviewer": reviewer,
-                    "note": note,
-                    "decided_at": decided_at.isoformat(),
-                    "execution_status": "not_configured",
-                    "execution_note": (
-                        "Approval recorded. No external action was performed because no publishing or sending connector is configured."
-                    ),
-                })
-                run["status"] = next_status
-                self._memory_approvals[approval_id] = approval
+                apply_approval_decision(run, approval, item_index=item_index)
+                self._memory_approvals[approval_id] = copy.deepcopy(approval)
             return copy.deepcopy(approval)
 
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT status, output_json FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                "SELECT status, workflow, output_json, warnings_json FROM workflow_runs WHERE run_id=%s FOR UPDATE",
                 (run_id,),
             ).fetchone()
             if not row:
                 raise KeyError("Run not found")
-            if row["status"] != "awaiting_approval":
-                raise ValueError("This run is no longer awaiting approval")
-            output = row["output_json"] or {}
-            request = output.get("approval")
-            if not isinstance(request, dict) or request.get("status") != "pending":
-                raise ValueError("No pending approval exists for this run")
-            request.update({
-                "status": next_status,
-                "decision": decision,
-                "reviewer": reviewer,
-                "note": note,
-                "decided_at": decided_at.isoformat(),
-                "execution_status": "not_configured",
-                "execution_note": (
-                    "Approval recorded. No external action was performed because no publishing or sending connector is configured."
-                ),
-            })
+            run_state = {
+                "status": row["status"],
+                "workflow": row["workflow"],
+                "output": row["output_json"] or {},
+                "warnings": row["warnings_json"] or [],
+            }
+            apply_approval_decision(run_state, approval, item_index=item_index)
             conn.execute(
                 "UPDATE workflow_runs SET status=%s, output_json=%s WHERE run_id=%s",
-                (next_status, _json_dumps(output), run_id),
+                (run_state["status"], _json_dumps(run_state["output"]), run_id),
             )
             conn.execute(
-                "INSERT INTO approvals VALUES (%s,%s,%s,%s,%s,%s)",
-                (approval_id, run_id, decision, reviewer, note, decided_at),
+                "INSERT INTO approvals (approval_id, run_id, decision, reviewer, note, decided_at, item_index) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (approval_id, run_id, decision, reviewer, note, decided_at, item_index),
             )
             conn.execute(
                 "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
-                (run_id, "human_approval", _json_dumps({"approval_id": approval_id, "decision": decision, "reviewer": reviewer}), decided_at),
+                (
+                    run_id,
+                    "human_approval",
+                    _json_dumps({"approval_id": approval_id, "decision": decision, "reviewer": reviewer, "item_index": item_index}),
+                    decided_at,
+                ),
             )
         return approval
 

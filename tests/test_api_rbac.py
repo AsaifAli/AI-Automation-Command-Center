@@ -119,6 +119,8 @@ class FakeRepo:
         decision,
         reviewer,
         note,
+        *,
+        item_index=None,
     ):
         result = {
             "approval_id": f"approval-{len(self.approvals) + 1}",
@@ -127,6 +129,7 @@ class FakeRepo:
             "reviewer": reviewer,
             "note": note,
             "decided_at": datetime.now(UTC),
+            "item_index": item_index,
         }
 
         run = self.runs[run_id]

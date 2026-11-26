@@ -27,7 +27,26 @@ class FakeRepo:
             "status": "awaiting_approval" if requires_approval else "queued",
             "resume_status": None,
             "output": (
-                {"approval": {"status": "pending", "action": "send_outreach" if workflow == "outreach" else "publish_content", "title": "Review requested", "summary": "Test approval request", "items": []}}
+                {
+                    "posts": [
+                        {"topic": "AI operations", "channel": channel, "draft": f"Draft {index}"}
+                        for index, channel in enumerate(("linkedin", "x"))
+                    ] if workflow == "content" else [],
+                    "approval": {
+                        "status": "pending",
+                        "action": "send_outreach" if workflow == "outreach" else "publish_content",
+                        "title": "Review requested",
+                        "summary": "Test approval request",
+                        "items": [
+                            {"topic": "AI operations", "channel": channel, "draft": f"Draft {index}", "approval_status": "pending"}
+                            for index, channel in enumerate(("linkedin", "x"))
+                        ] if workflow == "content" else [],
+                        "approved_count": 0,
+                        "rejected_count": 0,
+                        "pending_count": 2 if workflow == "content" else 0,
+                        "total_count": 2 if workflow == "content" else 0,
+                    },
+                }
                 if requires_approval else {}
             ),
             "evidence": [],
@@ -237,25 +256,48 @@ class FakeRepo:
             "workflow_approvals_approved": 0,
         }
 
-    def create_approval(self, run_id, decision, reviewer, note):
+    def create_approval(self, run_id, decision, reviewer, note, *, item_index=None):
         if not self.run or self.run["status"] != "awaiting_approval":
             raise ValueError("This run is no longer awaiting approval")
-        self.run["status"] = decision
-        self.run["output"].setdefault("approval", {}).update({
-            "status": decision,
-            "decision": decision,
-            "reviewer": reviewer,
-            "note": note,
-            "execution_status": "not_configured",
-        })
+        approval_request = self.run["output"].setdefault("approval", {})
+        approval_id = "22222222-2222-2222-2222-222222222222"
+        if self.run["workflow"] == "content":
+            if item_index is None:
+                raise ValueError("Content drafts must be approved individually")
+            items = approval_request["items"]
+            if item_index >= len(items):
+                raise ValueError("Content draft item_index is out of range")
+            item = items[item_index]
+            if item.get("approval_status") != "pending":
+                raise ValueError("This content draft has already been reviewed")
+            item.update({"approval_status": decision, "reviewer": reviewer, "note": note})
+            posts = self.run["output"].get("posts", [])
+            if item_index < len(posts):
+                posts[item_index]["approval_status"] = decision
+            statuses = [draft.get("approval_status", "pending") for draft in items]
+            approved = statuses.count("approved")
+            rejected = statuses.count("rejected")
+            pending = len(statuses) - approved - rejected
+            approval_request.update({"approved_count": approved, "rejected_count": rejected, "pending_count": pending})
+            if pending == 0:
+                final_decision = "approved" if rejected == 0 else "rejected"
+                approval_request.update({"status": final_decision, "decision": final_decision, "execution_status": "not_configured"})
+                self.run["status"] = "completed" if final_decision == "approved" else "rejected"
+        else:
+            if item_index is not None:
+                raise ValueError("item_index is only supported for content drafts")
+            self.run["status"] = decision
+            approval_request.update({"status": decision, "decision": decision, "reviewer": reviewer, "note": note, "execution_status": "not_configured"})
         return {
-            "approval_id": "22222222-2222-2222-2222-222222222222",
+            "approval_id": approval_id,
             "run_id": run_id,
             "decision": decision,
             "reviewer": reviewer,
             "note": note,
             "decided_at": datetime.now(UTC),
+            "item_index": item_index,
         }
+
 
 
 class FakeQueue:
@@ -686,6 +728,34 @@ def test_clear_run_history():
     response = client.delete("/api/v1/runs/history")
     assert response.status_code == 200
     assert response.json()["deleted_runs"] == 1
+
+
+
+def test_content_approval_requires_and_applies_an_individual_draft_index(monkeypatch):
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    created = client.post(
+        "/api/v1/runs",
+        json={"workflow": "content", "payload": {"topics": ["AI operations"]}},
+    )
+    assert created.status_code == 202
+    run_id = created.json()["run_id"]
+
+    missing_index = client.post(
+        f"/api/v1/runs/{run_id}/approval",
+        json={"decision": "approved", "note": "Looks good"},
+    )
+    assert missing_index.status_code == 422
+    assert "individually" in missing_index.json()["detail"]
+
+    approved = client.post(
+        f"/api/v1/runs/{run_id}/approval",
+        json={"decision": "approved", "item_index": 0, "note": "Looks good"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["item_index"] == 0
+    assert fake_repo.run["status"] == "awaiting_approval"
+    assert fake_repo.run["output"]["approval"]["approved_count"] == 1
 
 
 def test_outreach_approval():

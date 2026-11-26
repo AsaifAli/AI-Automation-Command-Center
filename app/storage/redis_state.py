@@ -12,6 +12,7 @@ from redis import Redis
 from redis.exceptions import WatchError
 
 from app.core.config import Settings
+from app.storage.approval import apply_approval_decision
 
 
 def _json_dumps(value: Any) -> str:
@@ -561,50 +562,45 @@ class RedisStateStore:
             for run in pending[:safe_limit]
         ]
 
-    def create_approval(self, run_id: str, decision: str, reviewer: str, note: str) -> dict[str, Any]:
+    def create_approval(
+        self,
+        run_id: str,
+        decision: str,
+        reviewer: str,
+        note: str,
+        *,
+        item_index: int | None = None,
+        approval_record: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if decision not in {"approved", "rejected"}:
             raise ValueError("Approval decision must be approved or rejected")
-        approval_id = str(uuid.uuid4())
-        decided_at = datetime.now(UTC)
-        next_status = "approved" if decision == "approved" else "rejected"
-        approval = {
-            "approval_id": approval_id,
+        record = approval_record or {
+            "approval_id": str(uuid.uuid4()),
             "run_id": run_id,
             "decision": decision,
             "reviewer": reviewer,
             "note": note,
-            "decided_at": decided_at,
+            "decided_at": datetime.now(UTC),
+            "item_index": item_index,
         }
-
-        def update(run):
-            if run.get("status") != "awaiting_approval":
-                raise ValueError("This run is no longer awaiting approval")
-            output = run.setdefault("output", {})
-            request = output.get("approval")
-            if not isinstance(request, dict) or request.get("status") != "pending":
-                raise ValueError("No pending approval exists for this run")
-            request.update({
-                "status": next_status,
-                "decision": decision,
-                "reviewer": reviewer,
-                "note": note,
-                "decided_at": decided_at.isoformat(),
-                "execution_status": "not_configured",
-                "execution_note": (
-                    "Approval recorded. No external action was performed because no publishing or sending connector is configured."
-                ),
-            })
-            run["status"] = next_status
-            return True
-
-        updated = self._mutate_run(run_id, update)
+        updated = self._mutate_run(
+            run_id,
+            lambda run: apply_approval_decision(run, record, item_index=item_index) or True,
+        )
         if updated is None:
             raise KeyError("Run not found")
-        if not updated:
-            raise ValueError("This run is no longer awaiting approval")
-        self.client.hset(self._key("approvals"), approval_id, _json_dumps(approval))
-        self._append_audit(run_id, "human_approval", {"approval_id": approval_id, "decision": decision})
-        return approval
+        self.client.hset(self._key("approvals"), record["approval_id"], _json_dumps(record))
+        self._append_audit(
+            run_id,
+            "human_approval",
+            {
+                "approval_id": record["approval_id"],
+                "decision": decision,
+                "reviewer": reviewer,
+                "item_index": item_index,
+            },
+        )
+        return record
 
     def metrics(self) -> dict[str, int]:
         runs = self._read_runs(limit=10000)

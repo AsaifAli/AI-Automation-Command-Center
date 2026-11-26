@@ -664,11 +664,22 @@ if result:
         st.caption("Token counts are provider-reported where available. BYOK provider charges are not estimated or billed by FlowPilot.")
         review_state = result.get("output", {}).get("approval", {})
         if result.get("status") == "awaiting_approval":
-            st.info("This run is paused in the Approval Inbox. An authorized reviewer must approve or reject the proposed action.")
+            if result.get("workflow") == "content":
+                review_items = review_state.get("items", [])
+                approved_count = sum(
+                    isinstance(item, dict) and item.get("approval_status", "pending") == "approved"
+                    for item in review_items
+                )
+                st.info(
+                    f"{approved_count} of {len(review_items)} content drafts approved. "
+                    "The workflow completes only after every draft is individually approved."
+                )
+            else:
+                st.info("This run is paused in the Approval Inbox. An authorized reviewer must approve or reject the proposed action.")
         elif review_state.get("status") == "approved":
-            st.success("Authorization recorded. This demo has no live publish/send connector; nothing was sent or published.")
+            st.success("All drafts approved. The workflow is complete. This demo has no live publish/send connector; nothing was sent or published.")
         elif review_state.get("status") == "rejected":
-            st.warning("The proposed action was rejected. No external action was performed.")
+            st.warning("At least one draft or proposed action was rejected. No external action was performed.")
 
 st.divider()
 st.markdown('<div class="section-kicker">HUMAN IN THE LOOP</div>', unsafe_allow_html=True)
@@ -701,41 +712,103 @@ else:
             approval = pending_item.get("approval", {})
             workflow_name = str(pending_item.get("workflow", "")).lower()
             meta_item = WORKFLOW_META.get(workflow_name, {"icon": "⚙️", "title": workflow_name.title()})
+            run_id = pending_item.get("run_id", "")
             with st.container(border=True):
                 st.subheader(f"{meta_item['icon']} {approval.get('title') or meta_item['title']}")
-                st.caption(f"Run {str(pending_item.get('run_id', ''))[:12]} · {approval.get('action', 'review')} · {pending_item.get('created_at', '')}")
+                st.caption(f"Run {str(run_id)[:12]} · {approval.get('action', 'review')} · {pending_item.get('created_at', '')}")
                 st.write(approval.get("summary", "Review this proposed action."))
-                for draft in approval.get("items", []):
-                    if not isinstance(draft, dict):
-                        continue
-                    if workflow_name == "content":
-                        st.markdown(f"**{draft.get('channel', 'channel')} · {draft.get('topic', 'Content draft')}**")
-                        st.write(draft.get("draft", ""))
-                    else:
+
+                if workflow_name == "content":
+                    draft_items = approval.get("items", [])
+                    approved_count = sum(
+                        isinstance(item, dict) and item.get("approval_status", "pending") == "approved"
+                        for item in draft_items
+                    )
+                    rejected_count = sum(
+                        isinstance(item, dict) and item.get("approval_status", "pending") == "rejected"
+                        for item in draft_items
+                    )
+                    st.caption(
+                        f"Review progress · {approved_count} approved · {rejected_count} rejected · "
+                        f"{len(draft_items) - approved_count - rejected_count} awaiting decision"
+                    )
+                    for draft_index, draft in enumerate(draft_items):
+                        if not isinstance(draft, dict):
+                            continue
+                        draft_status = str(draft.get("approval_status", "pending")).lower()
+                        with st.container(border=True):
+                            st.markdown(f"**Draft {draft_index + 1} · {draft.get('channel', 'channel')} · {draft.get('topic', 'Content draft')}**")
+                            st.write(draft.get("draft", ""))
+                            if draft_status == "approved":
+                                st.success(f"Approved by {draft.get('reviewer', 'reviewer')}")
+                                if draft.get("note"):
+                                    st.caption(f"Reviewer note: {draft['note']}")
+                            elif draft_status == "rejected":
+                                st.warning(f"Rejected by {draft.get('reviewer', 'reviewer')}")
+                                if draft.get("note"):
+                                    st.caption(f"Reviewer note: {draft['note']}")
+                            else:
+                                draft_note = st.text_area(
+                                    "Reviewer note",
+                                    key=f"approval_note_{run_id}_{draft_index}",
+                                    max_chars=1000,
+                                )
+                                approve_col, reject_col = st.columns(2)
+                                if approve_col.button(
+                                    "Approve draft",
+                                    type="primary",
+                                    use_container_width=True,
+                                    key=f"approve_{run_id}_{draft_index}",
+                                ):
+                                    response = api_post(
+                                        f"/api/v1/runs/{run_id}/approval",
+                                        {"decision": "approved", "item_index": draft_index, "note": draft_note},
+                                        role="reviewer",
+                                    )
+                                    response_json(response, "Approve draft")
+                                    st.success("Draft approved. The workflow will complete after every draft is approved.")
+                                    st.rerun()
+                                if reject_col.button(
+                                    "Reject draft",
+                                    use_container_width=True,
+                                    key=f"reject_{run_id}_{draft_index}",
+                                ):
+                                    response = api_post(
+                                        f"/api/v1/runs/{run_id}/approval",
+                                        {"decision": "rejected", "item_index": draft_index, "note": draft_note},
+                                        role="reviewer",
+                                    )
+                                    response_json(response, "Reject draft")
+                                    st.warning("Draft rejected. The workflow will be rejected after every draft has a decision.")
+                                    st.rerun()
+                else:
+                    for draft in approval.get("items", []):
+                        if not isinstance(draft, dict):
+                            continue
                         st.markdown(f"**{draft.get('name', 'Prospect')} · {draft.get('channel', 'channel')}**")
                         st.write(draft.get("message", ""))
                         if draft.get("reason"):
                             st.caption(draft["reason"])
-                decision_note = st.text_area("Reviewer note", key=f"approval_note_{pending_item.get('run_id')}", max_chars=1000)
-                approve_col, reject_col = st.columns(2)
-                if approve_col.button("Approve action", type="primary", use_container_width=True, key=f"approve_{pending_item.get('run_id')}"):
-                    response = api_post(
-                        f"/api/v1/runs/{pending_item.get('run_id')}/approval",
-                        {"decision": "approved", "note": decision_note},
-                        role="reviewer",
-                    )
-                    response_json(response, "Approve action")
-                    st.success("Authorization recorded. No message was sent and no content was published.")
-                    st.rerun()
-                if reject_col.button("Reject action", use_container_width=True, key=f"reject_{pending_item.get('run_id')}"):
-                    response = api_post(
-                        f"/api/v1/runs/{pending_item.get('run_id')}/approval",
-                        {"decision": "rejected", "note": decision_note},
-                        role="reviewer",
-                    )
-                    response_json(response, "Reject action")
-                    st.warning("Proposal rejected. No external action was performed.")
-                    st.rerun()
+                    decision_note = st.text_area("Reviewer note", key=f"approval_note_{run_id}", max_chars=1000)
+                    approve_col, reject_col = st.columns(2)
+                    if approve_col.button("Approve action", type="primary", use_container_width=True, key=f"approve_{run_id}"):
+                        response = api_post(
+                            f"/api/v1/runs/{run_id}/approval",
+                            {"decision": "approved", "note": decision_note},
+                            role="reviewer",
+                        )
+                        response_json(response, "Approve action")
+                        st.success("Authorization recorded. No message was sent and no content was published.")
+                        st.rerun()
+                    if reject_col.button("Reject action", use_container_width=True, key=f"reject_{run_id}"):
+                        response = api_post(
+                            f"/api/v1/runs/{run_id}/approval",
+                            {"decision": "rejected", "note": decision_note},
+                            role="reviewer",
+                        )
+                        response_json(response, "Reject action")
+                        st.warning("Proposal rejected. No external action was performed.")
+                        st.rerun()
     except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
         st.error(f"Approval inbox unavailable: {exc}")
 
