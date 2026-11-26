@@ -772,7 +772,11 @@ async def execute_qstash_message(request: Request):
 async def record_qstash_failure(request: Request):
     """Record QStash delivery timeout/failure without the Workflow SDK callback contract."""
     body = await request.body()
-    _verify_qstash_signature(body, request.headers.get("Upstash-Signature"))
+    _verify_qstash_signature(
+        body,
+        request.headers.get("Upstash-Signature"),
+        settings.upstash_workflow_url.rstrip("/") + request.url.path,
+    )
     try:
         callback = json.loads(body.decode("utf-8"))
         source_body = callback.get("sourceBody") if isinstance(callback, dict) else None
@@ -807,10 +811,16 @@ async def record_qstash_failure(request: Request):
         "warnings": ["QStash exhausted the configured HTTP delivery attempt."],
     }
     recorded = await asyncio.to_thread(repo.fail_run_if_active, failure)
+    raw_status = callback.get("status")
+    callback_status = (
+        raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+        else int(raw_status) if isinstance(raw_status, str) and raw_status.isdigit()
+        else 0
+    )
     logger.warning(
         "qstash_delivery_failure_recorded run_id=%s status=%s recorded=%s",
         data["run_id"],
-        int(callback.get("status", 0)),
+        callback_status,
         recorded,
     )
     return {"run_id": data["run_id"], "status": "failure_recorded" if recorded else "unchanged"}
