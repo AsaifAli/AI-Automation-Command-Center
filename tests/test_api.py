@@ -489,7 +489,7 @@ def test_upstash_trigger_disables_duplicate_workflow_level_retries(monkeypatch):
             return False
 
         async def post(self, url, *, headers, json):
-            captured["headers"] = headers
+            captured.update({"url": url, "headers": headers, "body": json})
             return FakeResponse()
 
     monkeypatch.setattr(api_module.httpx, "AsyncClient", FakeAsyncClient)
