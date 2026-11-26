@@ -162,9 +162,50 @@ def test_upstash_trigger_encodes_route_and_limits_parallel_callbacks(monkeypatch
     assert "%3A%2F%2Fflowpilot.example.com%2Finternal%2Fqstash%2Fworkflow" in captured["url"]
     assert captured["headers"]["Authorization"] == "Bearer private-qstash-token"
     assert captured["headers"]["Upstash-Flow-Control-Key"] == "flowpilot-global"
-    assert captured["headers"]["Upstash-Flow-Control-Value"] == "parallelism=2, rate=2, period=1s"
+    assert captured["headers"]["Upstash-Flow-Control-Value"] == "parallelism=2,rate=2,period=1s"
     assert captured["body"] == {"run_id": "id"}
     assert captured["client_options"]["trust_env"] is False
+
+
+def test_upstash_trigger_reports_sanitized_qstash_rejection(monkeypatch):
+    import asyncio
+
+    class FakeResponse:
+        status_code = 400
+
+        @staticmethod
+        def json():
+            return {
+                "error": "invalid flow-control header; Authorization: Bearer sensitive-qstash-value"
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(api_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(api_module.settings, "qstash_url", "https://qstash-eu-central-1.upstash.io")
+    monkeypatch.setattr(api_module.settings, "qstash_token", "private-qstash-token")
+    monkeypatch.setattr(api_module.settings, "upstash_workflow_url", "https://flowpilot.example.com")
+
+    try:
+        asyncio.run(api_module._trigger_upstash_workflow({"run_id": "id"}, "id"))
+    except RuntimeError as exc:
+        assert "HTTP 400" in str(exc)
+        assert "invalid flow-control header" in str(exc)
+        assert "sensitive-qstash-value" not in str(exc)
+        assert "private-qstash-token" not in str(exc)
+    else:
+        raise AssertionError("Expected QStash rejection to raise RuntimeError")
 
 
 def test_upstash_workflow_dispatch_encrypts_byok_before_queueing(monkeypatch):

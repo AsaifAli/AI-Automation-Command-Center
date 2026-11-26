@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import UTC, datetime
@@ -568,7 +569,7 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
         "Upstash-Flow-Control-Key": "flowpilot-global",
         # QStash requires the full flow-control value tuple, not parallelism alone.
         "Upstash-Flow-Control-Value": (
-            f"parallelism={settings.qstash_workflow_parallelism}, rate=2, period=1s"
+            f"parallelism={settings.qstash_workflow_parallelism},rate=2,period=1s"
         ),
         "Upstash-Label": "flowpilot",
     }
@@ -578,7 +579,39 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
     except httpx.HTTPError as exc:
         raise RuntimeError("QStash could not accept the workflow request.") from exc
     if not 200 <= response.status_code < 300:
-        raise RuntimeError("QStash rejected the workflow request.")
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = {}
+        error_detail = (
+            error_payload.get("error")
+            if isinstance(error_payload, dict)
+            else None
+        )
+        if isinstance(error_detail, str) and error_detail.strip():
+            error_detail = " ".join(error_detail.split())
+            error_detail = re.sub(
+                r"(?i)(authorization\s*[:=]\s*)bearer\s+[^\s,;]+",
+                r"\1Bearer [REDACTED]",
+                error_detail,
+            )
+            error_detail = re.sub(
+                r"(?i)\bbearer\s+[^\s,;]+",
+                "Bearer [REDACTED]",
+                error_detail,
+            )
+            error_detail = re.sub(
+                r"(?i)\b((?:api[_-]?key|token|secret)\s*[:=]\s*)[^\s,;]+",
+                r"\1[REDACTED]",
+                error_detail,
+            )
+            error_detail = error_detail[:240]
+            raise RuntimeError(
+                f"QStash rejected the workflow request (HTTP {response.status_code}): {error_detail}"
+            )
+        raise RuntimeError(
+            f"QStash rejected the workflow request (HTTP {response.status_code}; no error detail)."
+        )
     try:
         workflow_run_id = response.json().get("workflowRunId")
     except (ValueError, AttributeError):
