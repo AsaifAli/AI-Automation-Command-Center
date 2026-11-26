@@ -754,6 +754,7 @@ class Repository:
     def _row_to_run(row: dict[str, Any]) -> dict[str, Any]:
         return {
             "run_id": str(row["run_id"]),
+            "owner_id": row.get("owner_id", "legacy"),
             "workflow": row["workflow"],
             "status": row["status"],
             "output": row["output_json"] or {},
