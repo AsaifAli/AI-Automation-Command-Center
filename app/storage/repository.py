@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow VARCHAR(50) NOT NULL,
     status VARCHAR(50) NOT NULL,
     resume_status VARCHAR(50),
+    dispatch_payload_json JSONB,
+    qstash_message_id TEXT,
+    dispatch_generation INTEGER NOT NULL DEFAULT 0,
+    pending_result_json JSONB,
     output_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     evidence_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +75,10 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
 -- This keeps `docker compose up` upgrade-safe without requiring users to delete data.
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'legacy';
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS resume_status VARCHAR(50);
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS dispatch_payload_json JSONB;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS qstash_message_id TEXT;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS dispatch_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS pending_result_json JSONB;
 -- Before owner scopes existed, all authorized API roles shared one private control plane.
 -- Backfill those pre-migration rows to that same owner so existing history remains visible.
 UPDATE workflow_runs
@@ -169,6 +177,10 @@ class Repository:
             "workflow": workflow,
             "status": "queued",
             "resume_status": None,
+            "dispatch_payload": None,
+            "qstash_message_id": None,
+            "dispatch_generation": 0,
+            "pending_result": None,
             "output": {},
             "evidence": [],
             "duration_ms": 0,
@@ -223,6 +235,10 @@ class Repository:
                     "workflow": workflow,
                     "status": "queued",
                     "resume_status": None,
+                    "dispatch_payload": None,
+                    "qstash_message_id": None,
+                    "dispatch_generation": 0,
+                    "pending_result": None,
                     "output": {},
                     "evidence": [],
                     "duration_ms": 0,
@@ -253,6 +269,251 @@ class Repository:
                        VALUES (%s,%s,%s,%s)""",
                     (normalized_run_id, "queued", json.dumps({"workflow": workflow}), now),
                 )
+
+    def prepare_qstash_dispatch(self, run_id: str, payload: dict[str, Any]) -> int:
+        """Prepare a new generation of a plain QStash message for this run."""
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run or run.get("status") != "queued":
+                    raise ValueError("Only queued runs can be dispatched.")
+                generation = int(run.get("dispatch_generation", 0)) + 1
+                payload["dispatch_generation"] = generation
+                run["dispatch_generation"] = generation
+                run["dispatch_payload"] = copy.deepcopy(payload)
+                run["qstash_message_id"] = None
+                return generation
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status, dispatch_generation FROM workflow_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not row or row["status"] != "queued":
+                raise ValueError("Only queued runs can be dispatched.")
+            generation = int(row["dispatch_generation"] or 0) + 1
+            payload["dispatch_generation"] = generation
+            conn.execute(
+                """UPDATE workflow_runs
+                   SET dispatch_payload_json=%s, dispatch_generation=%s, qstash_message_id=NULL
+                   WHERE run_id=%s""",
+                (_json_dumps(payload), generation, run_id),
+            )
+        return generation
+
+    def restore_qstash_dispatch(self, run_id: str, payload: dict[str, Any]) -> None:
+        """Restore dispatch metadata from an authenticated QStash delivery after process restart."""
+        generation = payload.get("dispatch_generation")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+            raise ValueError("QStash dispatch generation is invalid.")
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run:
+                    raise KeyError(f"Run not found: {run_id}")
+                current = int(run.get("dispatch_generation", 0))
+                if generation > current:
+                    run["dispatch_generation"] = generation
+                    run["dispatch_payload"] = copy.deepcopy(payload)
+            return
+
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE workflow_runs
+                   SET dispatch_generation=%s,
+                       dispatch_payload_json=COALESCE(dispatch_payload_json, %s)
+                   WHERE run_id=%s AND dispatch_generation < %s""",
+                (generation, _json_dumps(payload), run_id, generation),
+            )
+
+    def set_qstash_message_id(self, run_id: str, generation: int, message_id: str) -> bool:
+        if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 256:
+            raise ValueError("QStash message identifier is invalid.")
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run or int(run.get("dispatch_generation", 0)) != generation:
+                    return False
+                run["qstash_message_id"] = message_id
+                return True
+        with self._connect() as conn:
+            row = conn.execute(
+                """UPDATE workflow_runs SET qstash_message_id=%s
+                   WHERE run_id=%s AND dispatch_generation=%s RETURNING run_id""",
+                (message_id, run_id, generation),
+            ).fetchone()
+        return bool(row)
+
+    def get_qstash_dispatch(self, run_id: str) -> dict[str, Any] | None:
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run:
+                    return None
+                return {
+                    "payload": copy.deepcopy(run.get("dispatch_payload")),
+                    "message_id": run.get("qstash_message_id"),
+                    "generation": int(run.get("dispatch_generation", 0)),
+                    "pending_result": copy.deepcopy(run.get("pending_result")),
+                    "status": run.get("status"),
+                    "resume_status": run.get("resume_status"),
+                }
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT dispatch_payload_json, qstash_message_id, dispatch_generation,
+                          pending_result_json, status, resume_status
+                   FROM workflow_runs WHERE run_id=%s""",
+                (run_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "payload": row["dispatch_payload_json"],
+            "message_id": row["qstash_message_id"],
+            "generation": int(row["dispatch_generation"] or 0),
+            "pending_result": row["pending_result_json"],
+            "status": row["status"],
+            "resume_status": row["resume_status"],
+        }
+
+    def claim_qstash_run(self, run_id: str, generation: int) -> str:
+        """Atomically claim one queued delivery; duplicate/stale messages become no-ops."""
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run:
+                    return "missing"
+                if int(run.get("dispatch_generation", 0)) != generation:
+                    return "superseded"
+                state = run.get("status")
+                if state != "queued":
+                    return state
+                run["status"] = "running"
+                return "claimed"
+
+        now = datetime.now(UTC)
+        with self._connect() as conn:
+            row = conn.execute(
+                """UPDATE workflow_runs SET status='running'
+                   WHERE run_id=%s AND status='queued' AND dispatch_generation=%s
+                   RETURNING run_id""",
+                (run_id, generation),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                    (run_id, "started", json.dumps({"dispatch_generation": generation}), now),
+                )
+                return "claimed"
+            current = conn.execute(
+                "SELECT status, dispatch_generation FROM workflow_runs WHERE run_id=%s",
+                (run_id,),
+            ).fetchone()
+        if not current:
+            return "missing"
+        if int(current["dispatch_generation"] or 0) != generation:
+            return "superseded"
+        return str(current["status"])
+
+    def save_paused_result(self, run_id: str, result: dict[str, Any]) -> bool:
+        """Stage a completed inference result while keeping the run paused."""
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run or run.get("status") != "paused" or run.get("pending_result") is not None:
+                    return False
+                run["pending_result"] = copy.deepcopy(result)
+                return True
+        with self._connect() as conn:
+            row = conn.execute(
+                """UPDATE workflow_runs SET pending_result_json=%s
+                   WHERE run_id=%s AND status='paused' AND pending_result_json IS NULL
+                   RETURNING run_id""",
+                (_json_dumps(result), run_id),
+            ).fetchone()
+        return bool(row)
+
+    def take_pending_result(self, run_id: str) -> dict[str, Any] | None:
+        """Atomically take the result staged at a pause checkpoint."""
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run:
+                    return None
+                result = run.get("pending_result")
+                run["pending_result"] = None
+                return copy.deepcopy(result)
+        with self._connect() as conn:
+            row = conn.execute(
+                """UPDATE workflow_runs SET pending_result_json=NULL
+                   WHERE run_id=%s AND pending_result_json IS NOT NULL
+                   RETURNING pending_result_json""",
+                (run_id,),
+            ).fetchone()
+        return row["pending_result_json"] if row else None
+
+    def fail_run_if_active(self, result: dict[str, Any]) -> bool:
+        """Persist a QStash failure, staging it when the run is user-paused."""
+        run_id = result["run_id"]
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if not run:
+                    return False
+                state = run.get("status")
+                if state == "paused":
+                    if run.get("pending_result") is not None:
+                        return False
+                    run["pending_result"] = copy.deepcopy(result)
+                    return True
+                if state not in {"queued", "running"}:
+                    return False
+                run.update({
+                    "status": "failed",
+                    "output": copy.deepcopy(result.get("output", {})),
+                    "evidence": copy.deepcopy(result.get("evidence", [])),
+                    "duration_ms": result.get("duration_ms", 0),
+                    "created_at": result.get("created_at", run["created_at"]),
+                    "usage": _normalize_usage(result.get("usage")),
+                    "warnings": copy.deepcopy(result.get("warnings", [])),
+                })
+                return True
+        now = datetime.now(UTC)
+        with self._connect() as conn:
+            row = conn.execute(
+                """UPDATE workflow_runs
+                   SET pending_result_json=%s
+                   WHERE run_id=%s AND status='paused'
+                   RETURNING run_id""",
+                (_json_dumps(result), run_id),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                    (run_id, "failure_staged", _json_dumps({"source": "qstash_failure_callback"}), now),
+                )
+                return True
+            row = conn.execute(
+                """UPDATE workflow_runs
+                   SET status='failed', output_json=%s, evidence_json=%s, duration_ms=%s,
+                       usage_json=NULL, warnings_json=%s, error=%s
+                   WHERE run_id=%s AND status IN ('queued','running')
+                   RETURNING run_id""",
+                (
+                    _json_dumps(result.get("output", {})),
+                    _json_dumps(result.get("evidence", [])),
+                    result.get("duration_ms", 0),
+                    _json_dumps(result.get("warnings", [])),
+                    result.get("output", {}).get("error"),
+                    run_id,
+                ),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                    (run_id, "failed", _json_dumps({"source": "qstash_failure_callback"}), now),
+                )
+        return bool(row)
 
     def pause_run(self, run_id: str) -> bool:
         """Pause an active run at its next durable workflow boundary."""
@@ -470,7 +731,7 @@ class Repository:
                     raise KeyError(f"Run not found: {result['run_id']}")
                 # A canceled or paused state is authoritative. Late worker
                 # completions must not resurrect a run that an operator controlled.
-                if record.get("status") in {"cancelled", "paused"}:
+                if record.get("status") in {"cancelled", "paused", "failed", "completed", "completed_with_warnings", "awaiting_approval"}:
                     return
                 record.update(
                     {
@@ -490,7 +751,7 @@ class Repository:
                 "SELECT status FROM workflow_runs WHERE run_id=%s FOR UPDATE",
                 (result["run_id"],),
             ).fetchone()
-            if not current or current["status"] in {"cancelled", "paused"}:
+            if not current or current["status"] not in {"queued", "running"}:
                 return
             conn.execute(
                 """UPDATE workflow_runs

@@ -16,6 +16,8 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Re
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
+from qstash import Receiver
+from qstash.errors import SignatureError
 from redis import Redis
 from rq import Queue
 from starlette.responses import Response
@@ -40,7 +42,7 @@ from app.models.schemas import (
     RunRequest,
     WorkflowResult,
 )
-from app.storage.repository import Repository, _json_dumps
+from app.storage.repository import Repository
 from app.workers.jobs import execute_run
 
 settings = get_settings()
@@ -346,7 +348,7 @@ def root():
 
     if settings.qstash_workflow_enabled:
         architecture = (
-            "api -> QStash Workflow -> signed execution callback -> "
+            "api -> QStash HTTP message -> signed execution endpoint + native failure callback -> "
             + ("PostgreSQL-backed run state" if settings.database_url.strip() else "ephemeral in-memory run state")
         )
     else:
@@ -379,7 +381,7 @@ def health():
         version=settings.app_version,
         demo_mode=settings.demo_mode,
         execution_mode=(
-            "upstash_workflow"
+            "qstash_http_queue"
             if settings.qstash_workflow_enabled
             else "inline_background" if settings.inline_execution else "redis_worker"
         ),
@@ -393,7 +395,7 @@ def ready():
         repo.metrics()
 
         redis_status = (
-            "upstash_workflow"
+            "qstash_http_queue"
             if settings.qstash_workflow_enabled
             else "inline" if settings.inline_execution else "available"
         )
@@ -512,36 +514,10 @@ def _execute_inline_background(
 
 
 
-def _parse_upstash_workflow_initial_payload(raw_payload: object) -> dict:
-    """Normalize SDK initial/failure payloads into the original JSON envelope.
-
-    The Python SDK may hand the callback a decoded mapping, a JSON string, or
-    a JSON string nested inside another JSON string. Failure callbacks must
-    recover the same envelope that the initial invocation received.
-    """
-    candidate = raw_payload
-    for _ in range(3):
-        if isinstance(candidate, dict):
-            return candidate
-        if isinstance(candidate, bytes):
-            try:
-                candidate = candidate.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError("Workflow payload encoding is invalid.") from exc
-        if isinstance(candidate, str):
-            try:
-                candidate = json.loads(candidate)
-            except json.JSONDecodeError as exc:
-                raise ValueError("Workflow payload is not valid JSON.") from exc
-            continue
-        break
-    raise TypeError("Workflow payload must decode to a JSON object.")
-
-
-def _validate_upstash_workflow_payload(raw_payload: object) -> dict:
-    """Validate the signed QStash envelope before restoring or executing a run."""
+def _validate_qstash_payload(raw_payload: object) -> dict:
+    """Validate a signed QStash message envelope before executing a run."""
     if not isinstance(raw_payload, dict):
-        raise TypeError("Workflow payload must be an object.")
+        raise TypeError("QStash message body must be a JSON object.")
     run_id = raw_payload.get("run_id")
     try:
         normalized_run_id = str(uuid.UUID(str(run_id)))
@@ -558,6 +534,10 @@ def _validate_upstash_workflow_payload(raw_payload: object) -> dict:
     owner_id = raw_payload.get("owner_id")
     if not isinstance(owner_id, str) or not owner_id.strip() or len(owner_id) > 256:
         raise ValueError("Workflow owner scope is invalid.")
+    generation = raw_payload.get("dispatch_generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ValueError("QStash dispatch generation is invalid.")
+
     encrypted_value = raw_payload.get("gateway_token_ciphertext")
     encrypted_token = None
     ttl_seconds = None
@@ -573,40 +553,81 @@ def _validate_upstash_workflow_payload(raw_payload: object) -> dict:
         ttl_seconds = raw_payload.get("gateway_token_ttl_seconds")
         if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or not 60 <= ttl_seconds <= 1800:
             raise ValueError("Gateway credential lifetime is invalid.")
+
     return {
         "run_id": normalized_run_id,
         "workflow": workflow,
         "payload": payload,
         "owner_id": owner_id,
+        "dispatch_generation": generation,
         "encrypted_gateway_token": encrypted_token,
         "gateway_token_ttl_seconds": ttl_seconds,
     }
 
 
-async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
-    """Trigger the signed Workflow route through the documented QStash REST API."""
-    workflow_url = settings.upstash_workflow_url.rstrip("/") + "/internal/qstash/workflow"
-    # QStash expects the destination URL directly after /v2/trigger/, not percent-encoded.
-    trigger_url = settings.qstash_url.rstrip("/") + "/v2/trigger/" + workflow_url
+def _verify_qstash_signature(
+    body: bytes,
+    signature: str | None,
+    expected_url: str,
+) -> None:
+    """Verify body and exact destination URL against either active QStash key."""
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing QStash signature.")
+    try:
+        raw_text = body.decode("utf-8")
+        Receiver(
+            current_signing_key=settings.qstash_current_signing_key,
+            next_signing_key=settings.qstash_next_signing_key,
+        ).verify(
+            signature=signature,
+            body=raw_text,
+            url=expected_url,
+            clock_tolerance=5,
+        )
+    except (SignatureError, UnicodeDecodeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid QStash signature.") from None
+
+
+async def _publish_qstash_message(
+    envelope: dict,
+    run_id: str,
+    generation: int,
+) -> str:
+    """Publish one signed HTTP job; no Workflow SDK trigger or replay callback is involved."""
+    destination_url = (
+        settings.upstash_workflow_url.rstrip("/") + "/internal/qstash/execute"
+    )
+    failure_url = (
+        settings.upstash_workflow_url.rstrip("/") + "/internal/qstash/failure"
+    )
+    publish_url = settings.qstash_url.rstrip("/") + "/v2/publish/" + destination_url
     headers = {
         "Authorization": f"Bearer {settings.qstash_token}",
         "Content-Type": "application/json",
-        "Upstash-Workflow-RunId": f"flowpilot-{run_id}",
-        # Explicitly identify the v1 Workflow protocol used by workflow-py 2.x.
-        "Upstash-Workflow-Sdk-Version": "1",
         "Upstash-Retries": "0",
+        # The free QStash plan permits up to 15 minutes per HTTP response.
+        # Leave a margin so QStash can invoke the failure callback on timeout.
+        "Upstash-Timeout": "14m",
+        "Upstash-Failure-Callback": failure_url,
+        "Upstash-Failure-Callback-Retries": "2",
+        "Upstash-Failure-Callback-Timeout": "10s",
         "Upstash-Flow-Control-Key": "flowpilot-global",
-        # QStash requires the full flow-control value tuple, not parallelism alone.
         "Upstash-Flow-Control-Value": (
             f"parallelism={settings.qstash_workflow_parallelism}, rate=2, period=1s"
         ),
+        "Upstash-Deduplication-Id": f"flowpilot-{run_id}-{generation}",
         "Upstash-Label": "flowpilot",
     }
     try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False, trust_env=False) as client:
-            response = await client.post(trigger_url, headers=headers, json=envelope)
+        async with httpx.AsyncClient(
+            timeout=20.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            response = await client.post(publish_url, headers=headers, json=envelope)
     except httpx.HTTPError as exc:
-        raise RuntimeError("QStash could not accept the workflow request.") from exc
+        raise RuntimeError("QStash could not accept the workflow message.") from exc
+
     if not 200 <= response.status_code < 300:
         try:
             error_payload = response.json()
@@ -634,30 +655,27 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
                 r"\1[REDACTED]",
                 error_detail,
             )
-            error_detail = error_detail[:240]
             raise RuntimeError(
-                f"QStash rejected the workflow request (HTTP {response.status_code}): {error_detail}"
+                f"QStash rejected the workflow message (HTTP {response.status_code}): {error_detail[:240]}"
             )
         raise RuntimeError(
-            f"QStash rejected the workflow request (HTTP {response.status_code}; no error detail)."
+            f"QStash rejected the workflow message (HTTP {response.status_code}; no error detail)."
         )
+
     try:
-        workflow_run_id = response.json().get("workflowRunId")
+        message_id = response.json().get("messageId")
     except (ValueError, AttributeError):
-        workflow_run_id = None
-    if not isinstance(workflow_run_id, str) or not workflow_run_id:
-        raise RuntimeError("QStash returned an invalid workflow acknowledgement.")
-    return workflow_run_id
+        message_id = None
+    if not isinstance(message_id, str) or not message_id:
+        raise RuntimeError("QStash returned an invalid message acknowledgement.")
+    return message_id
 
 
-async def _cancel_upstash_workflow(run_id: str) -> None:
-    """Cancel one QStash Workflow run without pausing the shared queue."""
-    workflow_run_id = f"wfr_flowpilot-{run_id}"
-    cancel_url = (
-        settings.qstash_url.rstrip("/")
-        + "/v2/workflows/runs/"
-        + workflow_run_id
-    )
+async def _cancel_qstash_message(message_id: str) -> bool:
+    """Cancel a pending QStash message. False means it was already delivered or gone."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", message_id or ""):
+        raise RuntimeError("QStash message identifier is invalid.")
+    cancel_url = settings.qstash_url.rstrip("/") + "/v2/messages/" + message_id
     try:
         async with httpx.AsyncClient(
             timeout=8.0,
@@ -667,127 +685,158 @@ async def _cancel_upstash_workflow(run_id: str) -> None:
             response = await client.delete(
                 cancel_url,
                 headers={"Authorization": f"Bearer {settings.qstash_token}"},
-                params={"cancel": "true"},
             )
     except httpx.HTTPError as exc:
-        raise RuntimeError("QStash could not confirm workflow cancellation.") from exc
-    if not 200 <= response.status_code < 300:
+        raise RuntimeError("QStash could not confirm message cancellation.") from exc
+    if response.status_code == 404:
+        return False
+    if response.status_code not in {200, 202}:
         raise RuntimeError(
-            f"QStash rejected workflow cancellation (HTTP {response.status_code})."
+            f"QStash rejected message cancellation (HTTP {response.status_code})."
         )
+    try:
+        return int(response.json().get("cancelled", 0)) > 0
+    except (ValueError, TypeError, AttributeError):
+        return True
 
 
-if settings.qstash_workflow_enabled:
-    from upstash_workflow import AsyncWorkflowContext
-    from upstash_workflow.fastapi import Serve
-
-    async def _wait_for_run_control(
-        context: AsyncWorkflowContext[dict],
-        run_id: str,
-        owner_id: str,
-        checkpoint: str,
-    ) -> bool:
-        """Wait durably while paused; return false if the run was stopped."""
-        sleep_index = 0
-        while True:
-            run = await asyncio.to_thread(
-                repo.get_run,
-                run_id,
-                owner_id=owner_id,
-                include_all=True,
-            )
-            if not run or run.get("status") == "cancelled":
-                return False
-            if run.get("status") != "paused":
-                return True
-            # QStash sleep suspends this execution without occupying a Render
-            # worker. Each iteration gets a stable replay-safe step name.
-            await context.sleep(f"flowpilot-{checkpoint}-pause-{sleep_index}", 15)
-            sleep_index += 1
-
-
-    _workflow_serve = Serve(app)
-    _workflow_environment = {
-        "QSTASH_TOKEN": settings.qstash_token,
-        "QSTASH_CURRENT_SIGNING_KEY": settings.qstash_current_signing_key,
-        "QSTASH_NEXT_SIGNING_KEY": settings.qstash_next_signing_key,
-        "QSTASH_URL": settings.qstash_url,
-    }
-
-    async def _upstash_workflow_failure(
-        context: AsyncWorkflowContext[dict],
-        fail_status: int,
-        fail_response: str,
-        fail_headers: dict,
-    ) -> None:
-        # Do not log or persist upstream response bodies, which may expose provider details.
-        try:
-            data = _validate_upstash_workflow_payload(
-                _parse_upstash_workflow_initial_payload(context.request_payload)
-            )
-            await asyncio.to_thread(repo.ensure_pending_run, data["run_id"], data["workflow"], data["owner_id"])
-            await asyncio.to_thread(repo.save_result, {
-                "run_id": data["run_id"],
-                "workflow": data["workflow"],
-                "status": "failed",
-                "output": {
-                    "error": "Workflow execution failed before the completion callback could be persisted.",
-                    "recovery": "Check the workflow input or provider session, then submit a new run.",
-                },
-                "evidence": [],
-                "duration_ms": 0,
-                "created_at": datetime.now(UTC),
-                "usage": None,
-                "warnings": ["Upstash Workflow execution ended before the run result was persisted."],
-            })
-            logger.warning("upstash_workflow_exhausted_retries run_id=%s status=%s", data["run_id"], int(fail_status))
-        except Exception:
-            logger.exception("upstash_workflow_failure_callback_failed")
-
-    @_workflow_serve.post(
-        "/internal/qstash/workflow",
-        base_url=settings.upstash_workflow_url,
-        retries=0,
-        env=_workflow_environment,
-        initial_payload_parser=_parse_upstash_workflow_initial_payload,
-        failure_function=_upstash_workflow_failure,
+@app.post("/internal/qstash/execute", include_in_schema=False)
+async def execute_qstash_message(request: Request):
+    """Execute one QStash message and acknowledge its delivery exactly once."""
+    body = await request.body()
+    _verify_qstash_signature(
+        body,
+        request.headers.get("Upstash-Signature"),
+        settings.upstash_workflow_url.rstrip("/") + request.url.path,
     )
-    async def _execute_upstash_workflow(context: AsyncWorkflowContext[dict]) -> None:
-        data = _validate_upstash_workflow_payload(
-            _parse_upstash_workflow_initial_payload(context.request_payload)
+    try:
+        envelope = json.loads(body.decode("utf-8"))
+        data = _validate_qstash_payload(envelope)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid QStash workflow message.") from None
+
+    await asyncio.to_thread(
+        repo.ensure_pending_run,
+        data["run_id"],
+        data["workflow"],
+        data["owner_id"],
+    )
+    await asyncio.to_thread(repo.restore_qstash_dispatch, data["run_id"], envelope)
+    claim = await asyncio.to_thread(
+        repo.claim_qstash_run,
+        data["run_id"],
+        data["dispatch_generation"],
+    )
+    if claim != "claimed":
+        # Duplicate, superseded, paused, and canceled deliveries are acknowledged
+        # without executing the model a second time.
+        return {"run_id": data["run_id"], "status": claim}
+
+    # Close the claim-to-execution race: Pause or Stop may win immediately
+    # after the atomic claim and before the model call is started.
+    current = await asyncio.to_thread(
+        repo.get_run,
+        data["run_id"],
+        owner_id=data["owner_id"],
+        include_all=True,
+    )
+    current_status = (current or {}).get("status")
+    if current_status != "running":
+        return {"run_id": data["run_id"], "status": current_status or "missing"}
+
+    try:
+        result = await asyncio.to_thread(
+            execute_run,
+            data["run_id"],
+            data["workflow"],
+            data["payload"],
+            encrypted_gateway_token=data["encrypted_gateway_token"],
+            gateway_token_ttl_seconds=data["gateway_token_ttl_seconds"],
+            persist_success=False,
+            persist_failure=False,
         )
-        await asyncio.to_thread(repo.ensure_pending_run, data["run_id"], data["workflow"], data["owner_id"])
+    except Exception:
+        # QStash's native failure callback records a terminal state after this
+        # delivery fails. Never log the incoming payload or encrypted credential.
+        logger.exception("qstash_message_execution_failed run_id=%s", data["run_id"])
+        raise HTTPException(
+            status_code=500,
+            detail="Workflow execution failed before a result could be persisted.",
+        ) from None
 
-        if not await _wait_for_run_control(
-            context, data["run_id"], data["owner_id"], "before-execute"
-        ):
-            return
+    latest = await asyncio.to_thread(
+        repo.get_run,
+        data["run_id"],
+        owner_id=data["owner_id"],
+        include_all=True,
+    )
+    latest_status = (latest or {}).get("status")
+    if latest_status == "paused":
+        await asyncio.to_thread(repo.save_paused_result, data["run_id"], result)
+        return {"run_id": data["run_id"], "status": "paused"}
+    if latest_status == "cancelled":
+        return {"run_id": data["run_id"], "status": "cancelled"}
 
-        async def _execute_step() -> dict:
-            result = await asyncio.to_thread(
-                execute_run,
-                data["run_id"],
-                data["workflow"],
-                data["payload"],
-                encrypted_gateway_token=data["encrypted_gateway_token"],
-                gateway_token_ttl_seconds=data["gateway_token_ttl_seconds"],
-                persist_success=False,
-                persist_failure=False,
-            )
-            return json.loads(_json_dumps(result))
+    await asyncio.to_thread(repo.save_result, result)
+    return {"run_id": data["run_id"], "status": result["status"]}
 
-        result = await context.run("execute-flowpilot-run", _execute_step)
 
-        # A pause requested during a model call takes effect at this boundary.
-        # The completed QStash step is replay-cached, so resume will not call
-        # the provider a second time.
-        if not await _wait_for_run_control(
-            context, data["run_id"], data["owner_id"], "after-execute"
-        ):
-            return
+@app.post("/internal/qstash/failure", include_in_schema=False)
+async def record_qstash_failure(request: Request):
+    """Record QStash delivery timeout/failure without the Workflow SDK callback contract."""
+    body = await request.body()
+    _verify_qstash_signature(
+        body,
+        request.headers.get("Upstash-Signature"),
+        settings.upstash_workflow_url.rstrip("/") + request.url.path,
+    )
+    try:
+        callback = json.loads(body.decode("utf-8"))
+        source_body = callback.get("sourceBody") if isinstance(callback, dict) else None
+        if not isinstance(source_body, str) or len(source_body) > 1_400_000:
+            raise ValueError("QStash failure callback has no valid source body.")
+        decoded = base64.b64decode(source_body, validate=True)
+        envelope = json.loads(decoded.decode("utf-8"))
+        data = _validate_qstash_payload(envelope)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid QStash failure callback.") from None
 
-        # Persist outside context.run so replays can restore local UI state.
-        await asyncio.to_thread(repo.save_result, result)
+    await asyncio.to_thread(
+        repo.ensure_pending_run,
+        data["run_id"],
+        data["workflow"],
+        data["owner_id"],
+    )
+    await asyncio.to_thread(repo.restore_qstash_dispatch, data["run_id"], envelope)
+    failure = {
+        "run_id": data["run_id"],
+        "workflow": data["workflow"],
+        "status": "failed",
+        "output": {
+            "error": "QStash could not complete delivery to the FlowPilot API.",
+            "failure_code": "qstash_delivery_failed",
+            "recovery": "Check the API service and model provider, then submit a new run.",
+        },
+        "evidence": [],
+        "duration_ms": 0,
+        "created_at": datetime.now(UTC),
+        "usage": None,
+        "warnings": ["QStash exhausted the configured HTTP delivery attempt."],
+    }
+    recorded = await asyncio.to_thread(repo.fail_run_if_active, failure)
+    raw_status = callback.get("status")
+    callback_status = (
+        raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+        else int(raw_status) if isinstance(raw_status, str) and raw_status.isdigit()
+        else 0
+    )
+    logger.warning(
+        "qstash_delivery_failure_recorded run_id=%s status=%s recorded=%s",
+        data["run_id"],
+        callback_status,
+        recorded,
+    )
+    return {"run_id": data["run_id"], "status": "failure_recorded" if recorded else "unchanged"}
 
 
 @app.post(
@@ -883,29 +932,28 @@ async def run_workflow(
             "gateway_token_ttl_seconds": credential_ttl,
         }
         try:
-            await _trigger_upstash_workflow(envelope, run_id)
+            generation = repo.prepare_qstash_dispatch(run_id, envelope)
+            message_id = await _publish_qstash_message(envelope, run_id, generation)
+            repo.set_qstash_message_id(run_id, generation, message_id)
         except Exception:
-            logger.exception("upstash_workflow_dispatch_failed run_id=%s", run_id)
-            try:
-                repo.save_result({
-                    "run_id": run_id,
-                    "workflow": request.workflow.value,
-                    "status": "failed",
-                    "output": {
-                        "error": "Workflow could not be queued.",
-                        "recovery": "QStash did not accept the request. Retry after checking the workflow connection.",
-                    },
-                    "evidence": [],
-                    "duration_ms": 0,
-                    "created_at": datetime.now(UTC),
-                    "usage": None,
-                    "warnings": ["Background dispatch failed before execution."],
-                })
-            except Exception:
-                logger.exception("upstash_workflow_dispatch_failure_persist_failed run_id=%s", run_id)
+            logger.exception("qstash_message_dispatch_failed run_id=%s", run_id)
+            repo.save_result({
+                "run_id": run_id,
+                "workflow": request.workflow.value,
+                "status": "failed",
+                "output": {
+                    "error": "Workflow could not be queued.",
+                    "recovery": "QStash did not accept the message. Retry after checking the queue connection.",
+                },
+                "evidence": [],
+                "duration_ms": 0,
+                "created_at": datetime.now(UTC),
+                "usage": None,
+                "warnings": ["Message dispatch failed before execution."],
+            })
             raise HTTPException(
                 status_code=503,
-                detail="Workflow could not be queued. Retry after checking the background execution connection.",
+                detail="Workflow could not be queued. Check the QStash connection and retry.",
             ) from None
     elif settings.inline_execution:
         # Do not hold the HTTP request open for a potentially slow model call.
@@ -1120,38 +1168,91 @@ def _owned_run_for_control(
 
 
 @app.post("/api/v1/runs/{run_id}/pause", tags=["workflows"])
-def pause_run(
+async def pause_run(
     run_id: str,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
     current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    dispatch = repo.get_qstash_dispatch(run_id) or {}
     if not repo.pause_run(run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be paused from status '{current['status']}'.")
-    logger.info("workflow_paused run_id=%s", run_id)
-    return {"run_id": run_id, "status": "paused"}
+    cancelled = False
+    if current["status"] == "queued" and dispatch.get("message_id"):
+        try:
+            cancelled = await _cancel_qstash_message(dispatch["message_id"])
+        except RuntimeError:
+            logger.warning("qstash_pause_cancel_unconfirmed run_id=%s", run_id)
+    logger.info("workflow_paused run_id=%s queued_message_cancelled=%s", run_id, cancelled)
+    return {
+        "run_id": run_id,
+        "status": "paused",
+        "queued_message_cancelled": cancelled,
+        "note": "An in-flight model request may finish; its result is held until Resume.",
+    }
 
 
 @app.post("/api/v1/runs/{run_id}/resume", tags=["workflows"])
-def resume_run(
+async def resume_run(
     run_id: str,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
     current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    dispatch = repo.get_qstash_dispatch(run_id) or {}
+    resume_status = current.get("resume_status") or "queued"
     if not repo.resume_run(run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be resumed from status '{current['status']}'.")
+
+    pending_result = repo.take_pending_result(run_id)
+    if pending_result is not None:
+        repo.save_result(pending_result)
+        resumed = repo.get_run(
+            run_id,
+            owner_id=current.get("owner_id") or principal.owner_id,
+            include_all=principal.role == "admin",
+        )
+        logger.info("workflow_resumed_from_checkpoint run_id=%s", run_id)
+        return {"run_id": run_id, "status": (resumed or {}).get("status", "completed"), "requeued": False}
+
+    if resume_status == "queued":
+        envelope = dispatch.get("payload")
+        if not isinstance(envelope, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="The queued message payload is unavailable; submit a new workflow run.",
+            )
+        try:
+            generation = repo.prepare_qstash_dispatch(run_id, envelope)
+            message_id = await _publish_qstash_message(envelope, run_id, generation)
+            repo.set_qstash_message_id(run_id, generation, message_id)
+        except Exception:
+            logger.exception("qstash_resume_dispatch_failed run_id=%s", run_id)
+            failure = {
+                "run_id": run_id,
+                "workflow": current["workflow"],
+                "status": "failed",
+                "output": {"error": "Workflow could not be resumed.", "failure_code": "resume_dispatch_failed"},
+                "evidence": [],
+                "duration_ms": 0,
+                "created_at": datetime.now(UTC),
+                "usage": None,
+                "warnings": ["Resume could not enqueue a new QStash message."],
+            }
+            repo.fail_run_if_active(failure)
+            raise HTTPException(status_code=503, detail="Workflow could not be resumed through QStash.") from None
+
     resumed = repo.get_run(
         run_id,
         owner_id=current.get("owner_id") or principal.owner_id,
         include_all=principal.role == "admin",
     )
-    logger.info("workflow_resumed run_id=%s", run_id)
-    return {"run_id": run_id, "status": (resumed or {}).get("status", "queued")}
+    logger.info("workflow_resumed run_id=%s resume_status=%s", run_id, resume_status)
+    return {"run_id": run_id, "status": (resumed or {}).get("status", "queued"), "requeued": resume_status == "queued"}
 
 
 @app.post("/api/v1/runs/{run_id}/stop", tags=["workflows"])
@@ -1161,22 +1262,23 @@ async def stop_run(
     principal: Principal = Depends(require_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled:
-        raise HTTPException(status_code=409, detail="Per-run controls require QStash Workflow execution.")
+        raise HTTPException(status_code=409, detail="Per-run controls require the QStash message queue.")
     current = _owned_run_for_control(run_id, llm_gateway_token, principal)
+    dispatch = repo.get_qstash_dispatch(run_id) or {}
     if not repo.stop_run(run_id):
         raise HTTPException(status_code=409, detail=f"Run cannot be stopped from status '{current['status']}'.")
-    try:
-        await _cancel_upstash_workflow(run_id)
-    except RuntimeError:
-        # The local cancellation is already authoritative and protects against
-        # late results even when QStash's remote cancellation races or fails.
-        logger.warning("workflow_remote_cancel_unconfirmed run_id=%s", run_id)
-        raise HTTPException(
-            status_code=502,
-            detail="The run was marked canceled, but QStash could not confirm remote cancellation.",
-        ) from None
-    logger.info("workflow_stopped run_id=%s", run_id)
-    return {"run_id": run_id, "status": "cancelled"}
+    cancellation_confirmed = False
+    if dispatch.get("message_id"):
+        try:
+            cancellation_confirmed = await _cancel_qstash_message(dispatch["message_id"])
+        except RuntimeError:
+            logger.warning("qstash_stop_cancel_unconfirmed run_id=%s", run_id)
+    logger.info("workflow_stopped run_id=%s cancellation_confirmed=%s", run_id, cancellation_confirmed)
+    return {
+        "run_id": run_id,
+        "status": "cancelled",
+        "remote_cancellation_confirmed": cancellation_confirmed,
+    }
 
 
 @app.get(

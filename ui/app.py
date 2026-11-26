@@ -417,7 +417,9 @@ workflow = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.markdown('<div class="premium-kicker">SYSTEM HEALTH</div>', unsafe_allow_html=True)
 execution_label = (
-    "API background execution"
+    "QStash HTTP message queue"
+    if health.get("execution_mode") == "qstash_http_queue"
+    else "API background execution"
     if health.get("execution_mode") == "inline_background"
     else "Redis + worker"
 )
@@ -838,7 +840,7 @@ try:
 
             can_control_runs = bool(API_OPERATOR_KEY or API_ADMIN_KEY or LEGACY_API_KEY)
             active_status = run.get("status") in {"queued", "running", "paused"}
-            if active_status and can_control_runs and health.get("execution_mode") == "upstash_workflow":
+            if active_status and can_control_runs and health.get("execution_mode") == "qstash_http_queue":
                 action_columns = st.columns(3)
                 if run.get("status") == "paused":
                     with action_columns[0]:
@@ -875,8 +877,8 @@ try:
                             st.rerun()
                         except (requests.RequestException, RuntimeError, ValueError) as exc:
                             st.error(str(exc))
-            elif active_status and health.get("execution_mode") != "upstash_workflow":
-                st.caption("Run controls are available when QStash Workflow execution is enabled.")
+            elif active_status and health.get("execution_mode") != "qstash_http_queue":
+                st.caption("Run controls are available when QStash message queue is enabled.")
             elif active_status and not can_control_runs:
                 st.caption("An operator API credential is required to control this run.")
 
