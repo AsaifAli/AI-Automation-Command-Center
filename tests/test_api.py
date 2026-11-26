@@ -499,7 +499,19 @@ def test_upstash_trigger_disables_duplicate_workflow_level_retries(monkeypatch):
 
     asyncio.run(api_module._trigger_upstash_workflow({"run_id": "id"}, "id"))
 
+    workflow_url = "https://flowpilot.example.com/internal/qstash/workflow"
+    assert captured["url"] == (
+        "https://qstash-eu-central-1.upstash.io/v2/trigger/" + workflow_url
+    )
+    assert captured["headers"]["Content-Type"] == "application/json"
+    assert captured["headers"]["Upstash-Workflow-Init"] == "true"
+    assert captured["headers"]["Upstash-Workflow-RunId"] == "wfr_flowpilot-id"
+    assert captured["headers"]["Upstash-Workflow-Url"] == workflow_url
+    assert captured["headers"]["Upstash-Feature-Set"] == (
+        "LazyFetch,InitialBody,WF_DetectTrigger"
+    )
     assert captured["headers"]["Upstash-Workflow-Sdk-Version"] == "1"
+    assert captured["headers"]["Upstash-Forward-Upstash-Workflow-Sdk-Version"] == "1"
     assert captured["headers"]["Upstash-Retries"] == "0"
     assert captured["headers"]["Upstash-Flow-Control-Key"] == "flowpilot-global"
 
