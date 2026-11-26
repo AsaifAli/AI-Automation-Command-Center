@@ -33,9 +33,18 @@ def _approval_request(workflow: str, output: dict[str, Any], created_at: datetim
             "title": "Review and authorize content publishing",
             "summary": f"{len(posts)} channel-specific content draft(s) are ready for approval.",
             "items": [
-                {"topic": post.get("topic"), "channel": post.get("channel"), "draft": post.get("draft")}
+                {
+                    "topic": post.get("topic"),
+                    "channel": post.get("channel"),
+                    "draft": post.get("draft"),
+                    "approval_status": "pending",
+                }
                 for post in posts
             ],
+            "approved_count": 0,
+            "rejected_count": 0,
+            "pending_count": len(posts),
+            "total_count": len(posts),
             "created_at": created_at.isoformat(),
         }
     if workflow == "outreach" and output.get("candidates"):

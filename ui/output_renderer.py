@@ -91,6 +91,11 @@ def _render_content(data: Mapping[str, Any]) -> None:
         draft = str(post.get("draft", "")).strip()
         topic = str(post.get("topic", "")).strip()
         limit = {"x": 280, "linkedin": 1300, "telegram": 800}.get(channel)
+        approval_status = str(post.get("approval_status", "pending")).lower()
+        status_label = {
+            "approved": "APPROVED",
+            "rejected": "REJECTED",
+        }.get(approval_status, "NEEDS REVIEW")
         with st.container(border=True):
             top_left, top_right = st.columns([4, 1])
             with top_left:
@@ -98,12 +103,21 @@ def _render_content(data: Mapping[str, Any]) -> None:
                 if topic:
                     st.caption(topic)
             with top_right:
-                st.markdown("<div style='text-align:right;font-weight:700;color:#0f9d75'>NEEDS REVIEW</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align:right;font-weight:700'>{status_label}</div>", unsafe_allow_html=True)
             st.markdown(draft or "No draft text was returned.", unsafe_allow_html=False)
             meta_cols = st.columns([1, 1, 2])
             meta_cols[0].caption(f"{len(draft)} characters" + (f" / {limit}" if limit else ""))
-            meta_cols[1].caption("Human approval required")
-            meta_cols[2].caption("Publishing is disabled until an authorized reviewer approves.")
+            meta_cols[1].caption(
+                f"Reviewed by {post.get('approval_reviewer')}" if post.get("approval_reviewer")
+                else "Human approval required"
+            )
+            meta_cols[2].caption(
+                "Editorial approval recorded; publishing remains disabled."
+                if approval_status == "approved"
+                else "This draft was rejected and will not be published."
+                if approval_status == "rejected"
+                else "Publishing is disabled until an authorized reviewer approves."
+            )
             with st.expander("Copy-ready draft", expanded=False):
                 st.code(draft, language=None)
     _render_note("Editorial direction", data.get("strategy_note"), info=True)

@@ -119,8 +119,25 @@ def test_redis_approvals_and_metrics_survive_repository_recreation(redis_reposit
     repo.mark_running(run_id)
     repo.save_result({
         **_completed(run_id),
+        "workflow": "content",
         "status": "awaiting_approval",
-        "output": {"approval": {"status": "pending", "items": []}},
+        "output": {
+            "posts": [
+                {"topic": "AI operations", "channel": "linkedin", "draft": "LinkedIn draft"},
+                {"topic": "AI operations", "channel": "x", "draft": "X draft"},
+            ],
+            "approval": {
+                "status": "pending",
+                "items": [
+                    {"topic": "AI operations", "channel": "linkedin", "draft": "LinkedIn draft", "approval_status": "pending"},
+                    {"topic": "AI operations", "channel": "x", "draft": "X draft", "approval_status": "pending"},
+                ],
+                "approved_count": 0,
+                "rejected_count": 0,
+                "pending_count": 2,
+                "total_count": 2,
+            },
+        },
     })
 
     second_repo = Repository(repo.settings)
@@ -128,11 +145,23 @@ def test_redis_approvals_and_metrics_survive_repository_recreation(redis_reposit
     assert len(approvals) == 1
     assert approvals[0]["run_id"] == run_id
 
-    decision = second_repo.create_approval(run_id, "approved", "Reviewer", "Looks good")
+    decision = second_repo.create_approval(run_id, "approved", "Reviewer A", "Looks good", item_index=0)
     assert decision["decision"] == "approved"
-    metrics = second_repo.metrics()
+    partial = Repository(repo.settings).get_run(run_id, owner_id="owner-a")
+    assert partial["status"] == "awaiting_approval"
+    assert partial["output"]["approval"]["pending_count"] == 1
+
+    decision = Repository(repo.settings).create_approval(
+        run_id, "approved", "Reviewer B", "Looks good", item_index=1
+    )
+    assert decision["item_index"] == 1
+    completed = Repository(repo.settings).get_run(run_id, owner_id="owner-a")
+    assert completed["status"] == "completed"
+    assert completed["output"]["approval"]["status"] == "approved"
+    metrics = Repository(repo.settings).metrics()
     assert metrics["workflow_runs_total"] == 1
-    assert metrics["workflow_approvals_approved"] == 1
+    assert metrics["workflow_runs_completed"] == 1
+    assert metrics["workflow_approvals_approved"] == 2
 
 
 def test_redis_history_clear_keeps_active_runs_and_deletes_terminal_runs(redis_repository):

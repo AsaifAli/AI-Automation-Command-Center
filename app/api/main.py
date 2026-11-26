@@ -1530,6 +1530,14 @@ def decide_approval(
             detail="This workflow has no external-impact action requiring approval",
         )
 
+    if result["workflow"] == "content" and request.item_index is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Content drafts must be approved individually. Provide item_index for the draft being reviewed.",
+        )
+    if result["workflow"] != "content" and request.item_index is not None:
+        raise HTTPException(status_code=400, detail="item_index is only supported for content drafts")
+
     # The authenticated principal determines reviewer identity.
     # The legacy request.reviewer field is deliberately ignored.
     try:
@@ -1538,6 +1546,7 @@ def decide_approval(
             request.decision,
             principal.subject,
             request.note,
+            item_index=request.item_index,
         )
     except KeyError:
         raise HTTPException(status_code=404, detail="Run not found") from None
