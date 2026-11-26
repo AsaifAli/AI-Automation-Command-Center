@@ -17,7 +17,6 @@ def test_qstash_dispatch_metadata_retains_envelope_and_message_id():
         "workflow": "competitor",
         "payload": {"competitors": ["AI"]},
         "owner_id": "qstash-queue-owner",
-        "dispatch_generation": 1,
     }
 
     generation = repo.prepare_qstash_dispatch(run_id, envelope)
@@ -25,6 +24,7 @@ def test_qstash_dispatch_metadata_retains_envelope_and_message_id():
 
     metadata = repo.get_qstash_dispatch(run_id)
     assert generation == 1
+    assert envelope["dispatch_generation"] == 1
     assert metadata["payload"] == envelope
     assert metadata["message_id"] == "msg_flowpilot_1"
     assert metadata["generation"] == 1
