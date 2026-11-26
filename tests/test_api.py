@@ -437,7 +437,7 @@ def test_qstash_delivery_is_idempotent_and_returns_terminal_result(monkeypatch):
     fake_repo = FakeRepo()
     monkeypatch.setattr(api_module, "repo", fake_repo)
     monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
-    monkeypatch.setattr(api_module, "_verify_qstash_signature", lambda body, signature: None)
+    monkeypatch.setattr(api_module, "_verify_qstash_signature", lambda body, signature, expected_url: None)
     calls = []
 
     def fake_execute(*args, **kwargs):
