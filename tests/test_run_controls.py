@@ -21,6 +21,7 @@ def test_pause_and_resume_restore_the_previous_run_state():
     assert repo.resume_run(run_id) is True
     resumed = repo.get_run(run_id, owner_id="owner-controls-test")
     assert resumed["status"] == "queued"
+    assert repo.stop_run(run_id) is True
 
 
 def test_pause_running_run_resumes_as_running():
@@ -31,6 +32,7 @@ def test_pause_running_run_resumes_as_running():
     assert repo.resume_run(run_id) is True
 
     assert repo.get_run(run_id, owner_id="owner-controls-test")["status"] == "running"
+    assert repo.stop_run(run_id) is True
 
 
 def test_stopped_run_cannot_be_resurrected_by_a_late_worker_result():
