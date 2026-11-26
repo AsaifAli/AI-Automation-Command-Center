@@ -278,10 +278,9 @@ class Repository:
                 if not run or run.get("status") != "queued":
                     raise ValueError("Only queued runs can be dispatched.")
                 generation = int(run.get("dispatch_generation", 0)) + 1
-                prepared = copy.deepcopy(payload)
-                prepared["dispatch_generation"] = generation
+                payload["dispatch_generation"] = generation
                 run["dispatch_generation"] = generation
-                run["dispatch_payload"] = prepared
+                run["dispatch_payload"] = copy.deepcopy(payload)
                 run["qstash_message_id"] = None
                 return generation
 
@@ -293,13 +292,12 @@ class Repository:
             if not row or row["status"] != "queued":
                 raise ValueError("Only queued runs can be dispatched.")
             generation = int(row["dispatch_generation"] or 0) + 1
-            prepared = copy.deepcopy(payload)
-            prepared["dispatch_generation"] = generation
+            payload["dispatch_generation"] = generation
             conn.execute(
                 """UPDATE workflow_runs
                    SET dispatch_payload_json=%s, dispatch_generation=%s, qstash_message_id=NULL
                    WHERE run_id=%s""",
-                (_json_dumps(prepared), generation, run_id),
+                (_json_dumps(payload), generation, run_id),
             )
         return generation
 
