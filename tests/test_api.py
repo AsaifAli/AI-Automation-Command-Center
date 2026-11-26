@@ -122,6 +122,9 @@ class FakeRepo:
     def fail_run_if_active(self, result):
         if not self.run or self.run["run_id"] != result["run_id"]:
             return False
+        if self.run["status"] == "paused":
+            self.dispatch["pending_result"] = dict(result)
+            return True
         if self.run["status"] not in {"queued", "running"}:
             return False
         self.run.update({
@@ -476,7 +479,7 @@ def test_qstash_failure_callback_records_terminal_failure(monkeypatch):
     fake_repo.prepare_qstash_dispatch("11111111-1111-1111-1111-111111111111", _qstash_envelope())
     monkeypatch.setattr(api_module, "repo", fake_repo)
     monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", True)
-    monkeypatch.setattr(api_module, "_verify_qstash_signature", lambda body, signature: None)
+    monkeypatch.setattr(api_module, "_verify_qstash_signature", lambda body, signature, expected_url: None)
     callback = {
         "status": 504,
         "sourceBody": base64.b64encode(json.dumps(_qstash_envelope()).encode()).decode(),
