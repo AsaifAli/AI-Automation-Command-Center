@@ -15,6 +15,8 @@ from sidebar_toggle import render_sidebar_toggle
 from streamlit.errors import StreamlitAPIException
 from ui_theme import apply_theme
 
+from ui.execution_modes import execution_mode_label, is_queue_backed_execution
+
 API = os.getenv("API_BASE_URL", "").strip()
 if not API:
     api_host = os.getenv("API_HOST", "localhost").strip()
@@ -416,13 +418,7 @@ workflow = st.sidebar.radio(
 )
 st.sidebar.divider()
 st.sidebar.markdown('<div class="premium-kicker">SYSTEM HEALTH</div>', unsafe_allow_html=True)
-execution_label = (
-    "QStash HTTP message queue"
-    if health.get("execution_mode") == "qstash_http_queue"
-    else "API background execution"
-    if health.get("execution_mode") == "inline_background"
-    else "Redis + worker"
-)
+execution_label = execution_mode_label(health.get("execution_mode"))
 st.sidebar.markdown(
     f'<div class="sidebar-health"><div><span class="status-dot"></span>API Online</div><small>Version · {escape(str(health["version"]))}</small><small>Execution · {escape(execution_label)}</small></div>',
     unsafe_allow_html=True,
@@ -840,10 +836,9 @@ try:
 
             can_control_runs = bool(API_OPERATOR_KEY or API_ADMIN_KEY or LEGACY_API_KEY)
             active_status = run.get("status") in {"queued", "running", "paused"}
-            queue_backed_execution = health.get("execution_mode") in {
-                "qstash_http_queue",
-                "redis_worker",
-            }
+            queue_backed_execution = is_queue_backed_execution(
+                health.get("execution_mode")
+            )
             if active_status and can_control_runs and queue_backed_execution:
                 action_columns = st.columns(3)
                 if run.get("status") == "paused":
@@ -887,7 +882,7 @@ try:
             elif active_status and not can_control_runs:
                 st.caption("An operator API credential is required to control this run.")
             elif active_status and not queue_backed_execution:
-                st.caption("Run controls are available with QStash or the dedicated Redis worker.")
+                st.caption("Run controls require a queue-backed worker.")
 
             st.markdown('<div class="detail-label">CLIENT-READY RESULT</div>', unsafe_allow_html=True)
             render_workflow_output(run.get("workflow", ""), run.get("output", {}))
