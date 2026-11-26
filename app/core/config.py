@@ -22,15 +22,17 @@ class Settings(BaseSettings):
     upstash_redis_rest_url: str = ""
     upstash_redis_rest_token: str = Field(default="", repr=False)
 
-    # Optional durable background orchestration via the existing QStash account.
+    # Optional background execution through plain QStash HTTP messages.
+    # The legacy environment variable name is retained for deployed-service compatibility.
     qstash_workflow_enabled: bool = False
     qstash_token: str = Field(default="", repr=False)
     qstash_current_signing_key: str = Field(default="", repr=False)
     qstash_next_signing_key: str = Field(default="", repr=False)
     qstash_url: str = "https://qstash-eu-central-1.upstash.io"
+    # Legacy env name; this is the public FlowPilot API origin, not an SDK Workflow endpoint.
     upstash_workflow_url: str = ""
     qstash_workflow_retries: int = Field(default=2, ge=0, le=5)
-    # Cap concurrent Workflow callbacks to avoid saturating the free Render API.
+    # Cap QStash message deliveries to avoid saturating the free Render API.
     qstash_workflow_parallelism: int = Field(default=2, ge=1, le=2)
     qstash_workflow_max_payload_bytes: int = Field(default=900_000, ge=10_000, le=950_000)
 
@@ -114,7 +116,7 @@ class Settings(BaseSettings):
             )):
                 raise ValueError(
                     "QSTASH_WORKFLOW_ENABLED requires QSTASH_TOKEN, both QSTASH signing keys, "
-                    "and UPSTASH_WORKFLOW_URL."
+                    "and UPSTASH_WORKFLOW_URL (the public FlowPilot API origin)."
                 )
             qstash_url = urlsplit(self.qstash_url)
             qstash_host = (qstash_url.hostname or "").lower()
@@ -148,7 +150,7 @@ class Settings(BaseSettings):
                 or workflow_url.password is not None
                 or workflow_url.port not in allowed_workflow_ports
             ):
-                raise ValueError("UPSTASH_WORKFLOW_URL must be a public HTTPS service base URL.")
+                raise ValueError("UPSTASH_WORKFLOW_URL must be the public HTTPS FlowPilot API base URL.")
 
         if not 60 <= self.gateway_job_credential_ttl_seconds <= 1800:
             raise ValueError(
