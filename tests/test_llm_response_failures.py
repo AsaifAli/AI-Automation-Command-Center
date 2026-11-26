@@ -88,3 +88,39 @@ def test_gateway_503_remains_retryable(monkeypatch):
     assert result["text"] == "available"
     assert len(calls) == 2
     assert sleeps == [1]
+
+
+
+def test_gateway_empty_completion_is_not_retried_and_has_specific_failure(monkeypatch):
+    from app.core.llm_gateway_context import reset_llm_gateway_token
+
+    provider = make_provider(max_retries=2)
+    calls = []
+
+    def empty_completion(*args, **kwargs):
+        calls.append(True)
+        request = httpx.Request("POST", "https://gateway.example/v1/chat/completions")
+        return httpx.Response(
+            502,
+            request=request,
+            json={
+                "error": {
+                    "type": "empty_completion",
+                    "code": "empty_completion",
+                    "message": "The selected model exhausted its output-token budget.",
+                }
+            },
+        )
+
+    monkeypatch.setattr("app.integrations.llm.httpx.post", empty_completion)
+    context = _with_gateway_session()
+    try:
+        with pytest.raises(LLMProviderError) as exc_info:
+            provider.generate("system", "user")
+    finally:
+        reset_llm_gateway_token(context)
+
+    assert exc_info.value.failure_code == "provider_empty_completion"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.status_code == 502
+    assert len(calls) == 1
