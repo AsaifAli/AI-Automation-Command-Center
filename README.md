@@ -50,27 +50,28 @@ This is intentionally a lightweight demo topology, not the durable PostgreSQL + 
 
 Required or externally supplied Render configuration includes the LLM provider credential, Gateway URL, allowed CORS origins, and the Gateway handoff root URL. Generated API role keys are provisioned by the manifest. Never commit real values.
 
-### Optional background execution with Upstash Workflow
+### Background execution with plain QStash messages
 
-The current free Render deployment can dispatch runs to the existing Upstash QStash account and receive signed callbacks on the same API service. This avoids a separate always-on worker process, which is not dependable on a free Render web service that can spin down. The existing in-process mode and RQ worker mode remain supported.
+The free Render deployment uses the existing QStash account as a single-job HTTP message queue. It does **not** use the Upstash Workflow SDK or its step-replay protocol. QStash publishes one message to the existing FlowPilot API, the API verifies the signed delivery, executes the job, and persists the run result. QStash's native failure callback records delivery failures and timeouts.
 
-To enable Workflow mode, configure these variables on **ai-automation-api** in Render:
+Configure these variables on **ai-automation-api** in Render (the existing names are retained for compatibility):
 
-- `QSTASH_WORKFLOW_ENABLED=true`
-- `QSTASH_TOKEN` — token for the selected QStash region
-- `QSTASH_CURRENT_SIGNING_KEY` and `QSTASH_NEXT_SIGNING_KEY` — both signing keys for that same region
-- `QSTASH_URL` — e.g. `https://qstash-eu-central-1.upstash.io`
-- `UPSTASH_WORKFLOW_URL` — public API origin, e.g. `https://ai-automation-api.onrender.com`
-- `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` — Fernet key used to encrypt short-lived BYOK session tokens before dispatch
+- `QSTASH_WORKFLOW_ENABLED=true` — legacy setting name; it now selects the plain QStash message queue.
+- `QSTASH_TOKEN` — token for the selected QStash region.
+- `QSTASH_CURRENT_SIGNING_KEY` and `QSTASH_NEXT_SIGNING_KEY` — signing keys for that same region.
+- `QSTASH_URL` — e.g. `https://qstash-eu-central-1.upstash.io`.
+- `UPSTASH_WORKFLOW_URL` — legacy setting name; supply the public FlowPilot API origin, e.g. `https://ai-automation-api.onrender.com`. It is used to construct the signed execute and failure-callback URLs.
+- `FLOWPILOT_GATEWAY_CREDENTIAL_KEY` — Fernet key used to encrypt short-lived BYOK session tokens before dispatch.
 
-The application rejects Workflow mode unless the QStash credentials, both signing keys, and HTTPS endpoints are configured. QStash verifies every callback signature before the route runs. The Workflow payload contains only encrypted BYOK ciphertext (never the raw session bearer), an opaque run ID, and owner-scoped input. Workflow-level retries are disabled for the single inference step to avoid repeating a potentially billable model request; bounded retries remain inside the provider adapter. Terminal infrastructure failures are recorded through the signed failure callback.
+The raw BYOK bearer is never included in the QStash message. The envelope contains only encrypted credential ciphertext, a short TTL, owner scope, run ID and workflow input. Each run has a generation number and a recorded QStash message ID; duplicate and superseded deliveries are acknowledged without invoking the model again. Both execute and failure endpoints verify the QStash signature against the exact callback URL and request body.
 
-**Run controls:** The Run History view exposes Pause, Resume, and Stop for active Workflow runs. Pause takes effect at the next safe workflow boundary; an already-running model request is allowed to finish. Resume continues from QStash's replay-cached step result, so a completed inference is not repeated. Stop marks the run canceled and asks QStash to cancel that individual run; late worker results cannot overwrite the canceled state. These controls do not pause the shared flowpilot-global queue or other users' runs.
+**Run controls:** Run History exposes Pause, Resume and Stop. Pausing a queued run attempts to cancel its pending QStash message. If execution is already in progress, the model call may finish but its result is held until Resume. Resume either commits that held result without another model call or republishes queued work as a new generation. Stop marks the run canceled and attempts to cancel its pending message; a model request already in flight is not forcibly interrupted, but its late result is discarded and cannot revive the run.
 
-**Persistence boundary:** Upstash Workflow persists its execution/step state, but the current free portfolio manifest still uses the in-memory FlowPilot run repository unless `DATABASE_URL` is configured. A Render restart can therefore clear the UI's run history after a completed run. The callback can rehydrate a run record while the Workflow is being delivered/replayed, but this does not replace a durable database. The paid RQ + PostgreSQL topology remains a future option only if you choose to fund always-on worker infrastructure.
+**Execution limit:** The QStash free tier permits HTTP responses up to 15 minutes. FlowPilot uses a 14-minute message timeout to leave room for the native failure callback. Longer jobs are marked failed; they are not left indefinitely active. The free QStash quota and message/flow-control limits still apply.
 
-Keep Workflow inputs below the configured 900 KB dispatch cap. A shared QStash flow-control key limits FlowPilot to two concurrent callbacks, protecting the small free Render API instance during traffic spikes. Retries and Workflow steps consume the QStash/Workflow free-tier quota; this is a portfolio/demo execution path, not an SLA-backed production queue.
+**Persistence boundary:** The current free Render deployment still uses the in-memory FlowPilot run repository unless `DATABASE_URL` is configured. QStash can redeliver a message and the callback can rehydrate that individual run record, but a Render restart can still erase completed run history and other in-memory state. A fully durable queue and history require persistent PostgreSQL/Redis plus the dedicated RQ worker topology; that is a separate paid deployment and has not been provisioned.
 
+The existing `flowpilot-global` flow-control key caps concurrent deliveries to protect the small free Render API instance. Use this as a portfolio/demo job queue, not an SLA-backed production queue.
 
 ## Local development
 
