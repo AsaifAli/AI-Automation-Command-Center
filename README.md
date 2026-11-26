@@ -122,6 +122,6 @@ The website-configured hosted endpoints were checked on November 25, 2026:
 - API: `https://ai-automation-api.onrender.com/health` returned `status: ok`.
 - API: `https://ai-automation-api.onrender.com/ready` returned `status: ready`.
 
-The live API reported `execution_mode=inline_background` and `state_store=ephemeral-memory`. This is the lightweight portfolio/demo topology declared by the root `render.yaml`; it is not the durable PostgreSQL + Redis worker topology described in `render.production.yaml`. Run records from this hosted demo should therefore be treated as ephemeral. The durable topology requires its separately provisioned resources and configuration.
+The hosted deployment uses the lightweight portfolio/demo topology declared by the root `render.yaml`. The API reports `state_store=ephemeral-memory` unless `DATABASE_URL` is configured; run history is therefore not restart-durable. The optional QStash HTTP message queue does not create a persistent database or a separate worker. The durable PostgreSQL + Redis worker topology in `render.production.yaml` remains a distinct deployment choice.
 
 These checks confirm service health/readiness only. A full live workflow execution with a real BYOK session and approval path still needs a synthetic end-to-end test.
