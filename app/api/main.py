@@ -648,36 +648,36 @@ async def _trigger_upstash_workflow(envelope: dict, run_id: str) -> str:
     return workflow_run_id
 
 
+async def _cancel_upstash_workflow(run_id: str) -> None:
+    """Cancel one QStash Workflow run without pausing the shared queue."""
+    workflow_run_id = f"wfr_flowpilot-{run_id}"
+    cancel_url = (
+        settings.qstash_url.rstrip("/")
+        + "/v2/workflows/runs/"
+        + workflow_run_id
+    )
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            response = await client.delete(
+                cancel_url,
+                headers={"Authorization": f"Bearer {settings.qstash_token}"},
+                params={"cancel": "true"},
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError("QStash could not confirm workflow cancellation.") from exc
+    if not 200 <= response.status_code < 300:
+        raise RuntimeError(
+            f"QStash rejected workflow cancellation (HTTP {response.status_code})."
+        )
+
+
 if settings.qstash_workflow_enabled:
     from upstash_workflow import AsyncWorkflowContext
     from upstash_workflow.fastapi import Serve
-
-    async def _cancel_upstash_workflow(run_id: str) -> None:
-        """Cancel one QStash Workflow run without pausing the shared queue."""
-        workflow_run_id = f"wfr_flowpilot-{run_id}"
-        cancel_url = (
-            settings.qstash_url.rstrip("/")
-            + "/v2/workflows/runs/"
-            + workflow_run_id
-        )
-        try:
-            async with httpx.AsyncClient(
-                timeout=8.0,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                response = await client.delete(
-                    cancel_url,
-                    headers={"Authorization": f"Bearer {settings.qstash_token}"},
-                    params={"cancel": "true"},
-                )
-        except httpx.HTTPError as exc:
-            raise RuntimeError("QStash could not confirm workflow cancellation.") from exc
-        if not 200 <= response.status_code < 300:
-            raise RuntimeError(
-                f"QStash rejected workflow cancellation (HTTP {response.status_code})."
-            )
-
 
     async def _wait_for_run_control(
         context: AsyncWorkflowContext[dict],
