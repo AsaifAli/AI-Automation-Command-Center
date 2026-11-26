@@ -16,5 +16,7 @@ os.environ.update(
         "API_OPERATOR_KEYS": "",
         "API_REVIEWER_KEYS": "",
         "API_ADMIN_KEYS": "",
+        # Keep unit/API tests offline; hosted telemetry is covered separately.
+        "OTEL_ENABLED": "false",
     }
 )

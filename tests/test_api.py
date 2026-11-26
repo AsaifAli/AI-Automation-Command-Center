@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api.main as api_module
+from app.core.config import Settings
 
 
 class FakeRepo:
@@ -889,3 +890,194 @@ def test_rq_enqueue_persists_job_identity_and_worker_callbacks(monkeypatch):
     assert captured["kwargs"]["rq_job_id"] == job_id
     assert captured["kwargs"]["on_failure"] is api_module.record_rq_job_failure
     assert captured["kwargs"]["on_stopped"] is api_module.record_rq_job_stopped
+
+
+def test_production_embedded_worker_accepts_tls_upstash_url():
+    settings = Settings(
+        _env_file=None,
+        app_env="production",
+        api_auth_enabled=True,
+        api_auth_require_keys=False,
+        redis_url="rediss://default:nonempty-test-password@upstash.example:6379/0",
+        redis_state_enabled=True,
+        redis_key_prefix="flowpilot",
+        embedded_rq_worker_enabled=True,
+        inline_execution=False,
+        qstash_workflow_enabled=False,
+    )
+
+    assert settings.redis_state_enabled is True
+    assert settings.embedded_rq_worker_enabled is True
+
+
+def test_embedded_worker_requires_redis_state_and_exclusive_queue_mode():
+    with pytest.raises(ValueError, match="requires REDIS_STATE_ENABLED"):
+        Settings(_env_file=None, embedded_rq_worker_enabled=True)
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        Settings(
+            _env_file=None,
+            redis_state_enabled=True,
+            embedded_rq_worker_enabled=True,
+            inline_execution=True,
+        )
+
+
+def test_embedded_worker_stop_does_not_send_rq_kill_horse_command(monkeypatch):
+    class FakeJob:
+        id = "active-job"
+        worker_name = "embedded-worker"
+        connection = object()
+
+        def get_status(self, refresh=False):
+            return api_module.JobStatus.STARTED
+
+    class FakeQueue:
+        def fetch_job(self, job_id):
+            assert job_id == "active-job"
+            return FakeJob()
+
+    calls = []
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue())
+    monkeypatch.setattr(api_module.settings, "embedded_rq_worker_enabled", True)
+    monkeypatch.setattr(
+        api_module,
+        "send_stop_job_command",
+        lambda *_args, **_kwargs: pytest.fail("must not issue kill-horse for the embedded SimpleWorker"),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "embedded_rq_worker",
+        SimpleNamespace(stop_current_job=lambda job: calls.append(job.id) or True),
+    )
+
+    assert api_module._stop_rq_job("active-job") is True
+    assert calls == ["active-job"]
+
+
+
+def test_rq_byoK_sessions_can_be_queued_with_redis_backed_state(monkeypatch):
+    captured = {}
+
+    class RedisBackedFakeRepo(FakeRepo):
+        def store_gateway_job_credential(self, run_id, encrypted_token, ttl_seconds):
+            captured["credential"] = (run_id, encrypted_token, ttl_seconds)
+            return "redis-credential-reference"
+
+    class FakeVault:
+        def __init__(self, key, ttl_seconds):
+            captured["vault"] = (key, ttl_seconds)
+
+        def encrypt(self, token):
+            captured["raw_token_seen_by_vault"] = token
+            return b"encrypted-gateway-session"
+
+    fake_repo = RedisBackedFakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "GatewayCredentialVault", FakeVault)
+    monkeypatch.setattr(
+        api_module,
+        "verify_flowpilot_gateway_session",
+        lambda _token: api_module.GatewaySessionLifetime(720, "b" * 64),
+    )
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue())
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "redis_state_enabled", True)
+    monkeypatch.setattr(api_module.settings, "database_url", "")
+    monkeypatch.setattr(api_module.settings, "gateway_job_credential_encryption_key", "test-fernet-key")
+    monkeypatch.setattr(api_module.settings, "gateway_job_credential_ttl_seconds", 900)
+
+    raw_token = "raw-byoK-bearer"
+    response = client.post(
+        "/api/v1/runs",
+        headers={"X-LLM-Gateway-Token": raw_token},
+        json={"workflow": "competitor", "payload": {"competitors": ["Example AI"]}},
+    )
+
+    assert response.status_code == 202
+    assert captured["vault"] == ("test-fernet-key", 900)
+    assert captured["raw_token_seen_by_vault"] == raw_token
+    assert captured["credential"] == (
+        fake_repo.run["run_id"],
+        b"encrypted-gateway-session",
+        720,
+    )
+    assert FakeQueue.last_enqueue["kwargs"]["gateway_credential_id"] == "redis-credential-reference"
+    assert raw_token not in repr(FakeQueue.last_enqueue)
+    assert b"encrypted-gateway-session" not in repr(FakeQueue.last_enqueue).encode()
+    assert response.json()["status"] == "queued"
+
+
+def test_rq_submission_keeps_sync_redis_and_queue_calls_off_the_api_event_loop(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    class ThreadAwareFakeRepo(FakeRepo):
+        @staticmethod
+        def _record(operation):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                calls.append((operation, "worker-thread"))
+            else:
+                calls.append((operation, "event-loop"))
+
+        def create_pending_run(self, workflow, owner_id="legacy"):
+            self._record("create_pending_run")
+            return super().create_pending_run(workflow, owner_id=owner_id)
+
+        def prepare_rq_dispatch(self, run_id, payload):
+            self._record("prepare_rq_dispatch")
+            return super().prepare_rq_dispatch(run_id, payload)
+
+        def set_rq_job_id(self, run_id, generation, job_id):
+            self._record("set_rq_job_id")
+            return super().set_rq_job_id(run_id, generation, job_id)
+
+        def get_run(self, run_id, *, owner_id=None, include_all=False):
+            self._record("get_run")
+            return super().get_run(run_id, owner_id=owner_id, include_all=include_all)
+
+    monkeypatch.setattr(api_module, "repo", ThreadAwareFakeRepo())
+    monkeypatch.setattr(api_module, "queue", lambda: FakeQueue())
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "redis_state_enabled", True)
+    monkeypatch.setattr(api_module.settings, "database_url", "")
+
+    response = client.post(
+        "/api/v1/runs",
+        json={"workflow": "competitor", "payload": {"competitors": ["Example AI"]}},
+    )
+
+    assert response.status_code == 202
+    assert calls
+    assert {thread for _operation, thread in calls} == {"worker-thread"}
+
+
+def test_readiness_uses_backend_ping_without_scanning_run_metrics(monkeypatch):
+    calls = []
+
+    class ReadinessRepo:
+        def ping(self):
+            calls.append("ping")
+            return True
+
+        def metrics(self):
+            pytest.fail("readiness must not scan run metrics")
+
+    monkeypatch.setattr(api_module, "repo", ReadinessRepo())
+    monkeypatch.setattr(api_module.settings, "qstash_workflow_enabled", False)
+    monkeypatch.setattr(api_module.settings, "inline_execution", False)
+    monkeypatch.setattr(api_module.settings, "redis_state_enabled", True)
+    monkeypatch.setattr(api_module.settings, "embedded_rq_worker_enabled", True)
+    monkeypatch.setattr(api_module.settings, "database_url", "")
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json()["state_store"] == "redis"
+    assert response.json()["redis"] == "embedded_rq_worker"
+    assert calls == ["ping"]

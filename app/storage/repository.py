@@ -11,6 +11,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.core.config import Settings
+from app.storage.redis_state import RedisStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -153,14 +154,32 @@ class Repository:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._use_memory = not bool(settings.database_url.strip())
+        self._redis_state = (
+            RedisStateStore(settings)
+            if getattr(settings, "redis_state_enabled", False) and not settings.database_url.strip()
+            else None
+        )
+        self._use_memory = not bool(settings.database_url.strip()) and self._redis_state is None
 
     def _connect(self):
-        if self._use_memory:
-            raise RuntimeError("In-memory repository does not use a database connection")
+        if self._use_memory or self._redis_state is not None:
+            raise RuntimeError("This repository backend does not use a PostgreSQL connection")
         return psycopg.connect(self.settings.database_url, row_factory=dict_row)
 
+    def ping(self) -> bool:
+        """Check the configured state backend without scanning workflow records."""
+        if self._redis_state is not None:
+            return self._redis_state.ping()
+        if self._use_memory:
+            return True
+        with self._connect() as conn:
+            conn.execute("SELECT 1")
+        return True
+
     def init_db(self) -> None:
+        if self._redis_state is not None:
+            self._redis_state.init_db()
+            return
         if self._use_memory:
             return
         with self._connect() as conn:
@@ -171,6 +190,8 @@ class Repository:
             )
 
     def create_pending_run(self, workflow: str, owner_id: str = "legacy") -> str:
+        if self._redis_state is not None:
+            return self._redis_state.create_pending_run(workflow, owner_id=owner_id)
         run_id = str(uuid.uuid4())
         now = datetime.now(UTC)
         record = {
@@ -214,6 +235,8 @@ class Repository:
         owner_id: str,
     ) -> None:
         """Idempotently restore a queued run for a verified Workflow callback."""
+        if self._redis_state is not None:
+            return self._redis_state.ensure_pending_run(run_id, workflow, owner_id)
         try:
             normalized_run_id = str(uuid.UUID(str(run_id)))
         except (TypeError, ValueError, AttributeError) as exc:
@@ -276,6 +299,8 @@ class Repository:
 
     def prepare_qstash_dispatch(self, run_id: str, payload: dict[str, Any]) -> int:
         """Prepare a new generation of a plain QStash message for this run."""
+        if self._redis_state is not None:
+            return self._redis_state.prepare_qstash_dispatch(run_id, payload)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -311,6 +336,8 @@ class Repository:
         Reusing the dispatch payload column lets a paused queued run be recreated
         after the original RQ job has left its queue registry or expired.
         """
+        if self._redis_state is not None:
+            return self._redis_state.prepare_rq_dispatch(run_id, payload)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -341,6 +368,8 @@ class Repository:
         return generation
 
     def set_rq_job_id(self, run_id: str, generation: int, job_id: str) -> bool:
+        if self._redis_state is not None:
+            return self._redis_state.set_rq_job_id(run_id, generation, job_id)
         if not isinstance(job_id, str) or not job_id.strip() or len(job_id) > 256:
             raise ValueError("RQ job identifier is invalid.")
         if self._use_memory:
@@ -360,6 +389,8 @@ class Repository:
 
     def claim_rq_run(self, run_id: str, generation: int, job_id: str) -> bool:
         """Claim the currently persisted RQ generation, allowing RQ's own safe replay."""
+        if self._redis_state is not None:
+            return self._redis_state.claim_rq_run(run_id, generation, job_id)
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
             return False
         if not isinstance(job_id, str) or not job_id.strip():
@@ -410,6 +441,8 @@ class Repository:
         return bool(changed)
 
     def get_rq_dispatch(self, run_id: str) -> dict[str, Any] | None:
+        if self._redis_state is not None:
+            return self._redis_state.get_rq_dispatch(run_id)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -443,6 +476,8 @@ class Repository:
 
     def restore_qstash_dispatch(self, run_id: str, payload: dict[str, Any]) -> None:
         """Restore dispatch metadata from an authenticated QStash delivery after process restart."""
+        if self._redis_state is not None:
+            return self._redis_state.restore_qstash_dispatch(run_id, payload)
         generation = payload.get("dispatch_generation")
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
             raise ValueError("QStash dispatch generation is invalid.")
@@ -467,6 +502,8 @@ class Repository:
             )
 
     def set_qstash_message_id(self, run_id: str, generation: int, message_id: str) -> bool:
+        if self._redis_state is not None:
+            return self._redis_state.set_qstash_message_id(run_id, generation, message_id)
         if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 256:
             raise ValueError("QStash message identifier is invalid.")
         if self._use_memory:
@@ -485,6 +522,8 @@ class Repository:
         return bool(row)
 
     def get_qstash_dispatch(self, run_id: str) -> dict[str, Any] | None:
+        if self._redis_state is not None:
+            return self._redis_state.get_qstash_dispatch(run_id)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -518,6 +557,8 @@ class Repository:
 
     def claim_qstash_run(self, run_id: str, generation: int) -> str:
         """Atomically claim one queued delivery; duplicate/stale messages become no-ops."""
+        if self._redis_state is not None:
+            return self._redis_state.claim_qstash_run(run_id, generation)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -557,6 +598,8 @@ class Repository:
 
     def save_paused_result(self, run_id: str, result: dict[str, Any]) -> bool:
         """Stage a completed inference result while keeping the run paused."""
+        if self._redis_state is not None:
+            return self._redis_state.save_paused_result(run_id, result)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -575,6 +618,8 @@ class Repository:
 
     def take_pending_result(self, run_id: str) -> dict[str, Any] | None:
         """Atomically take the result staged at a pause checkpoint."""
+        if self._redis_state is not None:
+            return self._redis_state.take_pending_result(run_id)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -594,6 +639,8 @@ class Repository:
 
     def fail_run_if_active(self, result: dict[str, Any]) -> bool:
         """Persist a queue failure, staging it once when the run is user-paused."""
+        if self._redis_state is not None:
+            return self._redis_state.fail_run_if_active(result)
         run_id = result["run_id"]
         if self._use_memory:
             with self._memory_lock:
@@ -657,6 +704,8 @@ class Repository:
 
     def pause_run(self, run_id: str) -> bool:
         """Pause an active run at its next durable workflow boundary."""
+        if self._redis_state is not None:
+            return self._redis_state.pause_run(run_id)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -686,6 +735,8 @@ class Repository:
 
     def resume_run(self, run_id: str) -> bool:
         """Resume a paused run, restoring its queued/running state."""
+        if self._redis_state is not None:
+            return self._redis_state.resume_run(run_id)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -715,6 +766,8 @@ class Repository:
 
     def stop_run(self, run_id: str) -> bool:
         """Mark an active run canceled; late worker results may not revive it."""
+        if self._redis_state is not None:
+            return self._redis_state.stop_run(run_id)
         stopped_output = {"error": "Workflow was stopped by the user."}
         if self._use_memory:
             with self._memory_lock:
@@ -767,6 +820,8 @@ class Repository:
         already-encrypted bytes are stored, and callers put only the returned
         UUID in the RQ job arguments.
         """
+        if self._redis_state is not None:
+            return self._redis_state.store_gateway_job_credential(run_id, encrypted_token, ttl_seconds)
         if self._use_memory:
             raise RuntimeError(
                 "Queued Gateway sessions require persistent PostgreSQL storage."
@@ -803,6 +858,8 @@ class Repository:
         credential_id: str,
     ) -> bytes | None:
         """Atomically consume the encrypted credential for exactly one run."""
+        if self._redis_state is not None:
+            return self._redis_state.consume_gateway_job_credential(run_id, credential_id)
         if self._use_memory:
             raise RuntimeError(
                 "Queued Gateway sessions require persistent PostgreSQL storage."
@@ -836,6 +893,8 @@ class Repository:
         credential_id: str,
     ) -> None:
         """Best-effort cleanup when RQ dispatch fails."""
+        if self._redis_state is not None:
+            return self._redis_state.delete_gateway_job_credential(run_id, credential_id)
         if self._use_memory:
             return
         with self._connect() as conn:
@@ -846,6 +905,8 @@ class Repository:
 
     def mark_running(self, run_id: str) -> bool:
         """Atomically claim queued work; return False for paused or terminal runs."""
+        if self._redis_state is not None:
+            return self._redis_state.mark_running(run_id)
         now = datetime.now(UTC)
         if self._use_memory:
             with self._memory_lock:
@@ -879,6 +940,8 @@ class Repository:
         return bool(changed)
 
     def save_result(self, result: dict[str, Any]) -> None:
+        if self._redis_state is not None:
+            return self._redis_state.save_result(result)
         if self._use_memory:
             with self._memory_lock:
                 record = self._memory_runs.get(result["run_id"])
@@ -937,6 +1000,8 @@ class Repository:
         owner_id: str | None = None,
         include_all: bool = False,
     ) -> dict[str, Any] | None:
+        if self._redis_state is not None:
+            return self._redis_state.get_run(run_id, owner_id=owner_id, include_all=include_all)
         if self._use_memory:
             with self._memory_lock:
                 run = self._memory_runs.get(run_id)
@@ -961,6 +1026,8 @@ class Repository:
         owner_id: str | None = None,
         include_all: bool = False,
     ) -> list[dict[str, Any]]:
+        if self._redis_state is not None:
+            return self._redis_state.list_runs(limit, owner_id=owner_id, include_all=include_all)
         safe_limit = min(max(int(limit), 1), 100)
         if self._use_memory:
             with self._memory_lock:
@@ -982,6 +1049,8 @@ class Repository:
         return [self._row_to_run(row) for row in rows]
 
     def clear_history(self) -> int:
+        if self._redis_state is not None:
+            return self._redis_state.clear_history()
         if self._use_memory:
             with self._memory_lock:
                 active = [run for run in self._memory_runs.values() if run["status"] in ("queued", "running", "paused", "awaiting_approval")]
@@ -1009,6 +1078,8 @@ class Repository:
         include_all: bool = False,
     ) -> list[dict[str, Any]]:
         """Return only this owner's pending approvals unless explicitly privileged."""
+        if self._redis_state is not None:
+            return self._redis_state.list_pending_approvals(limit, owner_id=owner_id, include_all=include_all)
         safe_limit = min(max(int(limit), 1), 100)
         if self._use_memory:
             with self._memory_lock:
@@ -1052,6 +1123,8 @@ class Repository:
 
     def create_approval(self, run_id: str, decision: str, reviewer: str, note: str) -> dict[str, Any]:
         """Record one reviewer decision and atomically close the pending gate."""
+        if self._redis_state is not None:
+            return self._redis_state.create_approval(run_id, decision, reviewer, note)
         if decision not in {"approved", "rejected"}:
             raise ValueError("Approval decision must be approved or rejected")
         approval_id = str(uuid.uuid4())
@@ -1130,6 +1203,8 @@ class Repository:
         return approval
 
     def metrics(self) -> dict[str, int]:
+        if self._redis_state is not None:
+            return self._redis_state.metrics()
         if self._use_memory:
             with self._memory_lock:
                 runs = list(self._memory_runs.values())

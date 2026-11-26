@@ -266,3 +266,87 @@ def test_stop_discards_a_result_held_while_paused():
     assert repo.stop_run(run_id) is True
     assert repo.get_rq_dispatch(run_id)["pending_result"] is None
     assert repo.resume_run(run_id) is False
+
+
+def test_simple_worker_executes_rq_job_and_persists_result_in_redis(monkeypatch):
+    from datetime import UTC, datetime
+
+    import fakeredis
+    from rq import Queue, SimpleWorker
+    from rq.job import JobStatus
+
+    import app.storage.redis_state as redis_state_module
+    import app.workers.jobs as jobs_module
+    from app.core.config import Settings
+    from app.storage.repository import Repository
+
+    connection = fakeredis.FakeRedis(decode_responses=False)
+    monkeypatch.setattr(
+        redis_state_module.Redis,
+        "from_url",
+        lambda *_args, **_kwargs: connection,
+    )
+    settings = Settings(
+        _env_file=None,
+        redis_state_enabled=True,
+        redis_url="redis://unused/0",
+        redis_key_prefix="rq-integration",
+        otel_enabled=False,
+    )
+    monkeypatch.setattr(jobs_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(jobs_module, "LLMProvider", lambda _settings: object())
+
+    class DeterministicWorkflowEngine:
+        def __init__(self, _llm):
+            pass
+
+        def run(self, workflow, payload, run_id=None):
+            return {
+                "run_id": run_id,
+                "workflow": workflow,
+                "status": "completed",
+                "output": {"sum": payload["left"] + payload["right"]},
+                "evidence": [],
+                "duration_ms": 1,
+                "created_at": datetime.now(UTC),
+                "usage": None,
+                "warnings": [],
+            }
+
+    monkeypatch.setattr(jobs_module, "WorkflowEngine", DeterministicWorkflowEngine)
+
+    repository = Repository(settings)
+    run_id = repository.create_pending_run("competitor", owner_id="rq-integration-owner")
+    envelope = {
+        "run_id": run_id,
+        "workflow": "competitor",
+        "payload": {"left": 3, "right": 4},
+        "owner_id": "rq-integration-owner",
+        "gateway_credential_id": None,
+    }
+    generation = repository.prepare_rq_dispatch(run_id, envelope)
+    job_id = f"{run_id}-{generation}"
+    assert repository.set_rq_job_id(run_id, generation, job_id) is True
+
+    queue = Queue("aiac-rq-integration", connection=connection)
+    queue.enqueue(
+        jobs_module.execute_run,
+        run_id,
+        "competitor",
+        envelope["payload"],
+        job_id=job_id,
+        job_timeout=300,
+        rq_generation=generation,
+        rq_job_id=job_id,
+        on_failure=jobs_module.record_rq_job_failure,
+        on_stopped=jobs_module.record_rq_job_stopped,
+    )
+    worker = SimpleWorker([queue], connection=connection, name="aiac-rq-integration-worker")
+
+    assert worker.work(burst=True, with_scheduler=False, logging_level="WARNING") is True
+    job = queue.fetch_job(job_id)
+    stored = Repository(settings).get_run(run_id, owner_id="rq-integration-owner")
+
+    assert job.get_status(refresh=True) == JobStatus.FINISHED
+    assert stored["status"] == "completed"
+    assert stored["output"]["sum"] == 7
