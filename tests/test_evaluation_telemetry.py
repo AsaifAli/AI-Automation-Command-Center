@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
-from app.integrations.evaluation_harness import build_flowpilot_event, publish_flowpilot_event
+from app.integrations.evaluation_harness import (
+    build_flowpilot_event,
+    publish_flowpilot_event,
+    publish_flowpilot_evaluation_event,
+)
 
 
 def test_flowpilot_telemetry_contains_only_bounded_numeric_metadata():
@@ -108,4 +112,50 @@ def test_telemetry_rejects_untrusted_origin():
         "workflow": "kpi",
         "status": "completed",
         "output": {},
+    }, settings) is False
+
+
+def test_flowpilot_deterministic_evaluation_summary_is_reported_without_case_content():
+    captured = {}
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def start(self):
+            captured["started"] = True
+
+    settings = SimpleNamespace(
+        evaluation_harness_url="https://ai-engineering-evaluation-harness.onrender.com",
+        evaluation_harness_ingest_token="private-ingest-token",
+        app_env="production",
+    )
+    summary = {
+        "run_id": "8f8e3bb3-5dbd-47e8-8c1a-c2c0a6f84a97",
+        "cases": 4,
+        "passed": 3,
+        "duration_ms": 200,
+        "private_case_payload": "do not report this",
+    }
+
+    assert publish_flowpilot_evaluation_event(summary, settings, thread_factory=FakeThread) is True
+    assert captured["started"] is True
+    payload = captured["args"][2]
+    assert payload["event_type"] == "evaluation.completed"
+    assert payload["status"] == "warning"
+    assert payload["workflow"] == "deterministic_replay"
+    assert payload["metrics"] == {"cases": 4, "passed": 3, "pass_rate": 0.75}
+    assert "private_case_payload" not in str(payload)
+
+
+def test_flowpilot_evaluation_event_rejects_invalid_counts():
+    settings = SimpleNamespace(
+        evaluation_harness_url="https://ai-engineering-evaluation-harness.onrender.com",
+        evaluation_harness_ingest_token="private-ingest-token",
+        app_env="production",
+    )
+    assert publish_flowpilot_evaluation_event({
+        "run_id": "8f8e3bb3-5dbd-47e8-8c1a-c2c0a6f84a98",
+        "cases": 2,
+        "passed": 3,
     }, settings) is False
