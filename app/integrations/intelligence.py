@@ -2,13 +2,13 @@
 import ipaddress
 import logging
 import socket
-import defusedxml.ElementTree as ET
-from defusedxml.common import DefusedXmlException
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
+import defusedxml.ElementTree as ET
 import httpx
+from defusedxml.common import DefusedXmlException
 
 from app.core.config import Settings
 
