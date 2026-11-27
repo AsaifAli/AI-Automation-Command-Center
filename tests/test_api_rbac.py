@@ -63,6 +63,16 @@ class FakeRepo:
         if run:
             run.update(result)
 
+    def list_run_events(self, run_id, *, limit=100, owner_id=None, include_all=False):
+        run = self.runs.get(run_id)
+        if run is None or (not include_all and owner_id is not None and run.get("owner_id", "legacy") != owner_id):
+            return []
+        return [{
+            "event": "step_started",
+            "detail": {"step_id": "execute", "label": "Analyse signals"},
+            "created_at": datetime.now(UTC),
+        }][:limit]
+
     def get_run(self, run_id, *, owner_id=None, include_all=False):
         run = self.runs.get(run_id)
         if (
@@ -729,3 +739,35 @@ def test_gateway_workspace_owner_cannot_access_another_project(monkeypatch):
             "runs:execute", api_key=None, gateway_token="quotesense-session"
         )
     assert error.value.status_code == 403
+
+
+
+def test_run_event_timeline_is_scoped_to_the_verified_gateway_owner(monkeypatch):
+    settings = Settings(api_auth_enabled=True, api_operator_keys="shared-ui-key", api_admin_keys="admin-key")
+    monkeypatch.setattr(auth_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module.settings, "inline_execution", True)
+    monkeypatch.setattr(
+        api_module, "verify_flowpilot_gateway_session",
+        lambda token: api_module.GatewaySessionLifetime(
+            600, api_module.hashlib.sha256(token.encode("utf-8")).hexdigest()
+        ),
+    )
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    monkeypatch.setattr(api_module, "_execute_inline_background", lambda *args, **kwargs: None)
+
+    with TestClient(api_module.app) as client:
+        headers = {"X-API-Key": "shared-ui-key", "X-LLM-Gateway-Token": "verified-gateway-token"}
+        created = client.post("/api/v1/runs", headers=headers,
+                              json={"workflow": "competitor", "payload": {}})
+        assert created.status_code == 202
+        run_id = created.json()["run_id"]
+        same_owner = client.get(f"/api/v1/runs/{run_id}/events", headers=headers)
+        other_owner = client.get(
+            f"/api/v1/runs/{run_id}/events",
+            headers={**headers, "X-LLM-Gateway-Token": "another-owner-token"},
+        )
+
+    assert same_owner.status_code == 200
+    assert same_owner.json()["events"][0]["detail"]["step_id"] == "execute"
+    assert other_owner.status_code == 404

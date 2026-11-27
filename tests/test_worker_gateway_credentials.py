@@ -60,7 +60,7 @@ def test_workflow_retry_can_decrypt_encrypted_token_without_consuming_repository
         def __init__(self, llm):
             pass
 
-        def run(self, workflow, payload, run_id=None):
+        def run(self, workflow, payload, run_id=None, on_event=None):
             observed["token"] = get_llm_gateway_token()
             return {
                 "run_id": run_id,
@@ -120,7 +120,7 @@ def test_workflow_retry_does_not_persist_an_intermediate_failure(monkeypatch):
         def __init__(self, llm):
             pass
 
-        def run(self, workflow, payload, run_id=None):
+        def run(self, workflow, payload, run_id=None, on_event=None):
             raise RuntimeError("temporary provider timeout")
 
     settings = SimpleNamespace(
@@ -179,7 +179,7 @@ def test_worker_consumes_credential_reference_and_clears_context(monkeypatch):
         def __init__(self, llm):
             pass
 
-        def run(self, workflow, payload, run_id=None):
+        def run(self, workflow, payload, run_id=None, on_event=None):
             observed["active_token_during_run"] = get_llm_gateway_token()
             return {
                 "run_id": run_id,

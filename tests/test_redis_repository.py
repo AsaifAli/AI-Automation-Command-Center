@@ -184,3 +184,19 @@ def test_redis_state_repository_ping_checks_connection_without_loading_run_histo
     client.set("unrelated:existing-key", "keep")
     assert repo.ping() is True
     assert client.get("unrelated:existing-key") == b"keep"
+
+
+
+def test_redis_run_events_are_persisted_chronologically_and_owner_scoped(redis_repository):
+    repo, _client = redis_repository
+    run_id = repo.create_pending_run("competitor", owner_id="owner-a")
+    repo.append_run_event(run_id, "step_started", {"step_id": "execute", "label": "Analyse signals"})
+    repo.append_run_event(run_id, "step_completed", {"step_id": "execute", "duration_ms": 840})
+    repo.append_run_event(run_id, "gateway_credential_consumed", {})
+
+    events = Repository(repo.settings).list_run_events(run_id, owner_id="owner-a")
+    assert Repository(repo.settings).list_run_events(run_id, owner_id="owner-b") == []
+    assert [event["event"] for event in events] == ["queued", "step_started", "step_completed"]
+    assert [event["detail"].get("step_id") for event in events[1:]] == ["execute", "execute"]
+    assert events[0]["created_at"]
+    assert Repository(repo.settings).list_run_events(run_id, owner_id="owner-a", limit=1)[0]["event"] == "step_completed"

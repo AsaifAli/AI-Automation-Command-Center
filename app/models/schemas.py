@@ -82,6 +82,18 @@ class RunListResponse(BaseModel):
     total: int
 
 
+class RunEvent(BaseModel):
+    event: str
+    detail: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class RunEventListResponse(BaseModel):
+    run_id: str
+    events: list[RunEvent] = Field(default_factory=list)
+    total: int
+
+
 class MetricResponse(BaseModel):
     workflow_runs_total: int
     workflow_runs_completed: int

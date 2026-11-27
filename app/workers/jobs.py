@@ -137,6 +137,7 @@ def execute_run(
             workflow,
             safe_payload,
             run_id=run_id,
+            on_event=lambda event, detail: repo.append_run_event(run_id, event, detail),
         )
         result["run_id"] = run_id
         if persist_success and not repo.save_paused_result(run_id, result):

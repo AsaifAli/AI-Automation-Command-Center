@@ -21,7 +21,7 @@ The current workspace exposes four workflow types:
 2. The UI submits an authenticated request to the FastAPI service.
 3. The API creates a run reference and schedules execution.
 4. Workflow execution records progress and a terminal result.
-5. The workspace polls the run and presents status, output, and review context.
+5. The workspace polls the run and its owner-scoped event timeline, then presents the recorded stages, durations, output, and review context in a live run canvas.
 6. Actions with external impact remain subject to approval and role permissions.
 
 ## Architecture
@@ -32,7 +32,7 @@ The current workspace exposes four workflow types:
 - **Execution:** the no-new-service Free Render topology enqueues RQ jobs to the existing Upstash Redis database. A supervised SimpleWorker child process runs workflows separately from the API request loop.
 - **State:** owner-scoped run records, dispatch metadata, approval state, and short-lived encrypted Gateway job credentials are stored in the same Redis database under a dedicated key prefix. PostgreSQL remains an optional backend.
 - **LLM access:** portfolio BYOK uses a short-lived, project-scoped Gateway session; raw provider credentials are not put in RQ job arguments.
-- **Observability:** health, run metrics, structured logs, and optional OpenTelemetry instrumentation.
+- **Observability:** health, run metrics, structured logs, and optional OpenTelemetry instrumentation. The shared workspace reads GET /api/v1/runs/{run_id}/events; real LangGraph execute and validate node boundaries emit bounded stage-start, completion, duration, and failure metadata into the existing audit store. PostgreSQL, Redis, and in-memory test backends share one repository contract. Event reads are owner-scoped and expose an allowlist of client-safe event types; provider credentials, prompts, and raw agent outputs are not copied into the timeline.
 
 ## BYOK and Gateway handoff
 

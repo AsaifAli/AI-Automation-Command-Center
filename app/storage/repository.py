@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS detail_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_audit_events_run_created ON audit_events(run_id, id);
 CREATE TABLE IF NOT EXISTS gateway_job_credentials (
     credential_id UUID PRIMARY KEY,
     run_id UUID NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
@@ -153,6 +154,7 @@ class Repository:
 
     _memory_runs: ClassVar[dict[str, dict[str, Any]]] = {}
     _memory_approvals: ClassVar[dict[str, dict[str, Any]]] = {}
+    _memory_events: ClassVar[dict[str, list[dict[str, Any]]]] = {}
     _memory_lock: ClassVar[Any] = threading.RLock()
 
     def __init__(self, settings: Settings):
@@ -218,6 +220,11 @@ class Repository:
         if self._use_memory:
             with self._memory_lock:
                 self._memory_runs[run_id] = record
+                self._memory_events[run_id] = [{
+                    "event": "queued",
+                    "detail": {"workflow": workflow},
+                    "created_at": now,
+                }]
             return run_id
         with self._connect() as conn:
             conn.execute(
@@ -667,6 +674,10 @@ class Repository:
                     "usage": _normalize_usage(result.get("usage")),
                     "warnings": copy.deepcopy(result.get("warnings", [])),
                 })
+                self._memory_events.setdefault(run_id, []).append({
+                    "event": "failed", "detail": {"source": "queue_failure_callback"},
+                    "created_at": datetime.now(UTC),
+                })
                 return True
         now = datetime.now(UTC)
         with self._connect() as conn:
@@ -714,8 +725,13 @@ class Repository:
                 run = self._memory_runs.get(run_id)
                 if not run or run.get("status") not in {"queued", "running"}:
                     return False
-                run["resume_status"] = run["status"]
+                resume_status = run["status"]
+                run["resume_status"] = resume_status
                 run["status"] = "paused"
+                self._memory_events.setdefault(run_id, []).append({
+                    "event": "paused", "detail": {"resume_status": resume_status},
+                    "created_at": datetime.now(UTC),
+                })
                 return True
 
         now = datetime.now(UTC)
@@ -745,7 +761,12 @@ class Repository:
                 run = self._memory_runs.get(run_id)
                 if not run or run.get("status") != "paused":
                     return False
-                run["status"] = run.pop("resume_status", None) or "queued"
+                restored_status = run.pop("resume_status", None) or "queued"
+                run["status"] = restored_status
+                self._memory_events.setdefault(run_id, []).append({
+                    "event": "resumed", "detail": {"status": restored_status},
+                    "created_at": datetime.now(UTC),
+                })
                 return True
 
         now = datetime.now(UTC)
@@ -782,6 +803,9 @@ class Repository:
                 run["pending_result"] = None
                 run["output"] = stopped_output
                 run["warnings"] = ["Execution was canceled by the user."]
+                self._memory_events.setdefault(run_id, []).append({
+                    "event": "cancelled", "detail": {}, "created_at": datetime.now(UTC),
+                })
                 return True
 
         now = datetime.now(UTC)
@@ -920,6 +944,9 @@ class Repository:
                 if status != "queued":
                     return False
                 run["status"] = "running"
+                self._memory_events.setdefault(run_id, []).append({
+                    "event": "started", "detail": {}, "created_at": datetime.now(UTC),
+                })
                 return True
 
         with self._connect() as conn:
@@ -966,6 +993,11 @@ class Repository:
                         "warnings": copy.deepcopy(result.get("warnings", [])),
                     }
                 )
+                self._memory_events.setdefault(result["run_id"], []).append({
+                    "event": result["status"],
+                    "detail": {"duration_ms": result.get("duration_ms", 0)},
+                    "created_at": datetime.now(UTC),
+                })
             return
         with self._connect() as conn:
             current = conn.execute(
@@ -995,6 +1027,85 @@ class Repository:
                 "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
                 (result["run_id"], result["status"], json.dumps({"duration_ms": result.get("duration_ms", 0)}), now),
             )
+
+    def append_run_event(self, run_id: str, event: str, detail: dict[str, Any] | None = None) -> None:
+        """Persist bounded, non-secret execution metadata against an existing run."""
+        if not isinstance(event, str) or not event.strip() or len(event) > 100:
+            raise ValueError("Run event name is invalid.")
+        safe_detail = copy.deepcopy(detail) if isinstance(detail, dict) else {}
+        now = datetime.now(UTC)
+        if self._redis_state is not None:
+            return self._redis_state.append_run_event(run_id, event, safe_detail)
+        if self._use_memory:
+            with self._memory_lock:
+                if run_id not in self._memory_runs:
+                    raise KeyError(f"Run not found: {run_id}")
+                events = self._memory_events.setdefault(run_id, [])
+                events.append({"event": event, "detail": safe_detail, "created_at": now})
+                del events[:-200]
+            return
+        with self._connect() as conn:
+            exists = conn.execute("SELECT 1 FROM workflow_runs WHERE run_id=%s", (run_id,)).fetchone()
+            if not exists:
+                raise KeyError(f"Run not found: {run_id}")
+            conn.execute(
+                "INSERT INTO audit_events(run_id,event,detail_json,created_at) VALUES (%s,%s,%s,%s)",
+                (run_id, event, _json_dumps(safe_detail), now),
+            )
+
+    def list_run_events(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        owner_id: str | None = None,
+        include_all: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return only client-safe events, oldest first, for the requested run owner."""
+        safe_limit = min(max(int(limit), 1), 100)
+        public_events = (
+            "queued", "started", "step_started", "step_completed", "step_failed",
+            "completed", "completed_with_warnings", "awaiting_approval", "failed",
+            "paused", "resumed", "cancelled", "human_approval",
+        )
+        if self._redis_state is not None:
+            return self._redis_state.list_run_events(
+                run_id, limit=safe_limit, owner_id=owner_id, include_all=include_all
+            )
+        if self._use_memory:
+            with self._memory_lock:
+                run = self._memory_runs.get(run_id)
+                if run is None or (not include_all and owner_id is not None and run.get("owner_id", "legacy") != owner_id):
+                    return []
+                events = copy.deepcopy(self._memory_events.get(run_id, []))
+            return [item for item in events if item.get("event") in public_events][-safe_limit:]
+        query = (
+            "SELECT e.event,e.detail_json,e.created_at FROM audit_events AS e "
+            "JOIN workflow_runs AS r ON r.run_id=e.run_id "
+            "WHERE e.run_id=%s AND e.event = ANY(%s)"
+        )
+        params: tuple[Any, ...] = (run_id, list(public_events))
+        if not include_all and owner_id is not None:
+            query += " AND r.owner_id=%s"
+            params += (owner_id,)
+        query += " ORDER BY e.id DESC LIMIT %s"
+        params += (safe_limit,)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        result = []
+        for row in reversed(rows):
+            detail = row.get("detail_json") or {}
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except ValueError:
+                    detail = {}
+            result.append({
+                "event": row["event"],
+                "detail": detail if isinstance(detail, dict) else {},
+                "created_at": row["created_at"],
+            })
+        return result
 
     def get_run(
         self,
@@ -1062,6 +1173,7 @@ class Repository:
                 doomed = [run_id for run_id, run in self._memory_runs.items() if run["status"] not in ("queued", "running", "paused", "awaiting_approval")]
                 for run_id in doomed:
                     self._memory_runs.pop(run_id, None)
+                    self._memory_events.pop(run_id, None)
                     for approval_id, approval in list(self._memory_approvals.items()):
                         if approval["run_id"] == run_id:
                             self._memory_approvals.pop(approval_id, None)
@@ -1162,6 +1274,12 @@ class Repository:
                     raise KeyError("Run not found")
                 apply_approval_decision(run, approval, item_index=item_index)
                 self._memory_approvals[approval_id] = copy.deepcopy(approval)
+                self._memory_events.setdefault(run_id, []).append({
+                    "event": "human_approval",
+                    "detail": {"approval_id": approval_id, "decision": decision,
+                               "reviewer": reviewer, "item_index": item_index},
+                    "created_at": decided_at,
+                })
             return copy.deepcopy(approval)
 
         with self._connect() as conn:

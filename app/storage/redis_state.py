@@ -121,7 +121,43 @@ class RedisStateStore:
             "detail": detail or {},
             "created_at": datetime.now(UTC).isoformat(),
         }
-        self.client.lpush(self._key(f"audit:{run_id}"), _json_dumps(item))
+        key = self._key(f"audit:{run_id}")
+        self.client.lpush(key, _json_dumps(item))
+        self.client.ltrim(key, 0, 199)
+
+    def append_run_event(self, run_id: str, event: str, detail: dict[str, Any] | None = None) -> None:
+        if not isinstance(event, str) or not event.strip() or len(event) > 100:
+            raise ValueError("Run event name is invalid.")
+        if self._load_run(run_id) is None:
+            raise KeyError(f"Run not found: {run_id}")
+        self._append_audit(run_id, event, detail if isinstance(detail, dict) else {})
+
+    def list_run_events(
+        self, run_id: str, *, limit: int = 100, owner_id: str | None = None,
+        include_all: bool = False,
+    ) -> list[dict[str, Any]]:
+        run = self._load_run(run_id)
+        if run is None or (not include_all and owner_id is not None and run.get("owner_id", "legacy") != owner_id):
+            return []
+        safe_limit = min(max(int(limit), 1), 100)
+        public_events = {
+            "queued", "started", "step_started", "step_completed", "step_failed",
+            "completed", "completed_with_warnings", "awaiting_approval", "failed",
+            "paused", "resumed", "cancelled", "human_approval",
+        }
+        raw_events = self.client.lrange(self._key(f"audit:{run_id}"), 0, 199)
+        chronological = []
+        for raw in reversed(raw_events):
+            item = json.loads(raw)
+            if item.get("event") not in public_events:
+                continue
+            detail = item.get("detail")
+            chronological.append({
+                "event": item.get("event"),
+                "detail": detail if isinstance(detail, dict) else {},
+                "created_at": item.get("created_at"),
+            })
+        return chronological[-safe_limit:]
 
     def _read_runs(self, *, limit: int, owner_id: str | None = None) -> list[dict[str, Any]]:
         safe_limit = min(max(int(limit), 1), 10000)

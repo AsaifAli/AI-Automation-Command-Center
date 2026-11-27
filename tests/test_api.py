@@ -14,9 +14,17 @@ class FakeRepo:
     def __init__(self):
         self.run = None
         self.dispatch = None
+        self.events = []
 
     def init_db(self):
         return None
+
+    def list_run_events(self, run_id, *, limit=100, owner_id=None, include_all=False):
+        if not self.run or self.run.get("run_id") != run_id:
+            return []
+        if not include_all and owner_id is not None and self.run.get("owner_id") != owner_id:
+            return []
+        return list(self.events)[-limit:]
 
     def create_pending_run(self, workflow, owner_id="legacy"):
         requires_approval = workflow in {"content", "outreach"}
@@ -1151,3 +1159,24 @@ def test_readiness_uses_backend_ping_without_scanning_run_metrics(monkeypatch):
     assert response.json()["state_store"] == "redis"
     assert response.json()["redis"] == "embedded_rq_worker"
     assert calls == ["ping"]
+
+
+
+def test_run_events_endpoint_returns_a_run_scoped_timeline(monkeypatch):
+    fake_repo = FakeRepo()
+    monkeypatch.setattr(api_module, "repo", fake_repo)
+    created = client.post(
+        "/api/v1/runs",
+        json={"workflow": "competitor", "payload": {"competitors": ["AI"]}},
+    )
+    assert created.status_code == 202
+    run_id = created.json()["run_id"]
+    fake_repo.events = [
+        {"event": "queued", "detail": {"workflow": "competitor"}, "created_at": "2026-11-27T10:00:00+00:00"},
+        {"event": "step_started", "detail": {"step_id": "execute"}, "created_at": "2026-11-27T10:00:01+00:00"},
+    ]
+
+    response = client.get(f"/api/v1/runs/{run_id}/events?limit=25")
+    assert response.status_code == 200
+    assert response.json()["run_id"] == run_id
+    assert [event["event"] for event in response.json()["events"]] == ["queued", "step_started"]
