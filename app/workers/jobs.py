@@ -7,21 +7,11 @@ from app.core.llm_gateway_context import (
     reset_llm_gateway_token,
     set_llm_gateway_token,
 )
-from app.integrations.evaluation_harness import report_workflow_event
 from app.integrations.llm import LLMProvider
 from app.storage.repository import Repository
 from app.workflows.orchestrator import WorkflowEngine
 
 logger = logging.getLogger(__name__)
-
-
-def _report_workflow_event_safely(settings, result: dict) -> None:
-    """Send content-free workflow metadata without affecting execution."""
-    try:
-        report_workflow_event(settings, result)
-    except Exception:
-        # Telemetry is best-effort. A monitoring outage must never fail a run.
-        logger.info("evaluation_harness_event_delivery_failed", exc_info=True)
 
 
 def record_rq_job_failure(job, connection, exc_type, exc_value, traceback) -> None:
@@ -52,7 +42,6 @@ def record_rq_job_failure(job, connection, exc_type, exc_value, traceback) -> No
         "warnings": ["The RQ worker reported a terminal job failure or timeout."],
     }
     repo.fail_run_if_active(failure)
-    _report_workflow_event_safely(settings, failure)
 
 
 def record_rq_job_stopped(job, connection) -> None:
@@ -152,7 +141,6 @@ def execute_run(
         result["run_id"] = run_id
         if persist_success and not repo.save_paused_result(run_id, result):
             repo.save_result(result)
-        _report_workflow_event_safely(settings, result)
         return result
 
     except Exception:
@@ -173,7 +161,6 @@ def execute_run(
         }
         if persist_failure and not repo.save_paused_result(run_id, result):
             repo.save_result(result)
-        _report_workflow_event_safely(settings, result)
         raise
     finally:
         if context_token is not None:
