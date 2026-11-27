@@ -41,10 +41,28 @@ def test_streamlit_entrypoint_is_a_retirement_notice_not_a_product_ui():
     }
 
     assert "streamlit" in imported_modules
-    assert "ui.legacy_notice" in imported_modules
+    assert "legacy_notice" in imported_modules
     assert "requests" not in imported_modules
     assert "execution_modes" not in imported_modules
     assert "api_access" not in imported_modules
+
+    import os
+    import subprocess
+    import sys
+
+    ui_dir = app_path.parent
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    import_result = subprocess.run(
+        [sys.executable, "-c", "from legacy_notice import legacy_workspace_url; print(legacy_workspace_url())"],
+        cwd=ui_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert import_result.returncode == 0, import_result.stderr
+    assert import_result.stdout.strip() == "https://studio.asaifali-studio.workers.dev/workspace"
 
     call_names = {
         node.func.attr
