@@ -52,3 +52,34 @@ def test_kpi_brief_reports_real_update_and_risk_counts():
     })
     assert "2 update(s) were reviewed" in result["leadership_brief"]
     assert "1 at risk" in result["leadership_brief"]
+
+
+
+def test_workflow_engine_emits_real_step_boundaries_and_ignores_event_sink_failures():
+    from app.workflows.orchestrator import WorkflowEngine
+
+    events = []
+    engine = WorkflowEngine(llm)
+    result = engine.run(
+        "kpi",
+        {"updates": [{"entity": "A", "metric": "delivery", "value": "on track", "blocker": "None"}]},
+        run_id="run-trace",
+        on_event=lambda event, detail: events.append((event, detail)),
+    )
+
+    assert result["status"] == "completed"
+    assert [(event, detail["step_id"]) for event, detail in events] == [
+        ("step_started", "execute"),
+        ("step_completed", "execute"),
+        ("step_started", "validate"),
+        ("step_completed", "validate"),
+    ]
+    assert all(isinstance(detail.get("duration_ms"), int) for event, detail in events if event == "step_completed")
+
+    resilient = engine.run(
+        "kpi",
+        {"updates": [{"entity": "A", "metric": "delivery", "value": "on track", "blocker": "None"}]},
+        run_id="run-trace-resilient",
+        on_event=lambda *_args: (_ for _ in ()).throw(RuntimeError("event sink unavailable")),
+    )
+    assert resilient["status"] == "completed"

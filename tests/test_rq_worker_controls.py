@@ -106,7 +106,7 @@ def test_worker_stages_completion_when_run_is_paused_during_execution(monkeypatc
         def __init__(self, llm):
             pass
 
-        def run(self, workflow, payload, run_id):
+        def run(self, workflow, payload, run_id, on_event=None):
             return {
                 "workflow": workflow,
                 "status": "completed",
@@ -150,7 +150,7 @@ def test_worker_stages_failure_when_run_is_paused_during_execution(monkeypatch):
         def __init__(self, llm):
             pass
 
-        def run(self, workflow, payload, run_id):
+        def run(self, workflow, payload, run_id, on_event=None):
             raise RuntimeError("provider failed")
 
     monkeypatch.setattr(jobs, "get_settings", lambda: Settings(_env_file=None))
@@ -300,7 +300,7 @@ def test_simple_worker_executes_rq_job_and_persists_result_in_redis(monkeypatch)
         def __init__(self, _llm):
             pass
 
-        def run(self, workflow, payload, run_id=None):
+        def run(self, workflow, payload, run_id=None, on_event=None):
             return {
                 "run_id": run_id,
                 "workflow": workflow,

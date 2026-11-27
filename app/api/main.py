@@ -41,6 +41,7 @@ from app.models.schemas import (
     ApprovalResponse,
     HealthResponse,
     MetricResponse,
+    RunEventListResponse,
     RunListResponse,
     RunRequest,
     WorkflowResult,
@@ -1485,6 +1486,42 @@ async def stop_run(
             else "The run is marked canceled. An in-flight provider request may finish before the worker reaches its next boundary; its result will be discarded."
         ),
     }
+
+
+@app.get(
+    "/api/v1/runs/{run_id}/events",
+    response_model=RunEventListResponse,
+    tags=["workflows"],
+)
+def list_run_events(
+    run_id: str,
+    limit: int = 100,
+    llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
+    principal: Principal = Depends(require_workspace_permission("runs:read")),
+):
+    gateway_token = (llm_gateway_token or "").strip()
+    gateway_scope = (
+        verify_flowpilot_gateway_session(gateway_token).owner_scope
+        if gateway_token else None
+    )
+    owner_id = gateway_scope or principal.owner_id or hashlib.sha256(
+        principal.subject.encode("utf-8")
+    ).hexdigest()
+    include_all = principal.role == "admin"
+    safe_limit = min(max(limit, 1), 100)
+    try:
+        run = repo.get_run(run_id, owner_id=owner_id, include_all=include_all)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        events = repo.list_run_events(
+            run_id, limit=safe_limit, owner_id=owner_id, include_all=include_all
+        )
+        return {"run_id": run_id, "events": events, "total": len(events)}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("run_events_lookup_failed run_id=%s", run_id)
+        raise HTTPException(status_code=503, detail="Run execution trace unavailable") from None
 
 
 @app.get(

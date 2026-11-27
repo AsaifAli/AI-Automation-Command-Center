@@ -173,3 +173,28 @@ def test_settings_loads_compose_gateway_key_alias(monkeypatch):
     settings = Settings(_env_file=None, app_env="development")
 
     assert settings.gateway_job_credential_encryption_key == key
+
+
+
+def test_in_memory_run_events_capture_queue_steps_and_terminal_state():
+    from datetime import UTC, datetime
+
+    from app.core.config import Settings
+    from app.storage.repository import Repository
+
+    repository = Repository(Settings(_env_file=None, database_url=""))
+    run_id = repository.create_pending_run("competitor", owner_id="trace-owner")
+    assert repository.mark_running(run_id) is True
+    repository.append_run_event(run_id, "step_started", {"step_id": "execute", "label": "Analyse signals"})
+    repository.append_run_event(run_id, "step_completed", {"step_id": "execute", "duration_ms": 12})
+    repository.save_result({
+        "run_id": run_id, "workflow": "competitor", "status": "completed",
+        "output": {"summary": "ready"}, "evidence": [], "duration_ms": 18,
+        "created_at": datetime.now(UTC), "usage": None, "warnings": [],
+    })
+
+    events = repository.list_run_events(run_id, owner_id="trace-owner")
+    assert [event["event"] for event in events] == [
+        "queued", "started", "step_started", "step_completed", "completed"
+    ]
+    assert repository.list_run_events(run_id, owner_id="different-owner") == []

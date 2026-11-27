@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, TypedDict
 
@@ -86,21 +87,75 @@ class WorkflowEngine:
         }
         self.llm = llm
 
-    def _graph(self, workflow: str):
+    def _graph(self, workflow: str, on_event: Callable[[str, dict[str, Any]], None] | None = None):
         agent = self.agents[workflow]
+        labels = {
+            "content": "Prepare channel-specific drafts",
+            "competitor": "Analyse competitor signals",
+            "outreach": "Qualify and draft outreach",
+            "kpi": "Normalize operating updates",
+        }
+
+        def emit(event: str, detail: dict[str, Any]) -> None:
+            if on_event is None:
+                return
+            try:
+                on_event(event, detail)
+            except Exception:
+                logger.debug("workflow_event_sink_failed event=%s", event, exc_info=True)
 
         def execute(state: State) -> State:
-            result = agent.run(state.get("payload", {}))
+            started = time.perf_counter()
+            label = labels.get(workflow, "Execute workflow")
+            emit("step_started", {
+                "step_id": "execute", "label": label,
+                "summary": "The selected workflow agent is processing the submitted inputs.",
+            })
+            try:
+                result = agent.run(state.get("payload", {}))
+            except Exception:
+                emit("step_failed", {
+                    "step_id": "execute", "label": label,
+                    "summary": "The workflow agent could not complete this stage.",
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                })
+                raise
             usage = result.pop("_usage", None)
+            result_count = sum(len(value) for value in result.values() if isinstance(value, list))
+            emit("step_completed", {
+                "step_id": "execute", "label": label,
+                "summary": "The workflow agent returned its result for validation.",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "result_count": result_count,
+            })
             return {"output": result, "usage": usage or {}}
 
         def validate(state: State) -> State:
-            output = state.get("output", {})
-            warnings = []
-            if not output:
-                warnings.append("Agent returned an empty output.")
-            if workflow == "outreach" and any(c.get("approval_required") is not True for c in output.get("candidates", [])):
-                warnings.append("Outreach policy violation: every candidate must require approval.")
+            started = time.perf_counter()
+            emit("step_started", {
+                "step_id": "validate", "label": "Verify output and approval policy",
+                "summary": "Checking the result against workflow validation and review rules.",
+            })
+            try:
+                output = state.get("output", {})
+                warnings = []
+                if not output:
+                    warnings.append("Agent returned an empty output.")
+                if workflow == "outreach" and any(c.get("approval_required") is not True for c in output.get("candidates", [])):
+                    warnings.append("Outreach policy violation: every candidate must require approval.")
+            except Exception:
+                emit("step_failed", {
+                    "step_id": "validate", "label": "Verify output and approval policy",
+                    "summary": "The output validation stage could not complete.",
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                })
+                raise
+            emit("step_completed", {
+                "step_id": "validate", "label": "Verify output and approval policy",
+                "summary": "Output validation completed; approval checkpoints remain enforced.",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "warning_count": len(warnings),
+            })
             return {"warnings": warnings}
 
         graph = StateGraph(State)
@@ -111,7 +166,10 @@ class WorkflowEngine:
         graph.add_edge("validate", END)
         return graph.compile()
 
-    def run(self, workflow: str, payload: dict[str, Any], run_id: str | None = None) -> dict[str, Any]:
+    def run(
+        self, workflow: str, payload: dict[str, Any], run_id: str | None = None,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         run_id = run_id or str(uuid.uuid4())
         tracer = trace.get_tracer("ai-automation") if trace else None
@@ -121,7 +179,7 @@ class WorkflowEngine:
             span.set_attribute("workflow", workflow)
             span.set_attribute("run_id", run_id)
         try:
-            state = self._graph(workflow).invoke({"payload": payload})
+            state = self._graph(workflow, on_event=on_event).invoke({"payload": payload})
             status = "completed" if not state.get("warnings") else "completed_with_warnings"
             output = state.get("output", {})
             warnings = state.get("warnings", [])
