@@ -116,6 +116,19 @@ A passing CI run establishes the checks included in that workflow; it does not b
 ## Portfolio positioning
 
 **FlowPilot — AI Workflow Automation:** a distinct AI application for orchestrating bounded workflows, tracking execution, and keeping consequential actions reviewable. It is not the shared Evaluation Harness dashboard and is not the private Agency OS.
+## Evaluation Harness activity reporting
+
+FlowPilot can report bounded run metadata to the central Engineering Assurance service. This is separate from the deterministic replay quality pack; replay tests and actual run activity are displayed independently.
+
+On the existing `ai-automation-api` Render service, configure:
+
+- `EVALUATION_HARNESS_URL=https://ai-engineering-evaluation-harness.onrender.com`
+- `EVALUATION_HARNESS_INGEST_TOKEN` — a unique random token matching the `flowpilot` entry in the harness service's `HARNESS_INGEST_TOKENS_JSON`.
+
+Generate the token with `openssl rand -hex 32`. Store it only in Render environment settings. Do not commit it or expose it to the UI. The telemetry sender uses a daemon thread, validates the harness origin, and fails open: telemetry failure must not block workflow completion.
+
+Only the project slug, workflow name, terminal status, duration, model label, run reference and bounded numeric counters are sent. It never sends prompts, client input, generated drafts, competitor names, KPI values, approval notes, API credentials or Gateway tokens. The integration is disabled until both environment variables are set.
+
 ## Hosted deployment verification
 
 The existing public services are:
