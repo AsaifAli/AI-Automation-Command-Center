@@ -24,7 +24,8 @@ from rq.command import send_stop_job_command
 from rq.job import JobStatus
 from starlette.responses import Response
 
-from app.core.auth import Principal, authenticate_api_key, require_permission
+import app.core.auth as auth_module
+from app.core.auth import ROLE_PERMISSIONS, Principal, authenticate_api_key
 from app.core.config import get_settings
 from app.core.gateway_credentials import GatewayCredentialError, GatewayCredentialVault
 from app.core.llm_gateway_context import (
@@ -249,6 +250,46 @@ def verify_flowpilot_gateway_session(gateway_token: str) -> GatewaySessionLifeti
         # scope; a missing claim never falls back to a shared project scope.
         owner_scope = hashlib.sha256(gateway_token.encode("utf-8")).hexdigest()
     return GatewaySessionLifetime(remaining_seconds, owner_scope)
+
+
+
+def resolve_api_principal(
+    permission: str,
+    *,
+    api_key: str | None,
+    gateway_token: str | None,
+) -> Principal:
+    """Resolve a role-scoped API principal or a project-owned BYOK session."""
+    token = (gateway_token or "").strip()
+    if token:
+        lifetime = verify_flowpilot_gateway_session(token)
+        owner_scope = getattr(lifetime, "owner_scope", None)
+        if not isinstance(owner_scope, str) or not owner_scope:
+            owner_scope = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        principal = Principal(
+            subject="Verified FlowPilot workspace session",
+            role="workspace_owner",
+            permissions=ROLE_PERMISSIONS["workspace_owner"],
+            owner_id=owner_scope,
+        )
+    else:
+        principal = authenticate_api_key(api_key, auth_module.get_settings())
+
+    if not principal.can(permission):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return principal
+
+
+def require_workspace_permission(permission: str):
+    """Support both existing role keys and scoped Gateway sessions."""
+    def dependency(
+        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        gateway_token: str | None = Header(default=None, alias="X-LLM-Gateway-Token"),
+    ) -> Principal:
+        return resolve_api_principal(
+            permission, api_key=x_api_key, gateway_token=gateway_token
+        )
+    return dependency
 
 
 @app.on_event("startup")
@@ -485,7 +526,7 @@ def ready():
 )
 def metrics(
     _: Principal = Depends(
-        require_permission("metrics:read")
+        require_workspace_permission("metrics:read")
     ),
 ):
     return repo.metrics()
@@ -515,7 +556,7 @@ def prometheus_metrics(authorization: str | None = Header(default=None, alias="A
 )
 def workflows(
     _: Principal = Depends(
-        require_permission("workflows:read")
+        require_workspace_permission("workflows:read")
     ),
 ):
     return {
@@ -972,7 +1013,7 @@ async def run_workflow(
         alias="X-LLM-Gateway-Token",
     ),
     principal: Principal = Depends(
-        require_permission("runs:execute")
+        require_workspace_permission("runs:execute")
     ),
 ):
     gateway_token = (llm_gateway_token or "").strip()
@@ -1165,7 +1206,7 @@ async def run_workflow(
 def list_pending_approvals(
     limit: int = 50,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
-    principal: Principal = Depends(require_permission("approvals:decide")),
+    principal: Principal = Depends(require_workspace_permission("approvals:decide")),
 ):
     """List pending review requests inside the verified owner's scope."""
     gateway_token = (llm_gateway_token or "").strip()
@@ -1201,7 +1242,7 @@ def list_pending_approvals(
 def list_runs(
     limit: int = 20,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
-    principal: Principal = Depends(require_permission("runs:read")),
+    principal: Principal = Depends(require_workspace_permission("runs:read")),
 ):
     safe_limit = min(max(limit, 1), 100)
     gateway_token = (llm_gateway_token or "").strip()
@@ -1241,7 +1282,7 @@ def list_runs(
 )
 def clear_run_history(
     _: Principal = Depends(
-        require_permission("runs:delete")
+        require_workspace_permission("runs:delete")
     ),
 ):
     try:
@@ -1294,7 +1335,7 @@ def _owned_run_for_control(
 async def pause_run(
     run_id: str,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
-    principal: Principal = Depends(require_permission("runs:execute")),
+    principal: Principal = Depends(require_workspace_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled and settings.inline_execution:
         raise HTTPException(status_code=409, detail="Run controls require a queue-backed execution mode.")
@@ -1330,7 +1371,7 @@ async def pause_run(
 async def resume_run(
     run_id: str,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
-    principal: Principal = Depends(require_permission("runs:execute")),
+    principal: Principal = Depends(require_workspace_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled and settings.inline_execution:
         raise HTTPException(status_code=409, detail="Run controls require a queue-backed execution mode.")
@@ -1411,7 +1452,7 @@ async def resume_run(
 async def stop_run(
     run_id: str,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
-    principal: Principal = Depends(require_permission("runs:execute")),
+    principal: Principal = Depends(require_workspace_permission("runs:execute")),
 ):
     if not settings.qstash_workflow_enabled and settings.inline_execution:
         raise HTTPException(status_code=409, detail="Run controls require a queue-backed execution mode.")
@@ -1454,7 +1495,7 @@ async def stop_run(
 def get_run(
     run_id: str,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
-    principal: Principal = Depends(require_permission("runs:read")),
+    principal: Principal = Depends(require_workspace_permission("runs:read")),
 ):
     gateway_token = (llm_gateway_token or "").strip()
     gateway_scope = (
@@ -1501,7 +1542,7 @@ def decide_approval(
     run_id: str,
     request: ApprovalRequest,
     llm_gateway_token: str = Header(default="", alias="X-LLM-Gateway-Token"),
-    principal: Principal = Depends(require_permission("approvals:decide")),
+    principal: Principal = Depends(require_workspace_permission("approvals:decide")),
 ):
     gateway_token = (llm_gateway_token or "").strip()
     gateway_scope = (
