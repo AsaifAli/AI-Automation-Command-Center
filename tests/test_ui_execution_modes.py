@@ -21,33 +21,53 @@ def test_execution_mode_labels_name_the_embedded_worker_explicitly():
     assert execution_mode_label(None) == "Unknown"
 
 
-def test_streamlit_entrypoint_can_import_its_execution_mode_helper():
-    """The import used by app.py must resolve from Streamlit's script directory."""
+def test_streamlit_entrypoint_is_a_retirement_notice_not_a_product_ui():
+    """The old public UI must not initiate workflow or model API calls."""
     import ast
+    from pathlib import Path
+
+    app_path = Path(__file__).resolve().parents[1] / "ui" / "app.py"
+    app_tree = ast.parse(app_path.read_text(encoding="utf-8"))
+
+    imported_modules = {
+        node.module
+        for node in ast.walk(app_tree)
+        if isinstance(node, ast.ImportFrom)
+    } | {
+        alias.name
+        for node in ast.walk(app_tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+    assert "streamlit" in imported_modules
+    assert "legacy_notice" in imported_modules
+    assert "requests" not in imported_modules
+    assert "execution_modes" not in imported_modules
+    assert "api_access" not in imported_modules
+
     import os
     import subprocess
     import sys
-    from pathlib import Path
 
-    project_root = Path(__file__).resolve().parents[1]
-    ui_dir = project_root / "ui"
-    app_tree = ast.parse((ui_dir / "app.py").read_text(encoding="utf-8"))
-    import_node = next(
-        node
-        for node in ast.walk(app_tree)
-        if isinstance(node, ast.ImportFrom)
-        and any(alias.name == "execution_mode_label" for alias in node.names)
-    )
-
+    ui_dir = app_path.parent
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
-    result = subprocess.run(
-        [sys.executable, "-c", ast.unparse(import_node)],
+    import_result = subprocess.run(
+        [sys.executable, "-c", "from legacy_notice import legacy_workspace_url; print(legacy_workspace_url())"],
         cwd=ui_dir,
         env=env,
         capture_output=True,
         text=True,
         check=False,
     )
+    assert import_result.returncode == 0, import_result.stderr
+    assert import_result.stdout.strip() == "https://studio.asaifali-studio.workers.dev/workspace"
 
-    assert result.returncode == 0, result.stderr
+    call_names = {
+        node.func.attr
+        for node in ast.walk(app_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "link_button" in call_names
+    assert "set_page_config" in call_names
