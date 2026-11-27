@@ -7,7 +7,7 @@ cannot launch workflows outside the workspace's BYOK and session boundary.
 
 import streamlit as st
 
-from ui.legacy_notice import legacy_workspace_url
+from legacy_notice import legacy_workspace_url
 
 st.set_page_config(
     page_title="FlowPilot · Studio Workspace",
