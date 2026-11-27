@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     schedule_workflow: str = "competitor"
     schedule_competitors: str = "Example Protocol,Example AI Startup"
 
+    # Evaluation harness telemetry (best-effort; never includes workflow content).
+    evaluation_harness_url: str = ""
+    evaluation_harness_ingest_token: str = Field(default="", repr=False)
+
     # Observability
     otel_enabled: bool = True
     otel_service_name: str = "ai-automation-api"
