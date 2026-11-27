@@ -201,7 +201,7 @@ class WorkflowEngine:
             "url": None,
             "observed_at": now,
         }]
-        return {
+        result = {
             "run_id": run_id,
             "workflow": workflow,
             "status": status,
@@ -212,3 +212,12 @@ class WorkflowEngine:
             "usage": usage,
             "warnings": warnings,
         }
+        # Telemetry is strictly best-effort. It carries only bounded metadata;
+        # a harness outage must never change the workflow result or approval state.
+        try:
+            from app.integrations.evaluation_harness import report_workflow_event
+
+            report_workflow_event(self.llm.settings, result)
+        except Exception:
+            logger.warning("evaluation_harness_reporting_skipped workflow=%s run_id=%s", workflow, run_id)
+        return result

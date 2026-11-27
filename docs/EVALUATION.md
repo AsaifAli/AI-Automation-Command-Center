@@ -80,3 +80,16 @@ Maintain a versioned evaluation set. Run it when any of the following changes:
 - output schemas
 
 A production deployment should block promotion when critical quality metrics regress beyond agreed thresholds.
+
+## Shared Engineering Assurance Harness
+
+FlowPilot can report privacy-safe workflow activity to the studio's evaluation harness. Configure these server-side variables on the FlowPilot API service:
+
+- `EVALUATION_HARNESS_URL=https://ai-engineering-evaluation-harness.onrender.com`
+- `EVALUATION_HARNESS_INGEST_TOKEN` — a unique FlowPilot-only token.
+
+The evaluation-harness service must include the same token under the `flowpilot` key in `HARNESS_INGEST_TOKENS_JSON`. Keep it separate from EvidenceFlow and QuoteSense tokens.
+
+Only run ID, workflow name, status, elapsed time, model label, token counts, approval-pending state and warning count are sent. Prompts, user inputs, generated artifacts, evidence details, model responses and provider credentials are never included. Delivery is best-effort with a short timeout; an unavailable harness never changes or blocks the workflow result.
+
+The harness's synthetic FlowPilot replay pack remains a separate quality-gate suite. Runtime activity counters are not represented as synthetic evaluation scores.
