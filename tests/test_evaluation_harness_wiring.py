@@ -131,3 +131,24 @@ def test_evaluation_harness_outage_never_changes_workflow_result():
         )
 
     assert returned["status"] == "completed"
+
+
+def test_hard_rq_worker_failure_is_reported_after_failure_is_persisted():
+    from app.workers.jobs import record_rq_job_failure
+
+    settings = SimpleNamespace()
+    repository = Mock()
+    job = SimpleNamespace(args=("run-12345678", "outreach"), id="rq-job-1")
+
+    with (
+        patch("app.workers.jobs.get_settings", return_value=settings),
+        patch("app.workers.jobs.Repository", return_value=repository),
+        patch("app.workers.jobs.report_workflow_event") as report_event,
+    ):
+        record_rq_job_failure(job, None, RuntimeError, RuntimeError("timeout"), None)
+
+    repository.fail_run_if_active.assert_called_once()
+    reported_settings, reported_result = report_event.call_args.args
+    assert reported_settings is settings
+    assert reported_result["run_id"] == "run-12345678"
+    assert reported_result["status"] == "failed"
