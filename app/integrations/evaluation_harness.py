@@ -163,3 +163,95 @@ def publish_flowpilot_event(
     )
     worker.start()
     return True
+
+
+def publish_flowpilot_evaluation_event(
+    summary: dict[str, Any],
+    settings: Any,
+    *,
+    thread_factory: Any = threading.Thread,
+) -> bool:
+    """Report a completed deterministic evaluation without transmitting case data."""
+    run_id = summary.get("run_id")
+    cases = summary.get("cases")
+    passed = summary.get("passed")
+    duration_ms = summary.get("duration_ms")
+    if (
+        not isinstance(run_id, str)
+        or not 8 <= len(run_id) <= 64
+        or not isinstance(cases, int)
+        or isinstance(cases, bool)
+        or cases < 1
+        or not isinstance(passed, int)
+        or isinstance(passed, bool)
+        or passed < 0
+        or passed > cases
+    ):
+        return False
+
+    base_url = str(getattr(settings, "evaluation_harness_url", "") or "").strip()
+    token = str(getattr(settings, "evaluation_harness_ingest_token", "") or "").strip()
+    if not base_url or not token:
+        return False
+
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError:
+        return False
+
+    is_production = str(getattr(settings, "app_env", "")).strip().lower() in {"prod", "production"}
+    production_origin = (
+        parsed.scheme == "https"
+        and parsed.hostname == HARNESS_HOST
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in {"", "/"}
+        and not parsed.query
+        and not parsed.fragment
+    )
+    local_origin = (
+        not is_production
+        and parsed.scheme == "http"
+        and parsed.hostname in {"localhost", "127.0.0.1"}
+        and port is not None
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in {"", "/"}
+        and not parsed.query
+        and not parsed.fragment
+    )
+    if not (production_origin or local_origin):
+        logger.warning("evaluation_harness_evaluation_delivery_skipped_invalid_origin")
+        return False
+
+    safe_duration = 0
+    try:
+        safe_duration = max(0, min(900_000, int(duration_ms or 0)))
+    except (TypeError, ValueError, OverflowError):
+        pass
+
+    payload = {
+        "event_id": run_id,
+        "project": "flowpilot",
+        "event_type": "evaluation.completed",
+        "status": "success" if passed == cases else "warning",
+        "workflow": "deterministic_replay",
+        "duration_ms": safe_duration,
+        "request_id": run_id,
+        "metrics": {
+            "cases": cases,
+            "passed": passed,
+            "pass_rate": round(passed / cases, 6),
+        },
+    }
+    url = base_url.rstrip("/") + "/api/application-events"
+    worker = thread_factory(
+        target=_send_event,
+        args=(url, token, payload),
+        name="flowpilot-evaluation-telemetry",
+        daemon=True,
+    )
+    worker.start()
+    return True
