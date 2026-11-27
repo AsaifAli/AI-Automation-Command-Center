@@ -2,7 +2,7 @@
 
 > An AI workflow automation workspace for launching, tracking, and reviewing bounded AI-assisted workflows.
 
-FlowPilot combines a Streamlit operator workspace with a FastAPI workflow control plane. It is designed around explicit workflow definitions, asynchronous execution, role-scoped access, observable run state, and human approval boundaries for external-impact actions.
+FlowPilot combines a shared React client workspace with a FastAPI workflow control plane. The client-facing UI lives inside the authenticated AI Engineering Studio workspace; the former standalone Streamlit UI is retired and its legacy URL shows a workspace handoff notice. The system is designed around explicit workflow definitions, asynchronous execution, role-scoped access, observable run state, and human approval boundaries for external-impact actions.
 
 ## What FlowPilot does
 
@@ -26,7 +26,8 @@ The current workspace exposes four workflow types:
 
 ## Architecture
 
-- **Frontend:** Streamlit operator workspace (ui/app.py).
+- **Frontend:** shared React workspace served by the Studio Worker at `/workspace/apps/flowpilot`.
+- **Legacy UI:** `ui/app.py` is a minimal migration notice only; it is not a workflow client and makes no product API calls.
 - **API:** FastAPI control plane (app/api/main.py).
 - **Execution:** the no-new-service Free Render topology enqueues RQ jobs to the existing Upstash Redis database. A supervised SimpleWorker child process runs workflows separately from the API request loop.
 - **State:** owner-scoped run records, dispatch metadata, approval state, and short-lived encrypted Gateway job credentials are stored in the same Redis database under a dedicated key prefix. PostgreSQL remains an optional backend.
@@ -35,16 +36,17 @@ The current workspace exposes four workflow types:
 
 ## BYOK and Gateway handoff
 
-When FlowPilot is launched from the portfolio website, the website owns provider selection and the user-supplied provider credential. FlowPilot receives a single-use handoff code, removes it from the URL, exchanges it server-side, and keeps the short-lived project token in Streamlit session state. The API validates the token for the FlowPilot project before using it for inference.
+When a client launches FlowPilot from the Studio workspace, Studio owns provider selection and the user-supplied provider credential. The browser receives a single-use, project-scoped handoff code and opens the same-origin React workspace route. Studio exchanges the code server-side and keeps the resulting project credential in a path-scoped HttpOnly cookie; the browser never handles a reusable bearer token. The Studio API proxy validates the project route and forwards only allowed operations to the FlowPilot API.
 
 Do not put provider API keys or reusable Gateway bearer tokens in source control, URL parameters, or browser storage.
 
 ## Deployment
 
-The root render.yaml defines the current **no-new-service Free-tier topology**:
+The root `render.yaml` defines the current **no-new-service Free-tier topology**:
 
-- ai-automation-api — FastAPI, Redis-backed run state, RQ enqueueing, and a supervised embedded worker child process in the same existing Free web service.
-- ai-automation-ui — Streamlit workspace.
+- `ai-automation-api` — FastAPI, Redis-backed run state, RQ enqueueing, and a supervised embedded worker child process in the same existing Free web service.
+
+The standalone `ai-automation-ui` service is no longer part of the manifest. Its entrypoint has been replaced with a retirement notice that sends any existing bookmark to the authenticated Studio workspace. After that notice is deployed and verified, suspend the old Render UI service; do not suspend or remove `ai-automation-api`.
 
 This topology does not create a Render Background Worker, Render Key Value, Render Postgres, or a second Upstash database. It reuses the existing Free Upstash Redis database. The API parent remains available to serve HTTP while the isolated child process consumes workflow jobs.
 
@@ -84,7 +86,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The Compose stack includes the API, Streamlit UI, LiteLLM, PostgreSQL, Redis, and observability services. The exact services and health checks are defined by `docker-compose.yml`.
+The Compose stack still includes API and supporting development services. The former Streamlit workflow UI is no longer a local product interface; `ui/app.py` now renders the retirement notice. Use the shared React workspace hosted by Studio for the client-facing FlowPilot experience.
 
 ## Validation
 
@@ -118,10 +120,11 @@ A passing CI run establishes the checks included in that workflow; it does not b
 **FlowPilot — AI Workflow Automation:** a distinct AI application for orchestrating bounded workflows, tracking execution, and keeping consequential actions reviewable. It is not the shared Evaluation Harness dashboard and is not the private Agency OS.
 ## Hosted deployment verification
 
-The existing public services are:
+The canonical product API is:
 
-- UI: `https://ai-automation-ui-ac2c.onrender.com`
 - API: `https://ai-automation-api.onrender.com`
+
+The former UI address `https://ai-automation-ui-ac2c.onrender.com` is retained only as a temporary migration notice until the Render service is suspended. It is not a supported product entry point.
 
 The no-new-service RQ/Redis topology was deployed on November 26, 2026 from merge commit `a47cbe9` to the existing Free API service. Live checks returned:
 
@@ -129,6 +132,6 @@ The no-new-service RQ/Redis topology was deployed on November 26, 2026 from merg
 - `GET /health` — `execution_mode=embedded_rq_worker`.
 - `GET /ready` — `status=ready`, `state_store=redis`, `redis=embedded_rq_worker`.
 
-Render still has only the existing `ai-automation-api` and `ai-automation-ui` Free web services. The worker runs as a supervised child inside the API service. It uses the existing Free Upstash Redis database shared with the Portfolio LLM Gateway; no new Render service, Redis database, or PostgreSQL database was created.
+The verified hosted topology uses the existing Free `ai-automation-api` service. The RQ worker runs as a supervised child inside the API service and uses the existing Free Upstash Redis database shared with the Portfolio LLM Gateway; no new Render worker, Redis database, or PostgreSQL database was created. The former standalone UI service should be suspended after its migration notice deployment is confirmed.
 
 Local validation: `198` tests passed, including a real RQ `SimpleWorker` integration test against fakeredis with Redis-backed run-state persistence. No live LLM/provider request was sent during deployment verification. A full live BYOK workflow execution is intentionally not claimed as tested.
