@@ -63,7 +63,7 @@ def test_missing_configuration_disables_reporting_without_network_call():
         post.assert_not_called()
 
 
-def test_delivery_uses_project_scoped_token_and_does_not_block_on_non_202():
+def test_delivery_uses_project_scoped_token():
     settings = SimpleNamespace(
         evaluation_harness_url="https://ai-engineering-evaluation-harness.onrender.com",
         evaluation_harness_ingest_token="flowpilot-secret",
@@ -77,3 +77,35 @@ def test_delivery_uses_project_scoped_token_and_does_not_block_on_non_202():
     assert kwargs["headers"]["Authorization"] == "Bearer flowpilot-secret"
     assert kwargs["json"]["project"] == "flowpilot"
     assert kwargs["timeout"] == 1.5
+
+
+def test_approved_action_is_not_reported_as_pending():
+    result = sample_result()
+    result["status"] = "completed"
+    result["output"]["approval"]["status"] = "approved"
+    event = build_flowpilot_event(result)
+    assert event["metrics"]["approval_pending"] is False
+
+
+def test_non_202_harness_response_fails_open_for_the_workflow():
+    settings = SimpleNamespace(
+        evaluation_harness_url="https://ai-engineering-evaluation-harness.onrender.com",
+        evaluation_harness_ingest_token="flowpilot-secret",
+        app_env="production",
+    )
+    with patch(
+        "app.integrations.evaluation_harness.httpx.post",
+        return_value=Mock(status_code=503),
+    ):
+        assert report_workflow_event(settings, sample_result()) is False
+
+
+def test_untrusted_http_endpoint_is_not_contacted_in_production():
+    settings = SimpleNamespace(
+        evaluation_harness_url="http://localhost:8000",
+        evaluation_harness_ingest_token="flowpilot-secret",
+        app_env="production",
+    )
+    with patch("app.integrations.evaluation_harness.httpx.post") as post:
+        assert report_workflow_event(settings, sample_result()) is False
+        post.assert_not_called()

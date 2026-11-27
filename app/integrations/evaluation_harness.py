@@ -30,7 +30,9 @@ def build_flowpilot_event(result: dict[str, Any]) -> dict[str, Any]:
 
     usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
     output = result.get("output") if isinstance(result.get("output"), dict) else {}
-    approval_pending = status == "awaiting_approval" or isinstance(output.get("approval"), dict)
+    approval = output.get("approval")
+    approval_state = str(approval.get("status", "")).strip().lower() if isinstance(approval, dict) else ""
+    approval_pending = status == "awaiting_approval" or approval_state in {"pending", "awaiting_approval"}
 
     metrics: dict[str, float | int | bool] = {
         "warning_count": len(result.get("warnings", [])) if isinstance(result.get("warnings"), list) else 0,
