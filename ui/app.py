@@ -5,8 +5,8 @@ This minimal landing page intentionally makes no product API calls and
 cannot launch workflows outside the workspace's BYOK and session boundary.
 """
 
-from legacy_notice import legacy_workspace_url
 import streamlit as st
+from legacy_notice import legacy_workspace_url
 
 st.set_page_config(
     page_title="FlowPilot · Studio Workspace",
