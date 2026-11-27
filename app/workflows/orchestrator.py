@@ -218,6 +218,6 @@ class WorkflowEngine:
             from app.integrations.evaluation_harness import report_workflow_event
 
             report_workflow_event(self.llm.settings, result)
-        except Exception:
+        except Exception:  # noqa: BLE001 - telemetry must never fail a workflow.
             logger.warning("evaluation_harness_reporting_skipped workflow=%s run_id=%s", workflow, run_id)
         return result

@@ -87,6 +87,10 @@ services:
         value: "1"
       - key: SCHEDULE_ENABLED
         value: "false"
+      - key: EVALUATION_HARNESS_URL
+        value: https://ai-engineering-evaluation-harness.onrender.com
+      - key: EVALUATION_HARNESS_INGEST_TOKEN
+        sync: false
       - key: OTEL_ENABLED
         value: "false"
 
