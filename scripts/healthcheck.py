@@ -30,14 +30,13 @@ def main() -> int:
             timeout=5.0,
             follow_redirects=False,
             trust_env=False,
-        ) as client:
-            with client.stream("GET", url) as response:
-                if response.status_code != 200:
-                    print(
-                        f"health check failed: HTTP {response.status_code}",
-                        file=sys.stderr,
-                    )
-                    return 1
+        ) as client, client.stream("GET", url) as response:
+            if response.status_code != 200:
+                print(
+                    f"health check failed: HTTP {response.status_code}",
+                    file=sys.stderr,
+                )
+                return 1
 
     except (ValueError, httpx.HTTPError) as exc:
         print(f"health check failed: {type(exc).__name__}", file=sys.stderr)

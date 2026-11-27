@@ -35,6 +35,18 @@ ROLE_PERMISSIONS = {
         }
     ),
     "admin": frozenset({"*"}),
+    # A Gateway-authenticated workspace owner can operate and review only
+    # their own project-scoped runs. They cannot administer the shared queue.
+    "workspace_owner": frozenset(
+        {
+            "system:read",
+            "workflows:read",
+            "runs:read",
+            "metrics:read",
+            "runs:execute",
+            "approvals:decide",
+        }
+    ),
 }
 
 

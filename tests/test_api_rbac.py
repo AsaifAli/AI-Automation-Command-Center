@@ -694,3 +694,38 @@ def test_flowpilot_supabase_schema_uses_valid_dollar_quoted_role_block():
 
     assert "DO $$\nBEGIN" in SCHEMA
     assert "\nEND\n$$;" in SCHEMA
+
+
+def test_gateway_workspace_owner_has_scoped_operator_and_reviewer_access(monkeypatch):
+    monkeypatch.setattr(
+        api_module,
+        "verify_flowpilot_gateway_session",
+        lambda token: api_module.GatewaySessionLifetime(600, "a" * 64),
+    )
+
+    operator = api_module.resolve_api_principal(
+        "runs:execute", api_key=None, gateway_token="opaque-gateway-session"
+    )
+    reviewer = api_module.resolve_api_principal(
+        "approvals:decide", api_key=None, gateway_token="opaque-gateway-session"
+    )
+
+    assert operator.owner_id == "a" * 64
+    assert operator.role == "workspace_owner"
+    assert reviewer.owner_id == operator.owner_id
+    assert reviewer.can("approvals:decide")
+    assert not operator.can("runs:delete")
+
+
+def test_gateway_workspace_owner_cannot_access_another_project(monkeypatch):
+    from fastapi import HTTPException
+
+    def reject(token):
+        raise HTTPException(status_code=403, detail="The Gateway session is not authorized for FlowPilot.")
+
+    monkeypatch.setattr(api_module, "verify_flowpilot_gateway_session", reject)
+    with pytest.raises(HTTPException) as error:
+        api_module.resolve_api_principal(
+            "runs:execute", api_key=None, gateway_token="quotesense-session"
+        )
+    assert error.value.status_code == 403
