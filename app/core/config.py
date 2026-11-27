@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     )
     gateway_job_credential_ttl_seconds: int = 900
 
+    # Optional, privacy-bounded application activity reporting to the studio harness.
+    evaluation_harness_url: str = ""
+    evaluation_harness_ingest_token: str = Field(default="", repr=False)
+
     # API / security
     api_base_url: str = "http://localhost:8000"
     api_auth_enabled: bool = False
