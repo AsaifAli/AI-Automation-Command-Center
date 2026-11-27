@@ -12,6 +12,7 @@ from app.agents.kpi import KPIAgent
 from app.agents.outreach import OutreachAgent, OutreachGenerationError
 from app.integrations.intelligence import IntelligenceSource
 from app.integrations.llm import LLMProvider, LLMProviderError
+from app.integrations.evaluation_harness import publish_flowpilot_event
 
 try:
     from opentelemetry import trace
@@ -201,7 +202,7 @@ class WorkflowEngine:
             "url": None,
             "observed_at": now,
         }]
-        return {
+        result = {
             "run_id": run_id,
             "workflow": workflow,
             "status": status,
@@ -212,3 +213,9 @@ class WorkflowEngine:
             "usage": usage,
             "warnings": warnings,
         }
+        try:
+            publish_flowpilot_event(result, self.llm.settings)
+        except Exception:
+            # Telemetry is optional and must never affect workflow completion.
+            logger.warning("evaluation_harness_telemetry_dispatch_failed workflow=%s", workflow)
+        return result
