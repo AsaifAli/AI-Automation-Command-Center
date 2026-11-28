@@ -83,3 +83,39 @@ def test_workflow_engine_emits_real_step_boundaries_and_ignores_event_sink_failu
         on_event=lambda *_args: (_ for _ in ()).throw(RuntimeError("event sink unavailable")),
     )
     assert resilient["status"] == "completed"
+
+
+def test_workflow_engine_reports_evaluation_for_observed_execute_and_validate_steps(monkeypatch):
+    from app.integrations import evaluation_harness
+    from app.workflows.orchestrator import WorkflowEngine
+
+    reported = {}
+    monkeypatch.setattr(
+        evaluation_harness,
+        "report_workflow_event",
+        lambda settings, result: True,
+    )
+    monkeypatch.setattr(
+        evaluation_harness,
+        "report_workflow_evaluation_event",
+        lambda settings, result, *, completed_steps: (
+            reported.update(
+                result_status=result["status"],
+                workflow=result["workflow"],
+                completed_steps=completed_steps,
+            ) or True
+        ),
+    )
+
+    result = WorkflowEngine(llm).run(
+        "kpi",
+        {"updates": [{"entity": "A", "metric": "delivery", "value": "on track", "blocker": "None"}]},
+        run_id="runtime-evaluation-run",
+    )
+
+    assert result["status"] == "completed"
+    assert reported == {
+        "result_status": "completed",
+        "workflow": "kpi",
+        "completed_steps": ["execute", "validate"],
+    }
