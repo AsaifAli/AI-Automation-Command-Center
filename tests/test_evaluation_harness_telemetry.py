@@ -109,3 +109,80 @@ def test_untrusted_http_endpoint_is_not_contacted_in_production():
     with patch("app.integrations.evaluation_harness.httpx.post") as post:
         assert report_workflow_event(settings, sample_result()) is False
         post.assert_not_called()
+
+
+def test_evaluation_event_reports_real_stages_and_approval_without_content(monkeypatch):
+    from app.integrations.evaluation_harness import build_flowpilot_evaluation_event
+
+    monkeypatch.setenv("EVALUATION_EXPERIMENT_ID", "flowpilot-run-v1")
+    monkeypatch.setenv("EVALUATION_DATASET_VERSION", "workflow-fixtures-v2")
+    monkeypatch.setenv("EVALUATION_PROMPT_VERSION", "agent-prompts-v3")
+    monkeypatch.setenv("EVALUATION_CONFIG_VERSION", "workflow-config-v4")
+    result = sample_result()
+    result["evidence"] = [{"source": "workflow-engine", "detail": "private run detail"}]
+    result["output"]["approval"] = {"status": "pending"}
+    event = build_flowpilot_evaluation_event(
+        result,
+        completed_steps=["execute", "validate"],
+    )
+
+    assert event["project"] == "flowpilot"
+    assert event["event_type"] == "evaluation.completed"
+    assert event["status"] == "success"
+    assert event["event_id"] == "eval-" + result["run_id"]
+    assert event["experiment_id"] == "flowpilot-run-v1"
+    assert event["dataset_version"] == "workflow-fixtures-v2"
+    assert event["prompt_version"] == "agent-prompts-v3"
+    assert event["config_version"] == "workflow-config-v4"
+    assert event["metrics"]["runtime.workflow_completion"] == 1.0
+    assert event["metrics"]["runtime.step_coverage"] == 1.0
+    assert event["metrics"]["runtime.validation_completed"] == 1.0
+    assert event["metrics"]["runtime.approval_compliance"] == 1.0
+    assert event["metrics"]["runtime.audit_traceability"] == 1.0
+    serialized = str(event)
+    assert "PRIVATE GENERATED MESSAGE" not in serialized
+    assert "PRIVATE EVIDENCE" not in serialized
+    assert "private run detail" not in serialized
+    assert "output" not in event
+    assert "evidence" not in event
+
+
+def test_evaluation_event_penalizes_missing_validation_and_failed_workflow():
+    from app.integrations.evaluation_harness import build_flowpilot_evaluation_event
+
+    result = sample_result()
+    result["status"] = "failed"
+    result["output"] = {"failure_code": "workflow_execution_error"}
+    event = build_flowpilot_evaluation_event(result, completed_steps=["execute"])
+
+    assert event["metrics"]["runtime.workflow_completion"] == 0.0
+    assert event["metrics"]["runtime.step_coverage"] == 0.5
+    assert event["metrics"]["runtime.validation_completed"] == 0.0
+
+
+def test_evaluation_report_uses_same_project_token_and_fails_open():
+    from app.integrations.evaluation_harness import report_workflow_evaluation_event
+
+    settings = SimpleNamespace(
+        evaluation_harness_url="https://ai-engineering-evaluation-harness.onrender.com",
+        evaluation_harness_ingest_token="flowpilot-secret",
+        app_env="production",
+    )
+    response = Mock(status_code=202)
+    with patch(
+        "app.integrations.evaluation_harness.httpx.post",
+        return_value=response,
+    ) as post:
+        accepted = report_workflow_evaluation_event(
+            settings,
+            sample_result(),
+            completed_steps=["execute", "validate"],
+        )
+
+    assert accepted is True
+    args, kwargs = post.call_args
+    assert args[0] == "https://ai-engineering-evaluation-harness.onrender.com/api/application-events"
+    assert kwargs["headers"]["Authorization"] == "Bearer flowpilot-secret"
+    assert kwargs["json"]["event_type"] == "evaluation.completed"
+    assert kwargs["json"]["metrics"]["runtime.step_coverage"] == 1.0
+    assert kwargs["timeout"] == 1.5
