@@ -135,3 +135,20 @@ The no-new-service RQ/Redis topology was deployed on November 26, 2026 from merg
 The verified hosted topology uses the existing Free `ai-automation-api` service. The RQ worker runs as a supervised child inside the API service and uses the existing Free Upstash Redis database shared with the Portfolio LLM Gateway; no new Render worker, Redis database, or PostgreSQL database was created. The former standalone UI service should be suspended after its migration notice deployment is confirmed.
 
 Local validation: `198` tests passed, including a real RQ `SimpleWorker` integration test against fakeredis with Redis-backed run-state persistence. No live LLM/provider request was sent during deployment verification. A full live BYOK workflow execution is intentionally not claimed as tested.
+
+## Runtime evaluation reporting
+
+When the evaluation harness URL and project-scoped ingest token are configured, FlowPilot reports a second `evaluation.completed` event after each workflow result is finalized. The score event is kept separate from the existing `run.completed` / `run.failed` activity event and contains only bounded numeric signals:
+
+- `runtime.workflow_completion` — whether the workflow reached a successful terminal state or its explicit approval checkpoint.
+- `runtime.step_coverage` — observed completed LangGraph stages divided by the required `execute` and `validate` stages.
+- `runtime.validation_completed` — whether the actual validation node completed.
+- `runtime.approval_compliance` and `runtime.approval_pending` — approval checkpoint state for content/outreach actions.
+- `runtime.audit_traceability` — whether the result has its workflow-engine audit evidence record.
+- `runtime.warning_count` — bounded warning count.
+
+The evaluation event may include optional experiment lineage labels: `EVALUATION_EXPERIMENT_ID`, `EVALUATION_DATASET_VERSION`, `EVALUATION_PROMPT_VERSION` and `EVALUATION_CONFIG_VERSION`. Model identity comes from the existing normalized provider/model usage metadata.
+
+These are deterministic runtime checks, **not LLM-as-a-judge scores**. The current FlowPilot workflow runtime executes bounded workflow agents through execute/validate stages and does not produce a general dynamic tool-call trajectory. Tool-selection, argument and agent-plan metrics must not be inferred from these stages. The Evaluation Harness can accept genuine RAGAS/DeepEval agent scores when a runtime later has instrumented tool-call traces.
+
+Reporting is best-effort and cannot change a workflow result, approval state or client response. No workflow input, generated drafts/messages, evidence details, prompts, provider credentials or raw agent traces are sent to the Evaluation Harness. Configure the optional version labels on `ai-automation-api` only when the corresponding versions are known; leave them blank rather than inventing a version.
