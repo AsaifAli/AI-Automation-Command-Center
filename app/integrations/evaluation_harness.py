@@ -298,6 +298,6 @@ def report_workflow_evaluation_event(
     except (httpx.HTTPError, TypeError, ValueError, KeyError):
         logger.info("evaluation_harness_score_delivery_failed", exc_info=True)
         return False
-    except Exception:  # noqa: BLE001 - an evaluator outage must never affect workflow execution.
+    except Exception:
         logger.info("evaluation_harness_score_delivery_failed", exc_info=True)
         return False
