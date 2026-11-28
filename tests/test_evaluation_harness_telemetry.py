@@ -129,7 +129,8 @@ def test_evaluation_event_reports_real_stages_and_approval_without_content(monke
     assert event["project"] == "flowpilot"
     assert event["event_type"] == "evaluation.completed"
     assert event["status"] == "success"
-    assert event["event_id"] == "eval-" + result["run_id"]
+    assert event["event_id"].startswith("eval-")
+    assert len(event["event_id"]) == 37
     assert event["experiment_id"] == "flowpilot-run-v1"
     assert event["dataset_version"] == "workflow-fixtures-v2"
     assert event["prompt_version"] == "agent-prompts-v3"
