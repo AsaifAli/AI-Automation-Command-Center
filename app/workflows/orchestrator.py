@@ -178,8 +178,18 @@ class WorkflowEngine:
             span = span_context.__enter__()
             span.set_attribute("workflow", workflow)
             span.set_attribute("run_id", run_id)
+        completed_steps: set[str] = set()
+
+        def capture_step_event(event: str, detail: dict[str, Any]) -> None:
+            if event == "step_completed" and isinstance(detail, dict):
+                step_id = detail.get("step_id")
+                if step_id in {"execute", "validate"}:
+                    completed_steps.add(step_id)
+            if on_event is not None:
+                on_event(event, detail)
+
         try:
-            state = self._graph(workflow, on_event=on_event).invoke({"payload": payload})
+            state = self._graph(workflow, on_event=capture_step_event).invoke({"payload": payload})
             status = "completed" if not state.get("warnings") else "completed_with_warnings"
             output = state.get("output", {})
             warnings = state.get("warnings", [])
@@ -278,4 +288,15 @@ class WorkflowEngine:
             report_workflow_event(self.llm.settings, result)
         except Exception:  # noqa: BLE001 - telemetry must never fail a workflow.
             logger.warning("evaluation_harness_reporting_skipped workflow=%s run_id=%s", workflow, run_id)
+
+        try:
+            from app.integrations.evaluation_harness import report_workflow_evaluation_event
+
+            report_workflow_evaluation_event(
+                self.llm.settings,
+                result,
+                completed_steps=sorted(completed_steps),
+            )
+        except Exception:  # noqa: BLE001 - runtime scoring must never fail a workflow.
+            logger.warning("evaluation_harness_scoring_skipped workflow=%s run_id=%s", workflow, run_id)
         return result
